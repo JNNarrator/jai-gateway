@@ -5,9 +5,11 @@ import type {
   GatewayKeyInfo,
   ImportReport,
   LogRowView,
+  McpServerRow,
   ModelRow,
   ProviderDto,
   SettingsDto,
+  SkillRow,
   WebDavConfigDto,
 } from "./types";
 
@@ -74,6 +76,45 @@ export const api = {
   }) => invoke<void>("webdav_config_set", { input }),
   webdavPush: () => invoke<void>("webdav_push"),
   webdavPull: () => invoke<ImportReport>("webdav_pull"),
+
+  // MCP 管理
+  mcpList: () => invoke<McpServerRow[]>("mcp_list"),
+  mcpCreate: (input: {
+    name: string;
+    kind: string;
+    command?: string | null;
+    args?: string | null;
+    url?: string | null;
+  }) => invoke<McpServerRow>("mcp_create", { input }),
+  mcpUpdate: (input: {
+    id: string;
+    name: string;
+    kind: string;
+    command?: string | null;
+    args?: string | null;
+    url?: string | null;
+  }) => invoke<void>("mcp_update", { input }),
+  mcpSetEnabled: (id: string, enabled: boolean) =>
+    invoke<void>("mcp_set_enabled", { id, enabled }),
+  mcpDelete: (id: string) => invoke<void>("mcp_delete", { id }),
+
+  // Skill 管理
+  skillList: () => invoke<SkillRow[]>("skill_list"),
+  skillCreate: (input: {
+    name: string;
+    description: string;
+    content: string;
+  }) => invoke<SkillRow>("skill_create", { input }),
+  skillUpdate: (input: {
+    id: string;
+    name: string;
+    description: string;
+    content: string;
+  }) => invoke<void>("skill_update", { input }),
+  skillSetEnabled: (id: string, enabled: boolean) =>
+    invoke<void>("skill_set_enabled", { id, enabled }),
+  skillDelete: (id: string) => invoke<void>("skill_delete", { id }),
+
   corsAllowGet: () => invoke<string[]>("cors_allow_get"),
   corsAllowSet: (list: string[]) => invoke<void>("cors_allow_set", { list }),
   settingsGet: () => invoke<SettingsDto>("settings_get"),

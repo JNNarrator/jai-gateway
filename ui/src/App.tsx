@@ -47,13 +47,15 @@ function fmtClock(ms: number | null | undefined): string {
 
 // ---------------------------------------------------------------- 页面
 
-type Tab = "gateway" | "sync" | "providers" | "models" | "logs" | "settings";
+type Tab = "gateway" | "sync" | "mcp" | "skills" | "providers" | "models" | "logs" | "settings";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("gateway");
   const tabs: [Tab, string][] = [
     ["gateway", "网关"],
     ["sync", "同步"],
+    ["mcp", "MCP"],
+    ["skills", "技能"],
     ["providers", "供应商"],
     ["models", "模型"],
     ["logs", "日志"],
@@ -85,6 +87,8 @@ export default function App() {
       <main className="flex-1 space-y-4 overflow-y-auto p-6">
         {tab === "gateway" && <GatewayTab />}
         {tab === "sync" && <SyncTab />}
+        {tab === "mcp" && <McpTab />}
+        {tab === "skills" && <SkillsTab />}
         {tab === "providers" && <ProvidersTab />}
         {tab === "models" && <ModelsTab />}
         {tab === "logs" && <LogsTab />}
@@ -403,6 +407,346 @@ function SyncTab() {
           </button>
         </div>
       </Card>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- MCP 管理
+
+function McpTab() {
+  const [list, setList] = useState<import("./types").McpServerRow[]>([]);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [showNew, setShowNew] = useState(false);
+
+  async function refresh() {
+    setList(await api.mcpList());
+  }
+  useEffect(() => {
+    refresh().catch((e) => setErr(String(e)));
+  }, []);
+
+  async function act(fn: () => Promise<unknown>) {
+    setErr("");
+    try {
+      await fn();
+      await refresh();
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-4">
+      <div className="flex items-center justify-between">
+        <h1 className="text-lg font-semibold">MCP Server 管理</h1>
+        <button className={btnPrimary} onClick={() => setShowNew(true)}>
+          + 添加 MCP Server
+        </button>
+      </div>
+      {err && (
+        <div className="rounded border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+          {err}
+        </div>
+      )}
+      {msg && (
+        <div className="rounded border border-emerald-900 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
+          {msg}
+        </div>
+      )}
+      {showNew && (
+        <McpForm
+          onCancel={() => setShowNew(false)}
+          onDone={() => {
+            setShowNew(false);
+            refresh();
+          }}
+        />
+      )}
+      <div className="space-y-3">
+        {list.map((m) => (
+          <div key={m.id} className="rounded-lg border border-neutral-800 bg-neutral-900/60 p-4">
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                checked={m.enabled}
+                onChange={(e) => act(() => api.mcpSetEnabled(m.id, e.target.checked))}
+                className="accent-amber-500"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-baseline gap-2">
+                  <span className="font-medium">{m.name}</span>
+                  <span className="rounded bg-neutral-800 px-1.5 py-0.5 text-[11px] text-neutral-400">
+                    {m.kind}
+                  </span>
+                  {!m.enabled && <span className="text-[11px] text-neutral-500">已停用</span>}
+                </div>
+                <div className="truncate font-mono text-xs text-neutral-500">
+                  {m.kind === "stdio"
+                    ? `${m.command ?? ""} ${m.args ?? ""}`
+                    : m.url ?? ""}
+                </div>
+              </div>
+              <button
+                className={btnDanger}
+                onClick={() => {
+                  if (!confirm(`删除 MCP Server「${m.name}」？`)) return;
+                  act(() => api.mcpDelete(m.id));
+                }}
+              >
+                删除
+              </button>
+            </div>
+            <McpForm
+              initial={m}
+              onCancel={() => {}}
+              onDone={() => {
+                setMsg("MCP Server 已更新");
+                setTimeout(() => setMsg(""), 2000);
+                refresh();
+              }}
+            />
+          </div>
+        ))}
+        {list.length === 0 && !showNew && (
+          <Card title="还没有 MCP Server">
+            <p className="text-sm text-neutral-500">
+              添加 stdio / SSE / HTTP 类型的 MCP Server 配置，当前版本先做管理与启停。
+            </p>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function McpForm({
+  initial,
+  onDone,
+  onCancel,
+}: {
+  initial?: import("./types").McpServerRow;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(initial?.name ?? "");
+  const [kind, setKind] = useState<string>(initial?.kind ?? "stdio");
+  const [command, setCommand] = useState(initial?.command ?? "");
+  const [args, setArgs] = useState(initial?.args ?? "");
+  const [url, setUrl] = useState(initial?.url ?? "");
+
+  async function submit() {
+    if (initial) {
+      await api.mcpUpdate({
+        id: initial.id,
+        name,
+        kind,
+        command: command || null,
+        args: args || null,
+        url: url || null,
+      });
+    } else {
+      await api.mcpCreate({
+        name,
+        kind,
+        command: command || null,
+        args: args || null,
+        url: url || null,
+      });
+    }
+    onDone();
+  }
+
+  return (
+    <div className="mt-3 grid grid-cols-2 gap-3 rounded border-t border-neutral-800 pt-4">
+      <label className="text-xs text-neutral-400">
+        名称
+        <input className={`${inputCls} mt-1`} value={name} onChange={(e) => setName(e.target.value)} />
+      </label>
+      <label className="text-xs text-neutral-400">
+        类型
+        <select className={`${inputCls} mt-1`} value={kind} onChange={(e) => setKind(e.target.value)}>
+          <option value="stdio">stdio</option>
+          <option value="sse">sse</option>
+          <option value="http">http</option>
+        </select>
+      </label>
+      {kind === "stdio" ? (
+        <>
+          <label className="text-xs text-neutral-400">
+            命令
+            <input className={`${inputCls} mt-1 font-mono`} value={command} onChange={(e) => setCommand(e.target.value)} placeholder="npx / node / python" />
+          </label>
+          <label className="text-xs text-neutral-400">
+            参数（JSON 数组）
+            <input className={`${inputCls} mt-1 font-mono`} value={args} onChange={(e) => setArgs(e.target.value)} placeholder='["-y","@modelcontextprotocol/server-filesystem"]' />
+          </label>
+        </>
+      ) : (
+        <label className="col-span-2 text-xs text-neutral-400">
+          URL
+          <input className={`${inputCls} mt-1 font-mono`} value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://mcp.example.com/sse" />
+        </label>
+      )}
+      <div className="col-span-2 flex gap-2">
+        <button className={btnPrimary} onClick={submit}>
+          {initial ? "保存" : "创建"}
+        </button>
+        {!initial && (
+          <button className={btnGhost} onClick={onCancel}>
+            取消
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- 技能（Skill）管理
+
+function SkillsTab() {
+  const [list, setList] = useState<import("./types").SkillRow[]>([]);
+  const [err, setErr] = useState("");
+  const [msg, setMsg] = useState("");
+  const [showNew, setShowNew] = useState(false);
+
+  async function refresh() {
+    setList(await api.skillList());
+  }
+  useEffect(() => {
+    refresh().catch((e) => setErr(String(e)));
+  }, []);
+
+  async function act(fn: () => Promise<unknown>) {
+    setErr("");
+    try {
+      await fn();
+      await refresh();
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-4">
+      <div className="flex items-center justify-between">
+        <h1 className="text-lg font-semibold">技能（Skill）管理</h1>
+        <button className={btnPrimary} onClick={() => setShowNew(true)}>
+          + 添加技能
+        </button>
+      </div>
+      {err && (
+        <div className="rounded border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+          {err}
+        </div>
+      )}
+      {msg && (
+        <div className="rounded border border-emerald-900 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
+          {msg}
+        </div>
+      )}
+      {showNew && (
+        <SkillForm
+          onCancel={() => setShowNew(false)}
+          onDone={() => {
+            setShowNew(false);
+            refresh();
+          }}
+        />
+      )}
+      <div className="space-y-3">
+        {list.map((s) => (
+          <div key={s.id} className="rounded-lg border border-neutral-800 bg-neutral-900/60 p-4">
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                checked={s.enabled}
+                onChange={(e) => act(() => api.skillSetEnabled(s.id, e.target.checked))}
+                className="accent-amber-500"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="font-medium">{s.name}</div>
+                <div className="truncate text-xs text-neutral-500">{s.description}</div>
+              </div>
+              <button
+                className={btnDanger}
+                onClick={() => {
+                  if (!confirm(`删除技能「${s.name}」？`)) return;
+                  act(() => api.skillDelete(s.id));
+                }}
+              >
+                删除
+              </button>
+            </div>
+            <SkillForm
+              initial={s}
+              onCancel={() => {}}
+              onDone={() => {
+                setMsg("技能已更新");
+                setTimeout(() => setMsg(""), 2000);
+                refresh();
+              }}
+            />
+          </div>
+        ))}
+        {list.length === 0 && !showNew && (
+          <Card title="还没有技能">
+            <p className="text-sm text-neutral-500">
+              技能即一组可复用的指令/提示词/工作流定义；当前版本先做管理与启停。
+            </p>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SkillForm({
+  initial,
+  onDone,
+  onCancel,
+}: {
+  initial?: import("./types").SkillRow;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(initial?.name ?? "");
+  const [description, setDescription] = useState(initial?.description ?? "");
+  const [content, setContent] = useState(initial?.content ?? "");
+
+  async function submit() {
+    if (initial) {
+      await api.skillUpdate({ id: initial.id, name, description, content });
+    } else {
+      await api.skillCreate({ name, description, content });
+    }
+    onDone();
+  }
+
+  return (
+    <div className="mt-3 grid grid-cols-2 gap-3 rounded border-t border-neutral-800 pt-4">
+      <label className="text-xs text-neutral-400">
+        名称
+        <input className={`${inputCls} mt-1`} value={name} onChange={(e) => setName(e.target.value)} />
+      </label>
+      <label className="text-xs text-neutral-400">
+        描述
+        <input className={`${inputCls} mt-1`} value={description} onChange={(e) => setDescription(e.target.value)} />
+      </label>
+      <label className="col-span-2 text-xs text-neutral-400">
+        内容/指令
+        <textarea className={`${inputCls} mt-1 h-28 font-mono`} value={content} onChange={(e) => setContent(e.target.value)} />
+      </label>
+      <div className="col-span-2 flex gap-2">
+        <button className={btnPrimary} onClick={submit}>
+          {initial ? "保存" : "创建"}
+        </button>
+        {!initial && (
+          <button className={btnGhost} onClick={onCancel}>
+            取消
+          </button>
+        )}
+      </div>
     </div>
   );
 }

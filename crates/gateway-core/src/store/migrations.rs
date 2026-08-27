@@ -2,10 +2,16 @@
 //! 新增迁移 = 在数组尾部追加一条，禁止修改历史条目。
 
 /// (名称, SQL)
-pub const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_initial_schema",
-    include_str!("migrations/0001_initial_schema.sql"),
-)];
+pub const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_initial_schema",
+        include_str!("migrations/0001_initial_schema.sql"),
+    ),
+    (
+        "0002_mcp_and_skills",
+        include_str!("migrations/0002_mcp_and_skills.sql"),
+    ),
+];
 
 #[cfg(test)]
 mod tests {

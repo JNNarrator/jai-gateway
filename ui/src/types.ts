@@ -76,3 +76,25 @@ export interface ImportReport {
   missingKeys: string[];
   invalidProviders: string[];
 }
+
+export interface McpServerRow {
+  id: string;
+  name: string;
+  kind: "stdio" | "sse" | "http";
+  command?: string | null;
+  args?: string | null;
+  url?: string | null;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SkillRow {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}

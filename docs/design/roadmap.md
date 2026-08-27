@@ -378,10 +378,24 @@
 - README 与 roadmap 同步
 - 实际签名/公证/更新 feed 发布：需要仓库 secrets 与真实证书后执行
 
+### MCP（Model Context Protocol）管理 —— 基础管理已完成 ✅
+
+- 新增 `mcp_servers` 表（stdio/sse/http、命令/参数/URL、启停）
+- store CRUD + Tauri IPC（`mcp_list/create/update/set_enabled/delete`）
+- UI「MCP」页：添加/编辑/启停/删除 MCP Server 配置
+- 真实 MCP 协议客户端调用（tools/list、tools/call）列入后续迭代
+
+### 技能（Skill）管理 —— 基础管理已完成 ✅
+
+- 新增 `skills` 表（名称/描述/内容/启停）
+- store CRUD + Tauri IPC（`skill_list/create/update/set_enabled/delete`）
+- UI「技能」页：添加/编辑/启停/删除技能定义
+- 技能在网关请求中的自动注入/检索列入后续迭代
+
 ### 待办（下一里程碑）
 
-1. MCP（Model Context Protocol）管理
-2. 技能（skill）管理
-3. 真机验收 M1–M9（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
+1. 真机验收 M1–M9 + MCP/Skill（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
+2. MCP 真实协议客户端接入与工具转发
+3. 技能检索/自动注入到请求上下文
 
-> 历史快照：M1–M9 工程快照已并入本节；更早的记录见 git 历史。
+> 历史快照：M1–M9 + MCP/Skill 基础管理快照已并入本节；更早的记录见 git 历史。

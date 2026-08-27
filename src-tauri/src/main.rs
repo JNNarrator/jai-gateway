@@ -13,7 +13,9 @@
 use gateway_core::codec::Family;
 use gateway_core::discover::discover_models;
 use gateway_core::server::{self, GatewayCtx};
-use gateway_core::store::{self, import, logs, Db, GatewayKeyRow, ModelRow, ProviderRow};
+use gateway_core::store::{
+    self, import, logs, Db, GatewayKeyRow, McpServerRow, ModelRow, ProviderRow, SkillRow,
+};
 use gateway_core::sync::{self, WebDavConfig};
 use gateway_core::vault;
 use rand::Rng;
@@ -679,6 +681,225 @@ async fn get_webdav_password() -> Result<String, String> {
         .ok_or_else(|| "WebDAV 密码尚未录入，请在设置中保存".to_string())
 }
 
+// ---------------------------------------------------------------- MCP 管理
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerInput {
+    pub name: String,
+    pub kind: String,
+    pub command: Option<String>,
+    pub args: Option<String>,
+    pub url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerUpdateInput {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub command: Option<String>,
+    pub args: Option<String>,
+    pub url: Option<String>,
+}
+
+#[tauri::command]
+async fn mcp_list(core: State<'_, AppCore>) -> Result<Vec<McpServerRow>, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| store::mcp_list(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn mcp_create(
+    core: State<'_, AppCore>,
+    input: McpServerInput,
+) -> Result<McpServerRow, String> {
+    if input.name.trim().is_empty() {
+        return Err("名称不能为空".into());
+    }
+    if !matches!(input.kind.as_str(), "stdio" | "sse" | "http") {
+        return Err("kind 仅支持 stdio/sse/http".into());
+    }
+    let now = store::now_ms();
+    let row = McpServerRow {
+        id: uuid::Uuid::now_v7().to_string(),
+        name: input.name.trim().to_string(),
+        kind: input.kind,
+        command: input.command.filter(|s| !s.trim().is_empty()),
+        args: input.args.filter(|s| !s.trim().is_empty()),
+        url: input.url.filter(|s| !s.trim().is_empty()),
+        enabled: true,
+        created_at: now,
+        updated_at: now,
+    };
+    let db = core.db.clone();
+    let row2 = row.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::mcp_insert(c, &row2))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    Ok(row)
+}
+
+#[tauri::command]
+async fn mcp_update(core: State<'_, AppCore>, input: McpServerUpdateInput) -> Result<(), String> {
+    if input.name.trim().is_empty() {
+        return Err("名称不能为空".into());
+    }
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| {
+            store::mcp_update(
+                c,
+                &input.id,
+                input.name.trim(),
+                &input.kind,
+                input.command.as_deref().filter(|s| !s.trim().is_empty()),
+                input.args.as_deref().filter(|s| !s.trim().is_empty()),
+                input.url.as_deref().filter(|s| !s.trim().is_empty()),
+            )
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn mcp_set_enabled(
+    core: State<'_, AppCore>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::mcp_set_enabled(c, &id, enabled))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn mcp_delete(core: State<'_, AppCore>, id: String) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::mcp_delete(c, &id))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+// ---------------------------------------------------------------- Skill 管理
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInput {
+    pub name: String,
+    pub description: String,
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillUpdateInput {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+}
+
+#[tauri::command]
+async fn skill_list(core: State<'_, AppCore>) -> Result<Vec<SkillRow>, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| store::skill_list(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn skill_create(core: State<'_, AppCore>, input: SkillInput) -> Result<SkillRow, String> {
+    if input.name.trim().is_empty() {
+        return Err("名称不能为空".into());
+    }
+    let now = store::now_ms();
+    let row = SkillRow {
+        id: uuid::Uuid::now_v7().to_string(),
+        name: input.name.trim().to_string(),
+        description: input.description.trim().to_string(),
+        content: input.content,
+        enabled: true,
+        created_at: now,
+        updated_at: now,
+    };
+    let db = core.db.clone();
+    let row2 = row.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::skill_insert(c, &row2))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    Ok(row)
+}
+
+#[tauri::command]
+async fn skill_update(core: State<'_, AppCore>, input: SkillUpdateInput) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| {
+            store::skill_update(
+                c,
+                &input.id,
+                input.name.trim(),
+                input.description.trim(),
+                &input.content,
+            )
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn skill_set_enabled(
+    core: State<'_, AppCore>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::skill_set_enabled(c, &id, enabled))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn skill_delete(core: State<'_, AppCore>, id: String) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::skill_delete(c, &id))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
 #[tauri::command]
 async fn cors_allow_get(core: State<'_, AppCore>) -> Result<Vec<String>, String> {
     let raw = core
@@ -1120,6 +1341,16 @@ fn main() {
             webdav_config_set,
             webdav_push,
             webdav_pull,
+            mcp_list,
+            mcp_create,
+            mcp_update,
+            mcp_set_enabled,
+            mcp_delete,
+            skill_list,
+            skill_create,
+            skill_update,
+            skill_set_enabled,
+            skill_delete,
             cors_allow_get,
             cors_allow_set,
             settings_get,

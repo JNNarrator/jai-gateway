@@ -469,6 +469,174 @@ pub fn gw_key_touch(c: &Connection, id: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+// ================================================================ MCP / Skills（MCP & skill 管理）
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub command: Option<String>,
+    /// JSON 数组字符串
+    pub args: Option<String>,
+    pub url: Option<String>,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRow {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn row_to_mcp_server(r: &rusqlite::Row) -> rusqlite::Result<McpServerRow> {
+    Ok(McpServerRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        kind: r.get(2)?,
+        command: r.get(3)?,
+        args: r.get(4)?,
+        url: r.get(5)?,
+        enabled: r.get::<_, i64>(6)? != 0,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
+    })
+}
+
+fn row_to_skill(r: &rusqlite::Row) -> rusqlite::Result<SkillRow> {
+    Ok(SkillRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        description: r.get(2)?,
+        content: r.get(3)?,
+        enabled: r.get::<_, i64>(4)? != 0,
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+    })
+}
+
+pub fn mcp_list(c: &Connection) -> Result<Vec<McpServerRow>, StoreError> {
+    let mut stmt = c.prepare(
+        "SELECT id,name,kind,command,args,url,enabled,created_at,updated_at
+         FROM mcp_servers ORDER BY name",
+    )?;
+    let rows = stmt
+        .query_map([], row_to_mcp_server)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn mcp_insert(c: &Connection, row: &McpServerRow) -> Result<(), StoreError> {
+    c.execute(
+        "INSERT INTO mcp_servers(id,name,kind,command,args,url,enabled,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            row.id,
+            row.name,
+            row.kind,
+            row.command,
+            row.args,
+            row.url,
+            row.enabled as i64,
+            row.created_at,
+            row.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn mcp_update(
+    c: &Connection,
+    id: &str,
+    name: &str,
+    kind: &str,
+    command: Option<&str>,
+    args: Option<&str>,
+    url: Option<&str>,
+) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE mcp_servers SET name=?1, kind=?2, command=?3, args=?4, url=?5, updated_at=?6
+         WHERE id=?7",
+        params![name, kind, command, args, url, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+pub fn mcp_set_enabled(c: &Connection, id: &str, enabled: bool) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE mcp_servers SET enabled=?1, updated_at=?2 WHERE id=?3",
+        params![enabled as i64, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+pub fn mcp_delete(c: &Connection, id: &str) -> Result<usize, StoreError> {
+    Ok(c.execute("DELETE FROM mcp_servers WHERE id=?1", [id])?)
+}
+
+pub fn skill_list(c: &Connection) -> Result<Vec<SkillRow>, StoreError> {
+    let mut stmt = c.prepare(
+        "SELECT id,name,description,content,enabled,created_at,updated_at
+         FROM skills ORDER BY name",
+    )?;
+    let rows = stmt
+        .query_map([], row_to_skill)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn skill_insert(c: &Connection, row: &SkillRow) -> Result<(), StoreError> {
+    c.execute(
+        "INSERT INTO skills(id,name,description,content,enabled,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            row.id,
+            row.name,
+            row.description,
+            row.content,
+            row.enabled as i64,
+            row.created_at,
+            row.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn skill_update(
+    c: &Connection,
+    id: &str,
+    name: &str,
+    description: &str,
+    content: &str,
+) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE skills SET name=?1, description=?2, content=?3, updated_at=?4 WHERE id=?5",
+        params![name, description, content, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+pub fn skill_set_enabled(c: &Connection, id: &str, enabled: bool) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE skills SET enabled=?1, updated_at=?2 WHERE id=?3",
+        params![enabled as i64, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+pub fn skill_delete(c: &Connection, id: &str) -> Result<usize, StoreError> {
+    Ok(c.execute("DELETE FROM skills WHERE id=?1", [id])?)
+}
+
 // ================================================================ meta KV
 
 pub fn meta_get(c: &Connection, key: &str) -> Result<Option<String>, StoreError> {
