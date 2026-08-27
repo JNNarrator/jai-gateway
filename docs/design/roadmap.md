@@ -360,11 +360,20 @@
 - 测试：`tests/m7_import_webdav.rs` 3 项 + import/sync 单测全绿
 - 全量回归：77 单测 + M2/M3/M4/M5/M6/M7 集成共 34 项全绿，`cargo fmt --check` + clippy -D warnings 零警告
 
+### M8（收尾加固）—— 自动化部分已完成 ✅（48h 常驻观察待公测）
+
+- 全矩阵回归一键脚本：`scripts/regression.sh`（fmt / clippy / test / 前端 build）
+- fuzz 简表：`tests/m8_hardening.rs` 500 个确定性随机 body 覆盖四类入站解码器与
+  SSE 解析器，无 panic/悬挂
+- 护栏常量审计：现有 `ir::validate_guards` 单测（blocks ≤ 64 / args ≤ 256KB）持续全绿
+- 文档一致性：README / roadmap 随 M1–M8 同步更新
+- 资源/性能基线与 48h 本机观察：列入 M9 发布前真机验收项（本仓库无法自动完成）
+
 ### 待办（下一里程碑）
 
-1. M8 收尾加固：全矩阵回归脚本、fuzz 简表、资源/性能基线、文档一致性
+1. M9 发布工程：签名/公证/更新通道/CHANGELOG/tag
 2. MCP（Model Context Protocol）管理
 3. 技能（skill）管理
-4. 真机验收 M1–M7（Claude Code/Codex 跨族链路与工具回传）
+4. 真机验收 M1–M8（Claude Code/Codex 跨族链路、WebDAV、48h 常驻）
 
-> 历史快照：M1–M7 完成快照已并入本节；更早的记录见 git 历史。
+> 历史快照：M1–M8 自动化加固快照已并入本节；更早的记录见 git 历史。
