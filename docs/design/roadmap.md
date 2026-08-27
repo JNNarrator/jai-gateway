@@ -349,11 +349,22 @@
 - 集成测试 `tests/m6_responses_inbound.rs` 4 项全绿：文本 / 工具 / 流式 / 404 错误形状
 - 全量回归：71 单测 + M2/M3/M4/M5/M6 集成共 31 项全绿，`cargo fmt --check` + clippy -D warnings 零警告
 
+### M7（配置导入 + WebDAV 同步）—— 已完成 ✅
+
+- 导入：`store/import.rs` 解析 `jai-export/v1`，按 (name, base_url) 去重 upsert，
+  生成「待录入密钥」清单与导入报告（新增/重复/模型/无效供应商）
+- WebDAV：`sync.rs` PUT/GET 推拉 `jai-config.json`，Basic Auth，密码存系统钥匙串；
+  推送前本地快照留存（`webdav_last_snapshot`），last-write-wins
+- Tauri IPC：`config_import` / `webdav_config_get/set` / `webdav_push/pull`
+- UI：新增「同步」页 —— 粘贴导入、WebDAV 配置、手动推/拉
+- 测试：`tests/m7_import_webdav.rs` 3 项 + import/sync 单测全绿
+- 全量回归：77 单测 + M2/M3/M4/M5/M6/M7 集成共 34 项全绿，`cargo fmt --check` + clippy -D warnings 零警告
+
 ### 待办（下一里程碑）
 
-1. M7 配置导入 + WebDAV 同步
+1. M8 收尾加固：全矩阵回归脚本、fuzz 简表、资源/性能基线、文档一致性
 2. MCP（Model Context Protocol）管理
 3. 技能（skill）管理
-4. 真机验收 M1–M6（Claude Code/Codex 跨族链路与工具回传）
+4. 真机验收 M1–M7（Claude Code/Codex 跨族链路与工具回传）
 
-> 历史快照：M1–M6 完成快照已并入本节；更早的记录见 git 历史。
+> 历史快照：M1–M7 完成快照已并入本节；更早的记录见 git 历史。

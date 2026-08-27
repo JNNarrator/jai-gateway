@@ -13,4 +13,5 @@ pub mod discover;
 pub mod router;
 pub mod server;
 pub mod store;
+pub mod sync;
 pub mod vault;

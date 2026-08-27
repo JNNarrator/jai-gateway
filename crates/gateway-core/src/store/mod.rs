@@ -4,6 +4,7 @@
 //! 迁移机制：`PRAGMA user_version` 逐版本事务推进，零外部依赖（§7）。
 
 pub mod export;
+pub mod import;
 pub mod logs;
 pub mod migrations;
 pub mod retention;
@@ -187,6 +188,17 @@ pub fn provider_get(c: &Connection, id: &str) -> Result<Option<ProviderRow>, Sto
     Ok(c.query_row(&sql, [id], row_to_provider).optional()?)
 }
 
+/// 按 (name, base_url) 查找现有供应商，供导入去重使用。
+pub fn provider_get_by_name_base(
+    c: &Connection,
+    name: &str,
+    base_url: &str,
+) -> Result<Option<ProviderRow>, StoreError> {
+    let sql = format!("SELECT {PROVIDER_COLS} FROM providers WHERE name = ?1 AND base_url = ?2");
+    Ok(c.query_row(&sql, [name, base_url], row_to_provider)
+        .optional()?)
+}
+
 pub fn provider_list(c: &Connection) -> Result<Vec<ProviderRow>, StoreError> {
     let sql =
         format!("SELECT {PROVIDER_COLS} FROM providers ORDER BY priority ASC, created_at ASC");
@@ -311,6 +323,17 @@ pub fn model_list_by_provider(
         .query_map([provider_id], row_to_model)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// 按 (provider_id, model_name) 查模型行（导入后按需禁用）。
+pub fn model_get_by_provider_name(
+    c: &Connection,
+    provider_id: &str,
+    model_name: &str,
+) -> Result<Option<ModelRow>, StoreError> {
+    let sql = format!("SELECT {MODEL_COLS} FROM models WHERE provider_id=?1 AND model_name=?2");
+    Ok(c.query_row(&sql, [provider_id, model_name], row_to_model)
+        .optional()?)
 }
 
 pub fn model_update_limits(

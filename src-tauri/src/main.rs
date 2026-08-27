@@ -13,7 +13,8 @@
 use gateway_core::codec::Family;
 use gateway_core::discover::discover_models;
 use gateway_core::server::{self, GatewayCtx};
-use gateway_core::store::{self, logs, Db, GatewayKeyRow, ModelRow, ProviderRow};
+use gateway_core::store::{self, import, logs, Db, GatewayKeyRow, ModelRow, ProviderRow};
+use gateway_core::sync::{self, WebDavConfig};
 use gateway_core::vault;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -544,6 +545,140 @@ async fn export_config_json(core: State<'_, AppCore>) -> Result<String, String> 
     .map_err(join_err)?
 }
 
+// ---------------------------------------------------------------- M7：导入 + WebDAV
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavConfigDto {
+    pub url: String,
+    pub username: String,
+    pub directory: String,
+}
+
+impl From<WebDavConfig> for WebDavConfigDto {
+    fn from(c: WebDavConfig) -> Self {
+        Self {
+            url: c.url,
+            username: c.username,
+            directory: c.directory,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavConfigInput {
+    pub url: String,
+    pub username: String,
+    pub directory: String,
+    /// Some(非空) 覆盖密码；None/空串保持原密码
+    pub password: Option<String>,
+}
+
+#[tauri::command]
+async fn config_import(
+    core: State<'_, AppCore>,
+    text: String,
+    strict: Option<bool>,
+) -> Result<import::ImportReport, String> {
+    let db = core.db.clone();
+    let strict = strict.unwrap_or(false);
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| import::apply_import(c, &text, strict).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn webdav_config_get(core: State<'_, AppCore>) -> Result<Option<WebDavConfigDto>, String> {
+    let db = core.db.clone();
+    let cfg: Option<WebDavConfig> = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| sync::config_get(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    Ok(cfg.map(WebDavConfigDto::from))
+}
+
+#[tauri::command]
+async fn webdav_config_set(
+    core: State<'_, AppCore>,
+    input: WebDavConfigInput,
+) -> Result<(), String> {
+    if let Some(pw) = input.password.as_deref().filter(|s| !s.trim().is_empty()) {
+        let ref_ = sync::WEBDAV_KEYRING_REF.to_string();
+        let pw = pw.to_string();
+        tokio::task::spawn_blocking(move || vault::set_secret(&ref_, &pw))
+            .await
+            .map_err(join_err)?
+            .map_err(vault_msg)?;
+    }
+    let cfg = WebDavConfig {
+        url: normalize_base(&input.url),
+        username: input.username.trim().to_string(),
+        directory: input.directory.trim().to_string(),
+    };
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| sync::config_set(c, &cfg))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn webdav_push(core: State<'_, AppCore>) -> Result<(), String> {
+    let cfg = get_webdav_config(&core).await?;
+    let password = get_webdav_password().await?;
+    let export_text = export_config_json(core.clone()).await?;
+
+    // 推送前本地快照留存一份，用于误操作回退
+    let db = core.db.clone();
+    let snap = export_text.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| sync::snapshot_put(c, &snap))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    sync::push(&core.http, &cfg, &password, export_text).await
+}
+
+#[tauri::command]
+async fn webdav_pull(core: State<'_, AppCore>) -> Result<import::ImportReport, String> {
+    let cfg = get_webdav_config(&core).await?;
+    let password = get_webdav_password().await?;
+    let text = sync::pull(&core.http, &cfg, &password).await?;
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| import::apply_import(c, &text, false).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)?
+}
+
+async fn get_webdav_config(core: &AppCore) -> Result<WebDavConfig, String> {
+    let db = core.db.clone();
+    let cfg: Option<WebDavConfig> = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| sync::config_get(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    cfg.ok_or_else(|| "尚未配置 WebDAV".to_string())
+}
+
+async fn get_webdav_password() -> Result<String, String> {
+    let ref_ = sync::WEBDAV_KEYRING_REF.to_string();
+    tokio::task::spawn_blocking(move || vault::get_secret(&ref_))
+        .await
+        .map_err(join_err)?
+        .map_err(vault_msg)?
+        .ok_or_else(|| "WebDAV 密码尚未录入，请在设置中保存".to_string())
+}
+
 #[tauri::command]
 async fn cors_allow_get(core: State<'_, AppCore>) -> Result<Vec<String>, String> {
     let raw = core
@@ -980,6 +1115,11 @@ fn main() {
             gateway_key_regenerate,
             logs_recent,
             export_config_json,
+            config_import,
+            webdav_config_get,
+            webdav_config_set,
+            webdav_push,
+            webdav_pull,
             cors_allow_get,
             cors_allow_set,
             settings_get,

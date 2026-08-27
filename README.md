@@ -2,7 +2,7 @@
 
 > 开箱即用的本地 AI API 网关：把官方与第三方中转的杂牌 token 来源，收敛成一个稳定的本机入口，并让多设备（macOS / Windows）配置保持同步。
 
-**状态**：开发中 —— M0（骨架）/ M1（单渠道直通）/ M2（多渠道故障转移）/ M3（Claude Code 接入）/ M4（跨族转换·上半场）/ M5（跨族转换·下半场）/ M6（Responses API 入站）已完成，WebDAV 同步、MCP 与技能管理按[路线图](docs/design/roadmap.md)推进中。
+**状态**：开发中 —— M0（骨架）/ M1（单渠道直通）/ M2（多渠道故障转移）/ M3（Claude Code 接入）/ M4（跨族转换·上半场）/ M5（跨族转换·下半场）/ M6（Responses API 入站）/ M7（配置导入 + WebDAV 同步）已完成，M8 加固、MCP 与技能管理按[路线图](docs/design/roadmap.md)推进中。
 
 ## 它解决什么问题
 

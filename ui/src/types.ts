@@ -62,3 +62,17 @@ export interface SettingsDto {
   retentionDays: number;
   logRowCap: number;
 }
+
+export interface WebDavConfigDto {
+  url: string;
+  username: string;
+  directory: string;
+}
+
+export interface ImportReport {
+  providersImported: number;
+  providersSkippedDuplicate: number;
+  modelsImported: number;
+  missingKeys: string[];
+  invalidProviders: string[];
+}

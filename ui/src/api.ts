@@ -3,10 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   GwStatus,
   GatewayKeyInfo,
+  ImportReport,
   LogRowView,
   ModelRow,
   ProviderDto,
   SettingsDto,
+  WebDavConfigDto,
 } from "./types";
 
 export const api = {
@@ -58,9 +60,20 @@ export const api = {
   gatewayKeyRegenerate: () =>
     invoke<GatewayKeyInfo>("gateway_key_regenerate"),
 
-  // 日志 / 导出 / 设置
+  // 日志 / 导出 / 设置 / WebDAV
   logsRecent: (limit = 100) => invoke<LogRowView[]>("logs_recent", { limit }),
   exportConfigJson: () => invoke<string>("export_config_json"),
+  configImport: (text: string, strict?: boolean) =>
+    invoke<ImportReport>("config_import", { text, strict: strict ?? false }),
+  webdavConfigGet: () => invoke<WebDavConfigDto | null>("webdav_config_get"),
+  webdavConfigSet: (input: {
+    url: string;
+    username: string;
+    directory: string;
+    password?: string | null;
+  }) => invoke<void>("webdav_config_set", { input }),
+  webdavPush: () => invoke<void>("webdav_push"),
+  webdavPull: () => invoke<ImportReport>("webdav_pull"),
   corsAllowGet: () => invoke<string[]>("cors_allow_get"),
   corsAllowSet: (list: string[]) => invoke<void>("cors_allow_set", { list }),
   settingsGet: () => invoke<SettingsDto>("settings_get"),

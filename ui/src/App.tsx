@@ -47,12 +47,13 @@ function fmtClock(ms: number | null | undefined): string {
 
 // ---------------------------------------------------------------- 页面
 
-type Tab = "gateway" | "providers" | "models" | "logs" | "settings";
+type Tab = "gateway" | "sync" | "providers" | "models" | "logs" | "settings";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("gateway");
   const tabs: [Tab, string][] = [
     ["gateway", "网关"],
+    ["sync", "同步"],
     ["providers", "供应商"],
     ["models", "模型"],
     ["logs", "日志"],
@@ -83,6 +84,7 @@ export default function App() {
 
       <main className="flex-1 space-y-4 overflow-y-auto p-6">
         {tab === "gateway" && <GatewayTab />}
+        {tab === "sync" && <SyncTab />}
         {tab === "providers" && <ProvidersTab />}
         {tab === "models" && <ModelsTab />}
         {tab === "logs" && <LogsTab />}
@@ -233,6 +235,172 @@ OPENAI_API_KEY=sk-jai-…`}</pre>
           <span className="text-xs text-neutral-500">
             导入功能在 M7 提供；API Key 保存在各设备钥匙串中不随导出迁移。
           </span>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- 同步（M7：导入 + WebDAV）
+
+function SyncTab() {
+  const [importText, setImportText] = useState("");
+  const [cfg, setCfg] = useState<{ url: string; username: string; directory: string }>({
+    url: "",
+    username: "",
+    directory: "",
+  });
+  const [pw, setPw] = useState("");
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState("");
+
+  useEffect(() => {
+    api
+      .webdavConfigGet()
+      .then((c) => {
+        if (c) setCfg(c);
+      })
+      .catch(() => {});
+  }, []);
+
+  async function doImport() {
+    setErr("");
+    try {
+      const r = await api.configImport(importText, false);
+      setMsg(
+        `导入完成：新增供应商 ${r.providersImported}，重复跳过 ${r.providersSkippedDuplicate}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
+      );
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  async function saveCfg() {
+    setErr("");
+    try {
+      await api.webdavConfigSet({ ...cfg, password: pw || null });
+      setPw("");
+      setMsg("WebDAV 连接配置已保存");
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  async function doPush() {
+    setBusy("push");
+    setErr("");
+    try {
+      await api.webdavPush();
+      setMsg("已推送到 WebDAV，推送前本地快照已留存");
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function doPull() {
+    setBusy("pull");
+    setErr("");
+    try {
+      const r = await api.webdavPull();
+      setMsg(
+        `拉取并导入完成：新增供应商 ${r.providersImported}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
+      );
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-4">
+      <h1 className="text-lg font-semibold">配置同步</h1>
+      {err && (
+        <div className="rounded border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+          {err}
+        </div>
+      )}
+      {msg && (
+        <div className="rounded border border-emerald-900 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
+          {msg}
+        </div>
+      )}
+
+      <Card title="导入导出 JSON">
+        <p className="mb-3 text-xs leading-relaxed text-neutral-500">
+          导出产物只含供应商与模型定义，不含任何 API Key。导入后请在「供应商」页逐项补录凭据。
+        </p>
+        <textarea
+          className={`${inputCls} h-32 font-mono`}
+          value={importText}
+          onChange={(e) => setImportText(e.target.value)}
+          placeholder="粘贴从另一台设备导出的 jai-export JSON…"
+        />
+        <div className="mt-3 flex gap-2">
+          <button className={btnPrimary} onClick={doImport}>
+            导入
+          </button>
+          <span className="text-xs text-neutral-500">
+            导出入口仍在「网关」页。
+          </span>
+        </div>
+      </Card>
+
+      <Card title="WebDAV 同步">
+        <p className="mb-3 text-xs leading-relaxed text-neutral-500">
+          手动推/拉：推送使用本机当前配置覆盖远端；拉取使用远端配置覆盖本机
+          （last-write-wins）。推送前会在本地留存一份快照。
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="text-xs text-neutral-400">
+            WebDAV 根地址
+            <input
+              className={`${inputCls} mt-1 font-mono`}
+              value={cfg.url}
+              onChange={(e) => setCfg({ ...cfg, url: e.target.value })}
+              placeholder="https://dav.example.com/remote.php/dav/files/u"
+            />
+          </label>
+          <label className="text-xs text-neutral-400">
+            用户名
+            <input
+              className={`${inputCls} mt-1`}
+              value={cfg.username}
+              onChange={(e) => setCfg({ ...cfg, username: e.target.value })}
+            />
+          </label>
+          <label className="text-xs text-neutral-400">
+            目录（可选）
+            <input
+              className={`${inputCls} mt-1 font-mono`}
+              value={cfg.directory}
+              onChange={(e) => setCfg({ ...cfg, directory: e.target.value })}
+              placeholder="jai/backups"
+            />
+          </label>
+          <label className="text-xs text-neutral-400">
+            密码（存入钥匙串，留空保持原密码）
+            <input
+              className={`${inputCls} mt-1`}
+              type="password"
+              value={pw}
+              onChange={(e) => setPw(e.target.value)}
+            />
+          </label>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button className={btnPrimary} onClick={saveCfg}>
+            保存配置
+          </button>
+          <button className={btnGhost} disabled={busy === "push"} onClick={doPush}>
+            {busy === "push" ? "推送中…" : "推送"}
+          </button>
+          <button className={btnGhost} disabled={busy === "pull"} onClick={doPull}>
+            {busy === "pull" ? "拉取中…" : "拉取"}
+          </button>
         </div>
       </Card>
     </div>
