@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod anthropic;
 pub mod openai;
 
 /// 协议家族。同族请求/上游之间允许字节级直通（见 IR 文档 §1 原则一）。

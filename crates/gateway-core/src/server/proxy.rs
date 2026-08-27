@@ -1,12 +1,14 @@
-//! OpenAI 兼容代理（M1 直通 + M2 多渠道故障转移）。
+//! OpenAI / Anthropic 同族直通代理（M1 直通 + M2 多渠道故障转移 + M3 Anthropic 入站）。
 //!
-//! 约束（roadmap M1/M2）：
-//! - 同族 `openai_compat` 字节级透传（验收：上游收到的 body SHA-256 == 客户端发出值）
+//! 约束（roadmap M1/M2/M3）：
+//! - 同族字节级透传（验收：上游收到的 body SHA-256 == 客户端发出值）
 //! - 多渠道：按 `priority, rowid` 序逐渠道尝试；{连接拒绝、超时、UpstreamAuth、
 //!   RateLimit、Overloaded、上游 5xx} → 下一渠道；InvalidRequest / ContextTooLong
 //!   → 即刻返回不切换；**首个字节下发下游后禁止切换**
 //! - SSE 全程管道转发 + usage 旁路扫描落日志（绝不反压客户端）
 //! - 超时三件套：上游连接 10s（client 构造）、首字节 60s、流空闲 120s
+//! - Anthropic 线：x-api-key + anthropic-version 头（缺省注入默认版本）、
+//!   错误 Anthropic 化（type:error）、Overloaded→HTTP 529
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +23,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
+use crate::codec::anthropic as anthropic_codec;
 use crate::codec::openai::{
     PeekRequest, UsageScanner, error_body, extract_usage, peek, url_join,
 };
@@ -44,6 +47,87 @@ pub const NONSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 /// 上游错误体读取上限（原样转发用）
 const MAX_ERROR_BODY: usize = 1024 * 1024;
+
+// ---------------------------------------------------------------- 入站线（wire）
+
+/// 同族直通的两条入站线。差异（路径/鉴权头/错误形状/日志族）全部收敛在此，
+/// M1 的 OpenAI 直通与 M3 的 Anthropic 直通共用同一套流水线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundWire {
+    OpenAi,
+    Anthropic,
+}
+
+impl InboundWire {
+    /// 要求的渠道协议族（providers.family 值）
+    pub fn family(&self) -> &'static str {
+        match self {
+            InboundWire::OpenAi => "openai_compat",
+            InboundWire::Anthropic => "anthropic",
+        }
+    }
+
+    /// 日志 inbound_family 字段值
+    pub fn log_family(&self) -> &'static str {
+        match self {
+            InboundWire::OpenAi => "openai",
+            InboundWire::Anthropic => "anthropic",
+        }
+    }
+
+    /// 上游路径（base_url 拼接）
+    pub fn upstream_path(&self) -> &'static str {
+        match self {
+            InboundWire::OpenAi => "/chat/completions",
+            InboundWire::Anthropic => "/v1/messages",
+        }
+    }
+
+    /// 上游鉴权头组装
+    pub fn apply_auth(
+        &self,
+        req: reqwest::RequestBuilder,
+        secret: &str,
+    ) -> reqwest::RequestBuilder {
+        match self {
+            InboundWire::OpenAi => req.bearer_auth(secret),
+            InboundWire::Anthropic => req
+                .header("x-api-key", secret)
+                .header(
+                    "anthropic-version",
+                    anthropic_codec::DEFAULT_ANTHROPIC_VERSION,
+                ),
+        }
+    }
+
+    /// 错误响应形状（入站协议方言）
+    pub fn error_response(
+        &self,
+        status: StatusCode,
+        message: &str,
+        err_type: &str,
+        code: Option<&str>,
+    ) -> Response {
+        match self {
+            InboundWire::OpenAi => {
+                (status, Json(error_body(message, err_type, code))).into_response()
+            }
+            InboundWire::Anthropic => (
+                status,
+                Json(anthropic_codec::error_body(message, err_type)),
+            )
+                .into_response(),
+        }
+    }
+
+    /// Overloaded → Anthropic 侧保留 529（roadmap M3 验收 4）
+    pub fn overloaded_status(&self) -> StatusCode {
+        match self {
+            InboundWire::OpenAi => StatusCode::SERVICE_UNAVAILABLE,
+            InboundWire::Anthropic => StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+}
 
 // ---------------------------------------------------------------- 共享上下文
 
@@ -139,6 +223,7 @@ pub async fn security_mw(
 #[allow(clippy::too_many_arguments)]
 fn emit_log(
     logs: &crate::store::logs::LogHandle,
+    inbound_family: &str,
     peeked: Option<&PeekRequest>,
     provider_id: Option<&str>,
     upstream_model_id: Option<String>,
@@ -154,7 +239,7 @@ fn emit_log(
         .unwrap_or((None, None, None, None));
     logs.emit(LogEvent {
         ts: store::now_ms(),
-        inbound_family: "openai".into(),
+        inbound_family: inbound_family.into(),
         route_mode: "passthrough",
         model_name: peeked.map(|p| p.model.clone()).unwrap_or_default(),
         provider_id: provider_id.map(str::to_string),
@@ -171,15 +256,6 @@ fn emit_log(
         error_kind,
         error_summary,
     });
-}
-
-fn oai_error_response(
-    status: StatusCode,
-    message: &str,
-    err_type: &str,
-    code: Option<&str>,
-) -> Response {
-    (status, Json(error_body(message, err_type, code))).into_response()
 }
 
 fn empty_resp(status: StatusCode) -> Response {
@@ -242,21 +318,19 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
         }
         Ok(Err(e)) => {
             eprintln!("[models] db: {e}");
-            return oai_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "查询模型列表失败",
-                "api_error",
-                None,
-            );
+            return Json(json!({
+                "object": "list", "data": [],
+                "error": {"message": format!("查询模型列表失败: {e}"), "type": "api_error"}
+            }))
+            .into_response();
         }
         Err(e) => {
             eprintln!("[models] join: {e}");
-            return oai_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error",
-                "api_error",
-                None,
-            );
+            return Json(json!({
+                "object": "list", "data": [],
+                "error": {"message": "internal error", "type": "api_error"}
+            }))
+            .into_response();
         }
     };
 
@@ -267,21 +341,68 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
 enum Attempt {
     /// 已经向客户端交付（最终响应或确定性错误）
     Delivered(Response),
-    /// 本次渠道失败，且允许转移到下一渠道
+    /// 本次渠道失败，且允许转移到下一渠道。
+    /// 携带最后一个 HTTP 错误（若为网络级失败则无），供全渠道失败时原样回传。
     Failed {
         kind: &'static str,
         summary: String,
+        /// 最后一个带 HTTP 状态的上游错误（status + body + content-type）
+        last_http: Option<UpstreamError>,
     },
 }
 
-/// POST /v1/chat/completions —— M1 直通 + M2 多渠道故障转移主入口。
+/// 可直接回传的上游错误响应（保留原始状态码与方言形状）。
+struct UpstreamError {
+    status: StatusCode,
+    content_type: Option<HeaderValue>,
+    body: Bytes,
+}
+
+/// POST /v1/chat/completions —— OpenAI 线主入口。
 pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Response {
+    dispatch(InboundWire::OpenAi, ctx, req).await
+}
+
+/// POST /v1/messages —— Anthropic 线主入口（M3，Claude Code 直连）。
+pub async fn anthropic_messages(State(ctx): State<GatewayCtx>, req: Request) -> Response {
+    dispatch(InboundWire::Anthropic, ctx, req).await
+}
+
+/// POST /v1/messages/count_tokens —— 粗估端点（M3，避免 Claude Code 降级）。
+pub async fn anthropic_count_tokens(
+    State(_ctx): State<GatewayCtx>,
+    req: Request,
+) -> Response {
+    let body = match to_bytes(req.into_body(), MAX_REQUEST_BODY).await {
+        Ok(b) => b,
+        Err(_) => {
+            return InboundWire::Anthropic.error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "请求体超过 32MB 上限",
+                "invalid_request_error",
+                None,
+            );
+        }
+    };
+    match anthropic_codec::count_tokens(&body) {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(msg) => InboundWire::Anthropic.error_response(
+            StatusCode::BAD_REQUEST,
+            &msg,
+            "invalid_request_error",
+            None,
+        ),
+    }
+}
+
+/// 直通主流程：路由候选 → 逐渠道尝试（故障转移）。
+async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response {
     let started = Instant::now();
 
     let body = match to_bytes(req.into_body(), MAX_REQUEST_BODY).await {
         Ok(b) => b,
         Err(_) => {
-            return oai_error_response(
+            return wire.error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "请求体超过 32MB 上限",
                 "invalid_request_error",
@@ -295,6 +416,7 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
         Err(msg) => {
             emit_log(
                 &ctx.logs,
+                wire.log_family(),
                 None,
                 None,
                 None,
@@ -305,7 +427,12 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
                 Some("InvalidRequest".into()),
                 Some(msg.clone()),
             );
-            return oai_error_response(StatusCode::BAD_REQUEST, &msg, "invalid_request_error", None);
+            return wire.error_response(
+                StatusCode::BAD_REQUEST,
+                &msg,
+                "invalid_request_error",
+                None,
+            );
         }
     };
 
@@ -320,11 +447,11 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 eprintln!("[route] db: {e}");
-                return internal_(&ctx, &peeked, &started);
+                return internal_error(&ctx, wire, &peeked, &started);
             }
             Err(e) => {
                 eprintln!("[route] join: {e}");
-                return internal_(&ctx, &peeked, &started);
+                return internal_error(&ctx, wire, &peeked, &started);
             }
         }
     };
@@ -333,6 +460,7 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
         let msg = format!("模型 {model:?} 不存在或其渠道未启用");
         emit_log(
             &ctx.logs,
+            wire.log_family(),
             Some(&peeked),
             None,
             None,
@@ -343,7 +471,7 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
             Some("InvalidRequest".into()),
             Some(msg.clone()),
         );
-        return oai_error_response(
+        return wire.error_response(
             StatusCode::NOT_FOUND,
             &msg,
             "invalid_request_error",
@@ -352,12 +480,13 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
     }
 
     // ---- 逐渠道尝试（按 priority, rowid 序）----
-    // M2 故障转移：每个渠道失败时按 router 分类决定切换或停止；
-    // 全部失败返回最后一个错误（roadmap M2）。
+    // 故障转移：每个渠道失败时按 router 分类决定切换或停止；
+    // 全部失败返回最后一个错误（roadmap M2：单轮遍历一遍即止，返回最后一个错误）。
     let mut last_kind: &'static str = "ProviderOther";
     let mut last_summary = String::from("所有渠道均失败");
+    let mut last_http: Option<UpstreamError> = None;
     for cand in &candidates {
-        if cand.family != "openai_compat" {
+        if cand.family != wire.family() {
             // 跨族转换自 M4 起提供；当前跳过该渠道尝试下一家
             provider_mark_fail(
                 &ctx.db,
@@ -372,18 +501,51 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
             continue;
         }
 
-        match try_openai_candidate(&ctx, &peeked, cand, &body, started).await {
+        match try_candidate(&ctx, wire, &peeked, cand, &body, started).await {
             Attempt::Delivered(resp) => return resp,
-            Attempt::Failed { kind, summary } => {
+            Attempt::Failed {
+                kind,
+                summary,
+                last_http: eh,
+            } => {
                 last_kind = kind;
                 last_summary = summary;
+                if let Some(e) = eh {
+                    last_http = Some(e);
+                }
             }
         }
     }
 
-    // 全部渠道失败：返回最后一个错误（OpenAI schema）
+    // 全部渠道失败。
+    // - 若存在带 HTTP 状态的上游错误：原样回传（保留状态码与协议方言形状，
+    //   如 Anthropic 线 429/529）—— roadmap M2「返回最后一个错误」
+    // - 否则（网络级失败）：统一 502
+    if let Some(err) = last_http {
+        emit_log(
+            &ctx.logs,
+            wire.log_family(),
+            Some(&peeked),
+            None,
+            None,
+            err.status.as_u16() as i64,
+            ms_since(started),
+            peeked.stream,
+            None,
+            Some(last_kind.into()),
+            Some(last_summary.clone()),
+        );
+        let mut b = Response::builder().status(err.status);
+        b = match err.content_type {
+            Some(ct) => b.header(header::CONTENT_TYPE, ct),
+            None => b.header(header::CONTENT_TYPE, "application/json"),
+        };
+        return b.body(Body::from(err.body)).unwrap_or_else(|_| empty_resp(err.status));
+    }
+
     emit_log(
         &ctx.logs,
+        wire.log_family(),
         Some(&peeked),
         None,
         None,
@@ -394,7 +556,7 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
         Some(last_kind.into()),
         Some(last_summary.clone()),
     );
-    oai_error_response(
+    wire.error_response(
         StatusCode::BAD_GATEWAY,
         &last_summary,
         "api_error",
@@ -402,9 +564,10 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
     )
 }
 
-/// 尝试单渠道（openai_compat 直通）。失败已按 router 分类，只返回「可转移」失败。
-async fn try_openai_candidate(
+/// 尝试单渠道（同族直通）。失败已按 router 分类，只返回「可转移」失败。
+async fn try_candidate(
     ctx: &GatewayCtx,
+    wire: InboundWire,
     peeked: &PeekRequest,
     cand: &store::RouteCandidate,
     body: &Bytes,
@@ -420,6 +583,7 @@ async fn try_openai_candidate(
                 provider_mark_fail(&ctx.db, &cand.provider_id, msg);
                 emit_log(
                     &ctx.logs,
+                    wire.log_family(),
                     Some(peeked),
                     Some(&cand.provider_id),
                     None,
@@ -433,6 +597,7 @@ async fn try_openai_candidate(
                 return Attempt::Failed {
                     kind: "UpstreamAuth",
                     summary: format!("{}：{msg}", cand.provider_name),
+                    last_http: None,
                 };
             }
             Ok(Err(e)) => {
@@ -440,6 +605,7 @@ async fn try_openai_candidate(
                 provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
                 emit_log(
                     &ctx.logs,
+                    wire.log_family(),
                     Some(peeked),
                     Some(&cand.provider_id),
                     None,
@@ -453,6 +619,7 @@ async fn try_openai_candidate(
                 return Attempt::Failed {
                     kind: "ProviderOther",
                     summary: format!("{}：{msg}", cand.provider_name),
+                    last_http: None,
                 };
             }
             Err(e) => {
@@ -460,14 +627,15 @@ async fn try_openai_candidate(
                 return Attempt::Failed {
                     kind: "ProviderOther",
                     summary: format!("{}：密钥环任务失败", cand.provider_name),
+                    last_http: None,
                 };
             }
         }
     };
 
     // ---- 组装上游请求（body 原样字节）----
-    let url = url_join(&cand.base_url, "/chat/completions");
-    let mut out_req = ctx.http.post(&url).bearer_auth(&secret);
+    let url = url_join(&cand.base_url, wire.upstream_path());
+    let mut out_req = wire.apply_auth(ctx.http.post(&url), &secret);
     if let Some(eh_raw) = cand.extra_headers.as_deref() {
         match serde_json::from_str::<serde_json::Map<String, Value>>(eh_raw) {
             Ok(map) => {
@@ -495,6 +663,7 @@ async fn try_openai_candidate(
             provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
             emit_log(
                 &ctx.logs,
+                wire.log_family(),
                 Some(peeked),
                 Some(&cand.provider_id),
                 None,
@@ -508,6 +677,7 @@ async fn try_openai_candidate(
             return Attempt::Failed {
                 kind: "ProviderOther",
                 summary: format!("{}：{msg}", cand.provider_name),
+                last_http: None,
             };
         }
     };
@@ -531,6 +701,7 @@ async fn try_openai_candidate(
                 provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
                 emit_log(
                     &ctx.logs,
+                    wire.log_family(),
                     Some(peeked),
                     Some(&cand.provider_id),
                     cand.upstream_model_id.clone(),
@@ -558,6 +729,7 @@ async fn try_openai_candidate(
                 provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
                 emit_log(
                     &ctx.logs,
+                    wire.log_family(),
                     Some(peeked),
                     Some(&cand.provider_id),
                     cand.upstream_model_id.clone(),
@@ -578,6 +750,11 @@ async fn try_openai_candidate(
                         cand.provider_name,
                         up_status.as_u16()
                     ),
+                    last_http: Some(UpstreamError {
+                        status: up_status,
+                        content_type: upstream_ct,
+                        body: bytes,
+                    }),
                 };
             }
             AttemptVerdict::Success => unreachable!("非 2xx 不会判 Success"),
@@ -595,17 +772,24 @@ async fn try_openai_candidate(
         .unwrap_or(false);
 
     let delivered = if ct_is_sse || peeked.stream {
-        streaming_response(ctx.clone(), peeked.clone(), cand.clone(), resp, up_status, started)
+        streaming_response(ctx.clone(), wire, peeked.clone(), cand.clone(), resp, up_status, started)
             .await
     } else {
-        plain_response(ctx.clone(), peeked.clone(), cand.clone(), resp, up_status, started).await
+        plain_response(ctx.clone(), wire, peeked.clone(), cand.clone(), resp, up_status, started)
+            .await
     };
     Attempt::Delivered(delivered)
 }
 
-fn internal_(ctx: &GatewayCtx, p: &PeekRequest, started: &Instant) -> Response {
+fn internal_error(
+    ctx: &GatewayCtx,
+    wire: InboundWire,
+    p: &PeekRequest,
+    started: &Instant,
+) -> Response {
     emit_log(
         &ctx.logs,
+        wire.log_family(),
         Some(p),
         None,
         None,
@@ -616,13 +800,19 @@ fn internal_(ctx: &GatewayCtx, p: &PeekRequest, started: &Instant) -> Response {
         Some("ProviderOther".into()),
         Some("internal error".into()),
     );
-    oai_error_response(StatusCode::INTERNAL_SERVER_ERROR, "内部错误", "api_error", None)
+    wire.error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "内部错误",
+        "api_error",
+        None,
+    )
 }
 
 // ---------------------------------------------------------------- 非流式
 
 async fn plain_response(
     ctx: GatewayCtx,
+    wire: InboundWire,
     peeked: PeekRequest,
     cand: store::RouteCandidate,
     resp: reqwest::Response,
@@ -635,6 +825,7 @@ async fn plain_response(
             let msg = format!("上游响应读取失败: {e}");
             emit_log(
                 &ctx.logs,
+                wire.log_family(),
                 Some(&peeked),
                 Some(&cand.provider_id),
                 None,
@@ -645,11 +836,12 @@ async fn plain_response(
                 Some("ProviderOther".into()),
                 Some(msg.clone()),
             );
-            return oai_error_response(StatusCode::BAD_GATEWAY, &msg, "api_error", None);
+            return wire.error_response(StatusCode::BAD_GATEWAY, &msg, "api_error", None);
         }
         Err(_) => {
             emit_log(
                 &ctx.logs,
+                wire.log_family(),
                 Some(&peeked),
                 Some(&cand.provider_id),
                 None,
@@ -663,8 +855,8 @@ async fn plain_response(
                     status.as_u16()
                 )),
             );
-            return oai_error_response(
-                StatusCode::GATEWAY_TIMEOUT,
+            return wire.error_response(
+                wire.overloaded_status(),
                 "上游响应读取超时(300s)",
                 "api_error",
                 Some("upstream_read_timeout"),
@@ -678,6 +870,7 @@ async fn plain_response(
 
     emit_log(
         &ctx.logs,
+        wire.log_family(),
         Some(&peeked),
         Some(&cand.provider_id),
         cand.upstream_model_id.clone(),
@@ -700,6 +893,7 @@ async fn plain_response(
 
 async fn streaming_response(
     ctx: GatewayCtx,
+    wire: InboundWire,
     peeked: PeekRequest,
     cand: store::RouteCandidate,
     resp: reqwest::Response,
@@ -717,6 +911,7 @@ async fn streaming_response(
             provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
             emit_log(
                 &ctx.logs,
+                wire.log_family(),
                 Some(&peeked),
                 Some(&cand.provider_id),
                 None,
@@ -727,7 +922,7 @@ async fn streaming_response(
                 Some("ProviderOther".into()),
                 Some(msg.clone()),
             );
-            return oai_error_response(
+            return wire.error_response(
                 StatusCode::BAD_GATEWAY,
                 &msg,
                 "api_error",
@@ -739,6 +934,7 @@ async fn streaming_response(
             provider_mark_fail(&ctx.db, &cand.provider_id, msg);
             emit_log(
                 &ctx.logs,
+                wire.log_family(),
                 Some(&peeked),
                 Some(&cand.provider_id),
                 None,
@@ -749,7 +945,7 @@ async fn streaming_response(
                 Some("ProviderOther".into()),
                 Some(msg.to_string()),
             );
-            return oai_error_response(
+            return wire.error_response(
                 StatusCode::BAD_GATEWAY,
                 msg,
                 "api_error",
@@ -759,6 +955,7 @@ async fn streaming_response(
         Err(_) => {
             emit_log(
                 &ctx.logs,
+                wire.log_family(),
                 Some(&peeked),
                 Some(&cand.provider_id),
                 None,
@@ -772,8 +969,8 @@ async fn streaming_response(
                     status.as_u16()
                 )),
             );
-            return oai_error_response(
-                StatusCode::GATEWAY_TIMEOUT,
+            return wire.error_response(
+                wire.overloaded_status(),
                 "上游首字节超时(60s)",
                 "api_error",
                 Some("upstream_first_byte_timeout"),
@@ -791,6 +988,7 @@ async fn streaming_response(
         // 客户端瞬间断开：记录后退出
         emit_log(
             &ctx.logs,
+            wire.log_family(),
             Some(&peeked),
             Some(&cand.provider_id),
             cand.upstream_model_id.clone(),
@@ -807,6 +1005,7 @@ async fn streaming_response(
     // 后台泵任务：持有 tx，循环转发并应用空闲超时；结束时负责落日志
     {
         let ctx2 = ctx.clone();
+        let wire2 = wire;
         let peeked2 = peeked.clone();
         let cand2_model = cand.upstream_model_id.clone();
         let pid = cand.provider_id.clone();
@@ -820,6 +1019,7 @@ async fn streaming_response(
                         drop(tx);
                         emit_log(
                             &ctx2.logs,
+                            wire2.log_family(),
                             Some(&peeked2),
                             Some(&pid),
                             cand2_model.clone(),
@@ -840,6 +1040,7 @@ async fn streaming_response(
                         if tx.send(Ok(chunk)).await.is_err() {
                             emit_log(
                                 &ctx2.logs,
+                                wire2.log_family(),
                                 Some(&peeked2),
                                 Some(&pid),
                                 cand2_model.clone(),
@@ -860,6 +1061,7 @@ async fn streaming_response(
                         provider_mark_fail(&ctx2.db, &pid, &msg);
                         emit_log(
                             &ctx2.logs,
+                            wire2.log_family(),
                             Some(&peeked2),
                             Some(&pid),
                             cand2_model.clone(),
@@ -877,6 +1079,7 @@ async fn streaming_response(
                         drop(tx);
                         emit_log(
                             &ctx2.logs,
+                            wire2.log_family(),
                             Some(&peeked2),
                             Some(&pid),
                             cand2_model.clone(),

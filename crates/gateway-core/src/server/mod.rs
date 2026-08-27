@@ -88,6 +88,12 @@ pub fn build_router(ctx: GatewayCtx) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/models", get(proxy::models_list))
+        // M3：Anthropic 入站（Claude Code 直连）+ count_tokens 粗估
+        .route("/v1/messages", post(proxy::anthropic_messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(proxy::anthropic_count_tokens),
+        )
         .layer(middleware::from_fn_with_state(
             ctx.clone(),
             proxy::security_mw,

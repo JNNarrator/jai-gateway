@@ -290,10 +290,23 @@
   （端口保存重启生效、日志开关实时切换、保留策略展示）；启动时从 meta 恢复端口与日志开关
 - 提供商健康徽标 UI：最近成功/失败徽章 + 时间 + 失败摘要（数据源为已有 last_ok_at / last_err_*）
 
+### M3（Claude Code 接入）—— 已完成 ✅
+
+- 入站 Anthropic 直通：`POST /v1/messages` → `family=anthropic` 渠道（`tests/m3_anthropic.rs` 5 项全绿）
+- 双线复用同一流水线：`InboundWire::{OpenAi,Anthropic}` 收敛路径/鉴权头/错误形状/日志族差异；
+  OpenAI 线回归不破坏（M1/M2 测试保持绿）
+- 上游认证：`x-api-key` + `anthropic-version`（缺省注入 `2023-06-01`）
+- `POST /v1/messages/count_tokens`：粗估 `ceil(chars/4)` + 消息/工具开销常量，恒返回正整数（验收 3）
+- 错误 Anthropic 化：`{"type":"error","error":{...}}` 形状；Overloaded → **HTTP 529** 保留（验收 4）
+- 全渠道失败语义修正：最后失败若携带 HTTP 状态，原样回传（保留 429/529 与上游方言），
+  网络级失败才折叠 502 `all_providers_failed`（对齐 roadmap M2「返回最后一个错误」）
+- 日志 `inbound_family='anthropic'` 区分；usage 旁路扫描照常落库（cache_read 校验留待真机）
+- README 快速接入节（`ANTHROPIC_BASE_URL` + 网关 Key 示例）
+
 ### 待办（下一里程碑）
 
-1. M3 Claude Code 接入：入站 Anthropic passthrough + count_tokens（见 §3 M3）
+1. M4 跨族转换上半场：`InboundCodec::OpenAI` 全量 + `UpstreamCodec::Anthropic/Gemini`（见 §3 M4）
 2. 修复 CI 暴露的跨平台问题（若有）
-3. 真机验收 M1/M2（DeepSeek harness / OpenAI 客户端真实流式对话、断流/超时故障注入）
+3. 真机验收 M1–M3（DeepSeek harness / Claude Code 真实对话、断流/超时故障注入、prompt caching）
 
-> 历史快照：M1/M2 完成快照已并入本节；更早的记录见 git 历史。
+> 历史快照：M1/M2/M3 完成快照已并入本节；更早的记录见 git 历史。

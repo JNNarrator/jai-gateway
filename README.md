@@ -2,7 +2,7 @@
 
 > 开箱即用的本地 AI API 网关：把官方与第三方中转的杂牌 token 来源，收敛成一个稳定的本机入口，并让多设备（macOS / Windows）配置保持同步。
 
-**状态**：规划与设计阶段（未开始编码）。欢迎通过 Issue 讨论需求。
+**状态**：开发中 —— M0（骨架）/ M1（单渠道直通）/ M2（多渠道故障转移）/ M3（Claude Code 接入）已完成，跨族协议转换与 Codex/WebDAV 能力按[路线图](docs/design/roadmap.md)推进中。
 
 ## 它解决什么问题
 
@@ -37,6 +37,29 @@ Tauri 2.0 · Rust (Axum + Reqwest) · React + TypeScript + TailwindCSS · SQLite
 ## 第一梯队客户端
 
 Claude Code · Codex · zcode · DeepSeek harness —— 首批适配与验收基准。
+
+## 快速接入
+
+### Claude Code（Anthropic 线，M3 已支持）
+
+在 Claude Code 中把 Base URL 指向 JAI、API Key 换成网关 Key（`sk-jai-*`，见应用「网关」页）：
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:1314
+ANTHROPIC_AUTH_TOKEN=sk-jai-xxxx            # 或 ANTHROPIC_API_KEY=sk-jai-xxxx
+claude
+```
+
+要求：供应商页添加一个 **Anthropic** 协议族渠道并录入上游 Key，模型列表存在 Claude 型号（如 `claude-sonnet-4-5`）且启用。多轮对话、工具调用、prompt caching 均走字节级直通；`count_tokens` 由网关粗估返回，避免客户端降级。
+
+### 任意 OpenAI 兼容客户端（M1/M2 已支持）
+
+```bash
+OPENAI_API_BASE=http://127.0.0.1:1314/v1
+OPENAI_API_KEY=sk-jai-xxxx
+```
+
+同名模型可配置多个渠道，按优先级自动故障转移（一级 5xx/429/超时 → 顺延下一渠道）。
 
 ## License
 
