@@ -5,7 +5,7 @@
   "identifier": "app.jai.gateway",
   "build": {
     "beforeDevCommand": "pnpm --dir ../ui dev",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://127.0.0.1:5173",
     "beforeBuildCommand": "pnpm --dir ../ui build",
     "frontendDist": "../ui/dist"
   },

@@ -61,6 +61,17 @@ OPENAI_API_KEY=sk-jai-xxxx
 
 同名模型可配置多个渠道，按优先级自动故障转移（一级 5xx/429/超时 → 顺延下一渠道）。
 
+## 本地开发启动
+
+```bash
+# 一键启动：Vite + Tauri 桌面壳（避免只跑 cargo run 造成的白屏）
+bash scripts/dev.sh
+```
+
+- Vite 固定监听 `http://127.0.0.1:5173`
+- 网关默认监听 `http://127.0.0.1:1314`
+- 健康检查：`curl http://127.0.0.1:1314/healthz`
+
 ## License
 
 [MIT](./LICENSE)
