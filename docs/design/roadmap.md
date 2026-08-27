@@ -369,11 +369,19 @@
 - 文档一致性：README / roadmap 随 M1–M8 同步更新
 - 资源/性能基线与 48h 本机观察：列入 M9 发布前真机验收项（本仓库无法自动完成）
 
+### M9（发布工程）—— 文档与 CI 已就绪 ✅（签名/公证需真实 secrets 执行）
+
+- `docs/design/release.md`：签名/公证/更新通道/发布流程检查单
+- `.github/workflows/release.yml`：tag 触发 macOS/Windows 构建，接入
+  Apple/Windows 签名 secrets 与 Tauri Release 草稿
+- `CHANGELOG.md`：M1–M8 变更记录
+- README 与 roadmap 同步
+- 实际签名/公证/更新 feed 发布：需要仓库 secrets 与真实证书后执行
+
 ### 待办（下一里程碑）
 
-1. M9 发布工程：签名/公证/更新通道/CHANGELOG/tag
-2. MCP（Model Context Protocol）管理
-3. 技能（skill）管理
-4. 真机验收 M1–M8（Claude Code/Codex 跨族链路、WebDAV、48h 常驻）
+1. MCP（Model Context Protocol）管理
+2. 技能（skill）管理
+3. 真机验收 M1–M9（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
 
-> 历史快照：M1–M8 自动化加固快照已并入本节；更早的记录见 git 历史。
+> 历史快照：M1–M9 工程快照已并入本节；更早的记录见 git 历史。
