@@ -109,6 +109,12 @@ fn ceil_chars4(s: &str) -> u64 {
     chars.div_ceil(4)
 }
 
+/// f32 采样参数精度归一：保留 6 位有效小数，避免 f32 存储噪声
+/// （如 0.9 → 0.899999976）污染上游请求体。
+pub(crate) fn round_f32(v: f32) -> f64 {
+    ((f64::from(v) * 1e6).round()) / 1e6
+}
+
 // ================================================================ 错误形状
 
 /// Anthropic 错误响应体（protocol-ir §6 / M3：错误 Anthropic 化）。
@@ -122,9 +128,374 @@ pub fn error_body(message: &str, err_type: &str) -> Value {
     })
 }
 
+// ================================================================ M4：UpstreamCodec::Anthropic
+
+// 转换路径：CanonicalRequest → Anthropic body；Anthropic 响应 → CanonicalResponse / StreamEvents。
+// 依据 protocol-ir §4/§5 映射表；结构合规在 ir::merge_adjacent_same_role 预处理后展开。
+
+use crate::codec::ir::{
+    Block, CanonMessage, CanonicalRequest, CanonicalResponse, Role, StopReason, StreamEvent,
+    ToolChoice, Usage,
+};
+
+/// 编码请求：IR → Anthropic Messages body。
+/// `max_output_tokens` 由调用方保证（请求侧缺省时用模型配置值）。
+pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
+    if req.system.len() > 1 {
+        return Err(format!(
+            "system 段数为 {}，跨族转换仅支持单条合并 system",
+            req.system.len()
+        ));
+    }
+
+    let mut body = json!({
+        "model": req.model,
+        "messages": [],
+    });
+
+    if let Some(sys) = req.system.first() {
+        body["system"] = Value::String(sys.clone());
+    }
+    if let Some(m) = req.params.max_output_tokens {
+        body["max_tokens"] = json!(m);
+    }
+    let p = &req.params;
+    if let Some(t) = p.temperature {
+        let clamped = t.clamp(0.0, 1.0);
+        if clamped != t {
+            eprintln!("[anthropic] temperature 越界截断 {t} → {clamped}（WARN）");
+        }
+        body["temperature"] = json!(round_f32(clamped));
+    }
+    if let Some(v) = p.top_p {
+        body["top_p"] = json!(round_f32(v));
+    }
+    if let Some(k) = p.top_k {
+        body["top_k"] = json!(k);
+    }
+    if !p.stop_sequences.is_empty() {
+        body["stop_sequences"] = Value::Array(
+            p.stop_sequences.iter().map(|s| Value::String(s.clone())).collect(),
+        );
+    }
+
+    // tools + tool_choice
+    if !req.tools.is_empty() {
+        body["tools"] = Value::Array(
+            req.tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description.as_deref().unwrap_or(""),
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect(),
+        );
+        match &req.tool_choice {
+            ToolChoice::Auto => {}
+            ToolChoice::None => { /* 省略 tools 字段整段（§4-B none） */ }
+            ToolChoice::Required => {
+                body["tool_choice"] = json!({"type": "any"});
+            }
+            ToolChoice::Specific(name) => {
+                body["tool_choice"] = json!({"type": "tool", "name": name});
+            }
+        }
+    }
+
+    // 消息：合并相邻同角色（调用方也可先做）；system 已在顶层。
+    let msgs: Vec<CanonMessage> = crate::codec::ir::merge_adjacent_same_role(req).messages;
+    let mut out = Vec::new();
+    for m in &msgs {
+        match m.role {
+            Role::User => {
+                // user 消息中的 ToolResult 块 + 文本块
+                let mut blocks: Vec<Value> = Vec::new();
+                let mut has_tool_result = false;
+                for b in &m.blocks {
+                    match b {
+                        Block::Text { text } => blocks.push(json!({"type":"text","text":text})),
+                        Block::Image { media_type, data_base64, url } => {
+                            let src = if let Some(b64) = data_base64 {
+                                json!({"type":"base64","media_type":media_type,"data":b64})
+                            } else {
+                                json!({"type":"url","url":url.as_deref().unwrap_or("")})
+                            };
+                            blocks.push(json!({"type":"image","source":src}));
+                        }
+                        Block::ToolResult { call_id, content, is_error } => {
+                            has_tool_result = true;
+                            let content_json: Vec<Value> = content
+                                .iter()
+                                .filter_map(|c| c.as_text())
+                                .map(|t| json!({"type":"text","text":t}))
+                                .collect();
+                            blocks.push(json!({
+                                "type":"tool_result",
+                                "tool_use_id": call_id,
+                                "content": content_json,
+                                "is_error": is_error,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if has_tool_result && blocks.len() > 1 {
+                    // §4-C：tool_result 与其他块同轮时，result 块在前
+                    blocks.sort_by_key(|b| {
+                        if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                            0
+                        } else {
+                            1
+                        }
+                    });
+                }
+                if !blocks.is_empty() {
+                    out.push(json!({"role":"user","content":blocks}));
+                }
+            }
+            Role::Assistant => {
+                let mut blocks: Vec<Value> = Vec::new();
+                for b in &m.blocks {
+                    match b {
+                        Block::Text { text } => blocks.push(json!({"type":"text","text":text})),
+                        Block::ToolUse { id, name, input } => {
+                            blocks.push(json!({
+                                "type":"tool_use",
+                                "id": id,
+                                "name": name,
+                                "input": input,
+                            }));
+                        }
+                        Block::Thinking { .. } => { /* v1 不产出 */ }
+                        _ => {}
+                    }
+                }
+                if !blocks.is_empty() {
+                    out.push(json!({"role":"assistant","content":blocks}));
+                }
+            }
+        }
+    }
+    body["messages"] = Value::Array(out);
+
+    if req.stream {
+        body["stream"] = json!(true);
+    }
+
+    Ok(body)
+}
+
+// ---------------------------------------------------------------- 响应解析
+
+/// 解析 Anthropic 非流式响应 → CanonicalResponse。
+pub fn parse_response(body: &[u8]) -> Result<CanonicalResponse, String> {
+    let v: Value =
+        serde_json::from_slice(body).map_err(|e| format!("Anthropic 响应 JSON 解析失败: {e}"))?;
+    let id = v.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+    let model = v
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let mut output: Vec<Block> = Vec::new();
+    if let Some(content) = v.get("content").and_then(Value::as_array) {
+        for c in content {
+            output.extend(parse_content_block(c));
+        }
+    }
+
+    // stop_reason
+    let stop_reason = match v.get("stop_reason").and_then(Value::as_str) {
+        Some("end_turn") => StopReason::EndTurn,
+        Some("max_tokens") => StopReason::MaxTokens,
+        Some("tool_use") => StopReason::ToolUse,
+        Some("refusal") => StopReason::SafetyBlock,
+        Some(other) => StopReason::Other(other.to_string()),
+        None => StopReason::EndTurn,
+    };
+
+    // usage
+    let usage = parse_usage(v.get("usage"));
+
+    Ok(CanonicalResponse {
+        id,
+        model,
+        output,
+        stop_reason,
+        usage,
+    })
+}
+
+/// 单个 Anthropic 内容块 → IR 块列表。
+fn parse_content_block(c: &Value) -> Vec<Block> {
+    match c.get("type").and_then(Value::as_str) {
+        Some("text") => c
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|t| vec![Block::Text { text: t.to_string() }])
+            .unwrap_or_default(),
+        Some("tool_use") => {
+            let id = c.get("id").and_then(Value::as_str).unwrap_or_default();
+            let name = c.get("name").and_then(Value::as_str).unwrap_or_default();
+            let input = c.get("input").cloned().unwrap_or_else(|| json!({}));
+            vec![Block::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+            }]
+        }
+        Some("tool_result") => {
+            let call_id = c.get("tool_use_id").and_then(Value::as_str).unwrap_or_default();
+            let is_error = c.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+            let content = c
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.get("text").and_then(Value::as_str))
+                        .map(|t| Block::Text { text: t.to_string() })
+                        .collect()
+                })
+                .or_else(|| {
+                    c.get("content")
+                        .and_then(Value::as_str)
+                        .map(|t| vec![Block::Text { text: t.to_string() }])
+                })
+                .unwrap_or_default();
+            vec![Block::ToolResult {
+                call_id: call_id.to_string(),
+                content,
+                is_error,
+            }]
+        }
+        _ => vec![],
+    }
+}
+
+fn parse_usage(u: Option<&Value>) -> Usage {
+    let get = |k: &str| u.and_then(|v| v.get(k)).and_then(Value::as_u64).unwrap_or(0);
+    Usage {
+        input_tokens: get("input_tokens"),
+        output_tokens: get("output_tokens"),
+        cache_read_tokens: u
+            .and_then(|v| v.get("cache_read_input_tokens"))
+            .and_then(Value::as_u64),
+        cache_write_tokens: u
+            .and_then(|v| v.get("cache_creation_input_tokens"))
+            .and_then(Value::as_u64),
+    }
+}
+
+// ---------------------------------------------------------------- 流式解析
+
+/// 解析 Anthropic SSE `data: {...}` 事件 → StreamEvent 列表。
+/// `raw` 为事件 payload 的原始字节（已剥掉 `data: ` 前缀与结尾换行）。
+pub fn parse_stream_event(raw: &[u8]) -> Result<Vec<StreamEvent>, String> {
+    let v: Value =
+        serde_json::from_slice(raw).map_err(|e| format!("Anthropic SSE JSON 解析失败: {e}"))?;
+    let evt_type = v
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    match evt_type {
+        "message_start" => {
+            if let Some(msg) = v.get("message") {
+                let model = msg
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                out.push(StreamEvent::Start { model: model.to_string() });
+            }
+        }
+        "content_block_start" => {
+            let idx = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if let Some(cb) = v.get("content_block") {
+                match cb.get("type").and_then(Value::as_str) {
+                    Some("text") => out.push(StreamEvent::TextDelta {
+                        text: cb
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    }),
+                    Some("tool_use") => out.push(StreamEvent::ToolCallStart {
+                        index: idx,
+                        id: cb.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        name: cb.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    }),
+                    _ => {}
+                }
+            }
+        }
+        "content_block_delta" => {
+            let idx = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if let Some(delta) = v.get("delta") {
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => out.push(StreamEvent::TextDelta {
+                        text: delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    }),
+                    Some("input_json_delta") => out.push(StreamEvent::ToolCallArgsDelta {
+                        index: idx,
+                        args_fragment: delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    }),
+                    Some("thinking_delta") => out.push(StreamEvent::ThinkingDelta {
+                        text: delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    }),
+                    _ => {}
+                }
+            }
+        }
+        "content_block_stop" => {
+            let idx = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            out.push(StreamEvent::ToolCallEnd { index: idx });
+        }
+        "message_delta" => {
+            let finish = v
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(Value::as_str);
+            let stop_reason = match finish {
+                Some("end_turn") => StopReason::EndTurn,
+                Some("max_tokens") => StopReason::MaxTokens,
+                Some("tool_use") => StopReason::ToolUse,
+                Some("refusal") => StopReason::SafetyBlock,
+                Some(o) => StopReason::Other(o.to_string()),
+                None => StopReason::EndTurn,
+            };
+            let usage = parse_usage(v.get("usage"));
+            out.push(StreamEvent::Finish {
+                stop_reason,
+                usage,
+            });
+        }
+        // message_stop / ping：无内容
+        _ => {}
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::ir::{CanonMessage, SampleParams, ToolSpec};
 
     #[test]
     fn peek_parses_model_and_stream() {
@@ -172,5 +543,125 @@ mod tests {
         assert_eq!(v["error"]["type"], "overloaded_error");
         assert_eq!(v["error"]["message"], "上游过载");
         assert!(v.get("error").is_some());
+    }
+
+    fn basic_req() -> CanonicalRequest {
+        CanonicalRequest {
+            model: "claude-sonnet-4".into(),
+            system: vec!["You are helpful.".into()],
+            messages: vec![
+                CanonMessage::text(Role::User, "hi"),
+                CanonMessage::text(Role::Assistant, "hello"),
+            ],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            params: SampleParams {
+                max_output_tokens: Some(1024),
+                temperature: Some(0.5),
+                ..Default::default()
+            },
+            stream: true,
+            extensions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn encode_basic_messages() {
+        let v = encode_request(&basic_req()).unwrap();
+        assert_eq!(v["model"], "claude-sonnet-4");
+        assert_eq!(v["system"], "You are helpful.");
+        assert_eq!(v["max_tokens"], 1024);
+        assert_eq!(v["temperature"], 0.5);
+        assert_eq!(v["messages"][0]["role"], "user");
+        assert_eq!(v["messages"][0]["content"][0]["text"], "hi");
+        assert_eq!(v["stream"], true);
+    }
+
+    #[test]
+    fn encode_tool_spec_and_choice() {
+        let mut req = basic_req();
+        req.tools = vec![ToolSpec {
+            name: "get_weather".into(),
+            description: Some("w".into()),
+            input_schema: json!({"type":"object","properties":{"city":{"type":"string"}}}),
+        }];
+        req.tool_choice = ToolChoice::Required;
+        let v = encode_request(&req).unwrap();
+        assert_eq!(v["tools"][0]["name"], "get_weather");
+        assert_eq!(v["tool_choice"]["type"], "any");
+    }
+
+    #[test]
+    fn encode_user_tool_result_block() {
+        let mut req = basic_req();
+        req.messages = vec![CanonMessage {
+            role: Role::User,
+            blocks: vec![Block::ToolResult {
+                call_id: "call_1".into(),
+                content: vec![Block::Text { text: "sunny".into() }],
+                is_error: false,
+            }],
+        }];
+        let v = encode_request(&req).unwrap();
+        let block = &v["messages"][0]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "call_1");
+    }
+
+    #[test]
+    fn parse_response_text_and_tool_use() {
+        let body = br#"{"id":"msg_1","type":"message","role":"assistant",
+            "model":"claude-sonnet-4",
+            "content":[{"type":"text","text":"Let me check."},
+                       {"type":"tool_use","id":"toolu_1","name":"get_weather",
+                        "input":{"city":"beijing"}}],
+            "stop_reason":"tool_use",
+            "usage":{"input_tokens":10,"output_tokens":4,
+                     "cache_read_input_tokens":3,"cache_creation_input_tokens":5}}"#;
+        let r = parse_response(body).unwrap();
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+        assert_eq!(r.output.len(), 2);
+        match &r.output[1] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input["city"], "beijing");
+            }
+            other => panic!("期望 ToolUse: {other:?}"),
+        }
+        assert_eq!(r.usage.input_tokens, 10);
+        assert_eq!(r.usage.cache_read_tokens, Some(3));
+        assert_eq!(r.usage.cache_write_tokens, Some(5));
+    }
+
+    #[test]
+    fn parse_stream_events_sequence() {
+        let start = parse_stream_event(
+            br#"{"type":"message_start","message":{"id":"m1","model":"claude-sonnet-4"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(&start[0], StreamEvent::Start { model } if model == "claude-sonnet-4"));
+
+        let ts = parse_stream_event(
+            br#"{"type":"content_block_start","index":0,
+                "content_block":{"type":"tool_use","id":"toolu_9","name":"get_weather"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(&ts[0], StreamEvent::ToolCallStart { index: 0, id, name }
+            if id == "toolu_9" && name == "get_weather"));
+
+        let args = parse_stream_event(
+            br#"{"type":"content_block_delta","index":0,
+                "delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(&args[0], StreamEvent::ToolCallArgsDelta { index: 0, .. }));
+
+        let fin = parse_stream_event(
+            br#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},
+                "usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .unwrap();
+        assert!(matches!(&fin[0], StreamEvent::Finish { stop_reason: StopReason::ToolUse, .. }));
     }
 }

@@ -303,10 +303,28 @@
 - 日志 `inbound_family='anthropic'` 区分；usage 旁路扫描照常落库（cache_read 校验留待真机）
 - README 快速接入节（`ANTHROPIC_BASE_URL` + 网关 Key 示例）
 
+### M4（跨族转换·上半场：OpenAI 客户端 × Claude/Gemini 模型）—— 已完成 ✅
+
+- IR 类型落地（`codec/ir.rs`）：CanonicalRequest/Response、Block、ToolSpec、ToolChoice、
+  SampleParams、StreamEvent、StopReason、Usage + 结构合规变换（相邻同角色合并）+ 护栏
+  （blocks ≤ 64 / args ≤ 256KB，`validate_guards`）
+- InboundCodec::OpenAI 全量（`codec/openai.rs`）：decode_request（含 image_url/base64、tool_calls、
+  tool 结果）、render_response、render_stream_event + RenderState
+- UpstreamCodec::Anthropic 全量（`codec/anthropic.rs`）：encode_request（system 提升、tool_result
+  块序、temperature 截断）、parse_response、parse_stream_event（message_start/content_block_*）
+- UpstreamCodec::Gemini 全量（`codec/gemini.rs`）：encode_request（systemInstruction、functionDeclarations、
+  functionCallingConfig）、parse_response、parse_stream_event（functionCall 整对象 → Start+Args+End、
+  合成 id `{name}_k0`）、HTTP 图片拉取转 base64（8s 超时，400 明确报错）
+- proxy 跨族接线：`try_converted_candidate`（解码→护栏→response_format 400→Lenient WARN→编码→
+  解析→渲染回入站形状），流式 SSE 事件级转换（首字节纪律保持）
+- 集成测试 `tests/m4_conversion.rs` 7 项 + `tests/m4_golden.rs` 5 项全绿
+  （Anthropic/Gemini 文本/工具/流式端到端、429 全败 OpenAI 形状、参数映射、往返不变性）
+- 全量回归：57 单测 + M2/M3/M4 集成共 78 项全绿，clippy -D warnings 零警告
+
 ### 待办（下一里程碑）
 
-1. M4 跨族转换上半场：`InboundCodec::OpenAI` 全量 + `UpstreamCodec::Anthropic/Gemini`（见 §3 M4）
+1. M5 跨族转换下半场：Anthropic 入站 render 侧（`InboundCodec::Anthropic` 响应渲染 + 嵌套顺序缓冲）
 2. 修复 CI 暴露的跨平台问题（若有）
-3. 真机验收 M1–M3（DeepSeek harness / Claude Code 真实对话、断流/超时故障注入、prompt caching）
+3. 真机验收 M1–M4（Claude Code 直通、OpenAI 客户端 × Claude/Gemini 转换链路）
 
-> 历史快照：M1/M2/M3 完成快照已并入本节；更早的记录见 git 历史。
+> 历史快照：M1–M4 完成快照已并入本节；更早的记录见 git 历史。

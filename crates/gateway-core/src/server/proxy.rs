@@ -262,6 +262,101 @@ fn empty_resp(status: StatusCode) -> Response {
     (status, Json(json!({}))).into_response()
 }
 
+/// 极简 ASCII 空白 trim（u8 slice 无内置 trim）。
+fn trim_ascii(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(s.len());
+    let end = s.iter().rposition(|b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
+    &s[start..end]
+}
+
+/// Gemini 目标：把 IR 中的 http(s) 图片 URL 拉取为 base64 inline（M4-G-d）。
+/// 8s 超时；拉取失败返回 Err（调用方按 400 回给客户端）。
+async fn resolve_remote_images(
+    ctx: &GatewayCtx,
+    req: &mut crate::codec::ir::CanonicalRequest,
+) -> Result<(), String> {
+    use crate::codec::ir::Block;
+
+    for m in &mut req.messages {
+        for b in &mut m.blocks {
+            if let Block::Image {
+                media_type,
+                data_base64,
+                url,
+            } = b
+            {
+                // 已有 base64：跳过
+                if data_base64.is_some() {
+                    continue;
+                }
+                let Some(url_str) = url.clone() else {
+                    continue;
+                };
+                if !(url_str.starts_with("http://") || url_str.starts_with("https://")) {
+                    return Err(format!("不支持的图片源: {url_str}（仅 http/https 或 data URL）"));
+                }
+                let resp = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    ctx.http.get(&url_str).send(),
+                )
+                .await
+                .map_err(|_| format!("图片拉取超时(8s): {url_str}"))?
+                .map_err(|e| format!("图片拉取失败: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!(
+                        "图片拉取失败: {url_str} → HTTP {}",
+                        resp.status().as_u16()
+                    ));
+                }
+                // 先取 content-type 头再消费 body（bytes() 拿走所有权）
+                let mime = resp
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "image/png".to_string());
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("图片读取失败: {e}"))?;
+                if bytes.len() > 10 * 1024 * 1024 {
+                    return Err(format!("图片过大(>{})", "10MB"));
+                }
+                let b64 = base64_like(&bytes);
+                *media_type = mime;
+                *data_base64 = Some(b64);
+                *url = None;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// base64 编码（不引入额外依赖，用 chunk 手写或最小实现）。
+fn base64_like(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(n >> 6) as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[n as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 fn ms_since(t: Instant) -> i64 {
     t.elapsed().as_millis() as i64
 }
@@ -487,17 +582,21 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
     let mut last_http: Option<UpstreamError> = None;
     for cand in &candidates {
         if cand.family != wire.family() {
-            // 跨族转换自 M4 起提供；当前跳过该渠道尝试下一家
-            provider_mark_fail(
-                &ctx.db,
-                &cand.provider_id,
-                &format!("协议族 {} 转换未实现（M4 起可用，已跳过）", cand.family),
-            );
-            last_kind = "ProviderOther";
-            last_summary = format!(
-                "渠道 {} 协议族为 {}，跨协议转换自 M4 起提供（已跳过）",
-                cand.provider_name, cand.family
-            );
+            // 跨族转换（M4）：入站 OpenAI → 上游 Anthropic / Gemini
+            match try_converted_candidate(&ctx, wire, &peeked, cand, &body, started).await {
+                Attempt::Delivered(resp) => return resp,
+                Attempt::Failed {
+                    kind,
+                    summary,
+                    last_http: eh,
+                } => {
+                    last_kind = kind;
+                    last_summary = summary;
+                    if let Some(e) = eh {
+                        last_http = Some(e);
+                    }
+                }
+            }
             continue;
         }
 
@@ -779,6 +878,634 @@ async fn try_candidate(
             .await
     };
     Attempt::Delivered(delivered)
+}
+
+// ---------------------------------------------------------------- M4：跨族转换
+
+/// 尝试单渠道的**跨族转换**（入站 OpenAI → 上游 Anthropic / Gemini）。
+/// 全链路：InboundCodec 解码 → IR → UpstreamCodec 编码 → 上游 → 响应解析 → 渲染回入站形状。
+async fn try_converted_candidate(
+    ctx: &GatewayCtx,
+    wire: InboundWire,
+    peeked: &PeekRequest,
+    cand: &store::RouteCandidate,
+    body: &Bytes,
+    started: Instant,
+) -> Attempt {
+    // M4 只支持 OpenAI 入站的跨族转换（Anthropic 入站 → OpenAI/Gemini 在 M5）
+    if wire != InboundWire::OpenAi {
+        let msg = format!(
+            "渠道 {} 协议族为 {}，该入站线的跨族转换自 M5 起提供",
+            cand.provider_name, cand.family
+        );
+        return Attempt::Failed {
+            kind: "ProviderOther",
+            summary: msg,
+            last_http: None,
+        };
+    }
+
+    // 1) 解码入站
+    let req = match crate::codec::openai::decode_request(body) {
+        Ok(r) => r,
+        Err(msg) => {
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_REQUEST,
+                &msg,
+                "invalid_request_error",
+                None,
+            ));
+        }
+    };
+
+    // 2) 护栏（M4：blocks ≤ 64 / args ≤ 256KB）
+    if let Err(msg) = crate::codec::ir::validate_guards(&req) {
+        return Attempt::Delivered(wire.error_response(
+            StatusCode::BAD_REQUEST,
+            &msg,
+            "invalid_request_error",
+            None,
+        ));
+    }
+
+    // 2.5) 跨族不支持的能力面：response_format(json_schema) → 400（M4 验收 5）
+    if req.extensions.contains_key("response_format") {
+        let msg =
+            "response_format（json_schema）在跨协议转换中不支持；支持子集：无。请改用提示词约束输出";
+        return Attempt::Delivered(wire.error_response(
+            StatusCode::BAD_REQUEST,
+            msg,
+            "invalid_request_error",
+            Some("response_format_not_supported"),
+        ));
+    }
+
+    // 2.6) 未建模字段：Lenient 丢弃 + 单条 WARN 汇总（§7）
+    if let Some(note) = crate::codec::ir::extension_warn_note(&req) {
+        eprintln!("[convert] {note}");
+    }
+
+    // 3) 按上游协议族编码
+    let (url, auth_builder) = match cand.family.as_str() {
+        "anthropic" => {
+            let body = match crate::codec::anthropic::encode_request(&req) {
+                Ok(b) => b,
+                Err(msg) => {
+                    return Attempt::Delivered(wire.error_response(
+                        StatusCode::BAD_REQUEST,
+                        &msg,
+                        "invalid_request_error",
+                        None,
+                    ));
+                }
+            };
+            let url = url_join(&cand.base_url, "/v1/messages");
+            // 鉴权：x-api-key + anthropic-version（代理调用上游）
+            let out = ctx.http.post(&url).header("x-api-key", "");
+            (url, (out, body))
+        }
+        "gemini" => {
+            // Gemini 不接受任意外链（fileData 仅限 GCS URI）：
+            // http(s) 图片必须转 inlineData/base64（M4-G-d，8s 超时，失败明确 400）
+            let mut req2 = req.clone();
+            if let Err(msg) = resolve_remote_images(ctx, &mut req2).await {
+                return Attempt::Delivered(wire.error_response(
+                    StatusCode::BAD_REQUEST,
+                    &msg,
+                    "invalid_request_error",
+                    Some("image_fetch_failed"),
+                ));
+            }
+            let body = match crate::codec::gemini::encode_request(&req2) {
+                Ok(b) => b,
+                Err(msg) => {
+                    return Attempt::Delivered(wire.error_response(
+                        StatusCode::BAD_REQUEST,
+                        &msg,
+                        "invalid_request_error",
+                        None,
+                    ));
+                }
+            };
+            let path = crate::codec::gemini::model_url(&req.model);
+            let mut url = url_join(&cand.base_url, &path);
+            if req.stream {
+                url.push_str("?alt=sse");
+            }
+            // 鉴权：x-goog-api-key
+            let out = ctx.http.post(&url).header("x-goog-api-key", "");
+            (url, (out, body))
+        }
+        other => {
+            return Attempt::Failed {
+                kind: "ProviderOther",
+                summary: format!("未知上游协议族: {other}"),
+                last_http: None,
+            };
+        }
+    };
+
+    // 4) 取上游密钥并组装请求
+    let (out, body_json) = auth_builder;
+    let secret = {
+        let ref_ = cand.keyring_ref.clone();
+        match tokio::task::spawn_blocking(move || vault::get_secret(&ref_)).await {
+            Ok(Ok(Some(k))) => k,
+            Ok(Ok(None)) => {
+                let msg = "密钥环中缺少该供应商凭据，请在设置中重新录入";
+                provider_mark_fail(&ctx.db, &cand.provider_id, msg);
+                return Attempt::Failed {
+                    kind: "UpstreamAuth",
+                    summary: format!("{}：{msg}", cand.provider_name),
+                    last_http: None,
+                };
+            }
+            Ok(Err(e)) => {
+                let msg = format!("keyring 读取失败: {e}");
+                provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
+                return Attempt::Failed {
+                    kind: "ProviderOther",
+                    summary: format!("{}：{msg}", cand.provider_name),
+                    last_http: None,
+                };
+            }
+            Err(e) => {
+                eprintln!("[vault] join: {e}");
+                return Attempt::Failed {
+                    kind: "ProviderOther",
+                    summary: format!("{}：密钥环任务失败", cand.provider_name),
+                    last_http: None,
+                };
+            }
+        }
+    };
+    let mut out_req = match cand.family.as_str() {
+        "anthropic" => out.header("x-api-key", &secret),
+        "gemini" => out.header("x-goog-api-key", &secret),
+        _ => out,
+    };
+    if let Some(eh_raw) = cand.extra_headers.as_deref() {
+        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, Value>>(eh_raw) {
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    if let (Ok(name), Ok(val)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(s),
+                    ) {
+                        out_req = out_req.header(name, val);
+                    }
+                }
+            }
+        }
+    }
+    drop(url);
+
+    let resp = match out_req.json(&body_json).timeout(Duration::from_secs(300)).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("上游连接失败: {e}");
+            provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                None,
+                502,
+                ms_since(started),
+                req.stream,
+                None,
+                Some("ProviderOther".into()),
+                Some(format!("[convert] {}：{msg}", cand.provider_name)),
+            );
+            return Attempt::Failed {
+                kind: "ProviderOther",
+                summary: format!("{}：{msg}", cand.provider_name),
+                last_http: None,
+            };
+        }
+    };
+
+    let up_status = StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    if !up_status.is_success() {
+        let mut bytes = resp.bytes().await.unwrap_or_default();
+        if bytes.len() > MAX_ERROR_BODY {
+            bytes.truncate(MAX_ERROR_BODY);
+        }
+        let hint = String::from_utf8_lossy(&bytes).into_owned();
+        let snippet: String = hint.chars().take(240).collect();
+
+        match router::classify_status(up_status.as_u16(), &snippet) {
+            AttemptVerdict::Stop { kind } => {
+                provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
+                emit_log(
+                    &ctx.logs,
+                    wire.log_family(),
+                    Some(peeked),
+                    Some(&cand.provider_id),
+                    cand.upstream_model_id.clone(),
+                    up_status.as_u16() as i64,
+                    ms_since(started),
+                    req.stream,
+                    None,
+                    Some(kind.into()),
+                    Some(format!("[convert] {}：{snippet}", cand.provider_name)),
+                );
+                // 确定性错误：翻译为入站方言（OpenAI schema）
+                let (tname, code) = match kind {
+                    "ContextTooLong" => ("invalid_request_error", Some("context_length_exceeded")),
+                    _ => ("invalid_request_error", None),
+                };
+                return Attempt::Delivered(wire.error_response(
+                    up_status,
+                    &snippet,
+                    tname,
+                    code,
+                ));
+            }
+            AttemptVerdict::Failover { kind } => {
+                provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
+                emit_log(
+                    &ctx.logs,
+                    wire.log_family(),
+                    Some(peeked),
+                    Some(&cand.provider_id),
+                    cand.upstream_model_id.clone(),
+                    up_status.as_u16() as i64,
+                    ms_since(started),
+                    req.stream,
+                    None,
+                    Some(kind.into()),
+                    Some(format!(
+                        "[convert] {}：「{kind}」即将切换渠道：{snippet}",
+                        cand.provider_name
+                    )),
+                );
+                return Attempt::Failed {
+                    kind,
+                    summary: format!(
+                        "{}：上游 {kind}（HTTP {}）",
+                        cand.provider_name,
+                        up_status.as_u16()
+                    ),
+                    last_http: None,
+                };
+            }
+            AttemptVerdict::Success => unreachable!("非 2xx 不会判 Success"),
+        }
+    }
+
+    provider_mark_ok(&ctx.db, &cand.provider_id);
+
+    // ---- 成功：解析 + 重渲染 ----
+    let ct_is_sse = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("text/event-stream"))
+        .unwrap_or(false);
+
+    if ct_is_sse || req.stream {
+        convert_streaming_response(ctx.clone(), wire, peeked.clone(), cand.clone(), resp, up_status, started).await
+    } else {
+        convert_plain_response(ctx.clone(), wire, peeked.clone(), cand.clone(), resp, up_status, started).await
+    }
+}
+
+/// 转换路径：非流式解析 + 渲染为入站形状。
+async fn convert_plain_response(
+    ctx: GatewayCtx,
+    wire: InboundWire,
+    peeked: PeekRequest,
+    cand: store::RouteCandidate,
+    resp: reqwest::Response,
+    status: StatusCode,
+    started: Instant,
+) -> Attempt {
+    let bytes = match tokio::time::timeout(NONSTREAM_READ_TIMEOUT, resp.bytes()).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            let msg = format!("上游响应读取失败: {e}");
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(&peeked),
+                Some(&cand.provider_id),
+                None,
+                502,
+                ms_since(started),
+                false,
+                None,
+                Some("ProviderOther".into()),
+                Some(format!("[convert] {msg}")),
+            );
+            return Attempt::Delivered(
+                wire.error_response(StatusCode::BAD_GATEWAY, &msg, "api_error", None),
+            );
+        }
+        Err(_) => {
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(&peeked),
+                Some(&cand.provider_id),
+                None,
+                504,
+                ms_since(started),
+                false,
+                None,
+                Some("Overloaded".into()),
+                Some(format!("[convert] Overloaded read timeout (status={})", status.as_u16())),
+            );
+            return Attempt::Delivered(wire.error_response(
+                wire.overloaded_status(),
+                "上游响应读取超时(300s)",
+                "api_error",
+                Some("upstream_read_timeout"),
+            ));
+        }
+    };
+
+    // 按上游协议族解析 IR
+    let parsed = match cand.family.as_str() {
+        "anthropic" => crate::codec::anthropic::parse_response(&bytes),
+        "gemini" => crate::codec::gemini::parse_response(&bytes),
+        other => Err(format!("未知上游协议族: {other}")),
+    };
+    let resp = match parsed {
+        Ok(r) => r,
+        Err(msg) => {
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(&peeked),
+                Some(&cand.provider_id),
+                None,
+                502,
+                ms_since(started),
+                false,
+                None,
+                Some("ProviderOther".into()),
+                Some(format!("[convert] 解析失败: {msg}")),
+            );
+            return Attempt::Delivered(
+                wire.error_response(StatusCode::BAD_GATEWAY, &msg, "api_error", None),
+            );
+        }
+    };
+
+    let usage = &resp.usage;
+    let uval = json!({
+        "prompt_tokens": usage.input_tokens,
+        "completion_tokens": usage.output_tokens,
+    });
+    emit_log(
+        &ctx.logs,
+        wire.log_family(),
+        Some(&peeked),
+        Some(&cand.provider_id),
+        cand.upstream_model_id.clone(),
+        status.as_u16() as i64,
+        ms_since(started),
+        false,
+        Some(&uval),
+        None,
+        None,
+    );
+
+    // 渲染为入站（OpenAI）形状
+    let rendered = crate::codec::openai::render_response(&resp);
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(rendered.to_string()))
+        .map(Attempt::Delivered)
+        .unwrap_or_else(|_| Attempt::Delivered(empty_resp(status)))
+}
+
+/// 转换路径：流式。逐 SSE 事件 parse → IR StreamEvent → render 回入站 SSE。
+async fn convert_streaming_response(
+    ctx: GatewayCtx,
+    wire: InboundWire,
+    peeked: PeekRequest,
+    cand: store::RouteCandidate,
+    resp: reqwest::Response,
+    status: StatusCode,
+    started: Instant,
+) -> Attempt {
+    let mut upstream_stream = resp.bytes_stream();
+
+    // 首字节持票
+    let first = tokio::time::timeout(UPSTREAM_FIRST_BYTE_TIMEOUT, upstream_stream.next()).await;
+    let first_chunk = match first {
+        Ok(Some(Ok(b))) => b,
+        Ok(Some(Err(e))) => {
+            let msg = format!("上游流建立失败: {e}");
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_GATEWAY,
+                &msg,
+                "api_error",
+                Some("upstream_stream_error"),
+            ));
+        }
+        Ok(None) => {
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_GATEWAY,
+                "上游流立即关闭",
+                "api_error",
+                Some("upstream_empty_stream"),
+            ));
+        }
+        Err(_) => {
+            return Attempt::Delivered(wire.error_response(
+                wire.overloaded_status(),
+                "上游首字节超时(60s)",
+                "api_error",
+                Some("upstream_first_byte_timeout"),
+            ));
+        }
+    };
+
+    // 组装下游 SSE 帧：OpenAI RenderState
+    let mut render = crate::codec::openai::RenderState {
+        id: format!("chatcmpl-jai-{}", started.elapsed().as_millis()),
+        model: peeked.model.clone(),
+        started: false,
+    };
+
+    // SSE 事件 ⊆ 格式转换：上游原始帧 → IR → 入站帧
+    // 简单起见逐块缓冲行；跨块分割由 SSE 行扫描器（每行独立 JSON）处理
+    let upstream_family = cand.family.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    // 首字节先入行缓冲（不丢数据）
+    let first_lines: Vec<u8> = first_chunk.to_vec();
+
+    // Start 事件先发（OpenAI 客户端期待 role=assistant 首帧）
+    if let Some(line) = crate::codec::openai::render_stream_event(
+        &crate::codec::ir::StreamEvent::Start { model: peeked.model.clone() },
+        &mut render,
+    ) {
+        let _ = tx.send(Ok(Bytes::from(format!("data: {line}\n\n")))).await;
+    }
+
+    {
+        let ctx2 = ctx.clone();
+        let wire2 = wire;
+        let peeked2 = peeked.clone();
+        let pid = cand.provider_id.clone();
+        tokio::spawn(async move {
+            let t0 = Instant::now();
+            let mut line_buf: Vec<u8> = first_lines;
+
+            loop {
+                let nxt = tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream_stream.next());
+                match nxt.await {
+                    Err(_) => {
+                        drop(tx);
+                        emit_log(
+                            &ctx2.logs,
+                            wire2.log_family(),
+                            Some(&peeked2),
+                            Some(&pid),
+                            None,
+                            status.as_u16() as i64,
+                            ms_since(t0),
+                            true,
+                            None,
+                            Some("Overloaded".into()),
+                            Some(format!(
+                                "[convert] Overloaded upstream={} idle timeout",
+                                status.as_u16()
+                            )),
+                        );
+                        break;
+                    }
+                    Ok(Some(Ok(chunk))) => {
+                        line_buf.extend_from_slice(&chunk);
+                        while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                            let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                            let line = line.strip_suffix(b"\r").unwrap_or(&line);
+                            let line: &[u8] = line;
+                            if !line.starts_with(b"data:") {
+                                continue;
+                            }
+                            let payload: &[u8] = trim_ascii(&line[5..]);
+                            if payload.is_empty() || payload == b"[DONE]" {
+                                continue;
+                            }
+                            let events: Vec<crate::codec::ir::StreamEvent> =
+                                match upstream_family.as_str() {
+                                    "anthropic" => {
+                                        match crate::codec::anthropic::parse_stream_event(payload)
+                                        {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                eprintln!("[convert] anthropic SSE: {e}");
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    "gemini" => match crate::codec::gemini::parse_stream_event(payload)
+                                    {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            eprintln!("[convert] gemini SSE: {e}");
+                                            continue;
+                                        }
+                                    },
+                                    _ => continue,
+                                };
+                            for ev in events {
+                                if let Some(out) =
+                                    crate::codec::openai::render_stream_event(&ev, &mut render)
+                                {
+                                    if tx.send(Ok(Bytes::from(format!("data: {out}\n\n")))).await
+                                        .is_err()
+                                    {
+                                        emit_log(
+                                            &ctx2.logs,
+                                            wire2.log_family(),
+                                            Some(&peeked2),
+                                            Some(&pid),
+                                            None,
+                                            status.as_u16() as i64,
+                                            ms_since(t0),
+                                            true,
+                                            None,
+                                            Some("InvalidRequest".into()),
+                                            Some("client disconnected mid-stream".into()),
+                                        );
+                                        drop(tx);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        let msg = format!("stream aborted by upstream: {e}");
+                        provider_mark_fail(&ctx2.db, &pid, &msg);
+                        emit_log(
+                            &ctx2.logs,
+                            wire2.log_family(),
+                            Some(&peeked2),
+                            Some(&pid),
+                            None,
+                            status.as_u16() as i64,
+                            ms_since(t0),
+                            true,
+                            None,
+                            Some("ProviderOther".into()),
+                            Some(format!("[convert] {msg}")),
+                        );
+                        drop(tx);
+                        break;
+                    }
+                    Ok(None) => {
+                        // 自然结束：补 [DONE]
+                        let _ = tx
+                            .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
+                            .await;
+                        emit_log(
+                            &ctx2.logs,
+                            wire2.log_family(),
+                            Some(&peeked2),
+                            Some(&pid),
+                            None,
+                            status.as_u16() as i64,
+                            ms_since(t0),
+                            true,
+                            None,
+                            None,
+                            None,
+                        );
+                        drop(tx);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    let client_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+
+    let body = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(
+            "x-jai-provider",
+            HeaderValue::from_str(&cand.provider_name).unwrap_or(HeaderValue::from_static("unknown")),
+        )
+        .header("x-jai-mode", HeaderValue::from_static("converted"))
+        .body(Body::from_stream(client_stream))
+        .unwrap_or_else(|_| empty_resp(status));
+
+    Attempt::Delivered(body)
 }
 
 fn internal_error(

@@ -1,13 +1,19 @@
-//! 协议编解码层占位。
+//! 协议编解码层。
 //!
 //! 设计权威：docs/design/protocol-ir.md（v1 已定稿）。
-//! 实现节奏：M1 落地 InboundCodec::OpenAI 的直通路径；M4/M5 填充跨族 Codec；
-//! M6 增加 Responses API 入站适配。本模块 M0 仅固化 `Family` 枚举，
-//! 因为存储层（providers.family）与路由层都依赖它。
+//! 布局：
+//! - `ir`       ：协议中间表示类型 + 结构合规变换 + 护栏（§2/§4-C）
+//! - `openai`   ：OpenAI 旁路工具（M1）+ InboundCodec::OpenAI（M4）
+//! - `anthropic`：Anthropic 直通助手（M3）+ UpstreamCodec::Anthropic（M4）
+//! - `gemini`   ：UpstreamCodec::Gemini（M4）
+//!
+//! 实现节奏：M1 直通 → M3 Anthropic 直通 → M4/M5 跨族 Codec → M6 Responses 入站。
 
 use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
+pub mod gemini;
+pub mod ir;
 pub mod openai;
 
 /// 协议家族。同族请求/上游之间允许字节级直通（见 IR 文档 §1 原则一）。
