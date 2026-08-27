@@ -15,6 +15,7 @@ pub mod anthropic;
 pub mod gemini;
 pub mod ir;
 pub mod openai;
+pub mod responses;
 
 /// 协议家族。同族请求/上游之间允许字节级直通（见 IR 文档 §1 原则一）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

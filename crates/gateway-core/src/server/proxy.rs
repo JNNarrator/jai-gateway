@@ -48,20 +48,23 @@ const MAX_ERROR_BODY: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------- 入站线（wire）
 
-/// 同族直通的两条入站线。差异（路径/鉴权头/错误形状/日志族）全部收敛在此，
-/// M1 的 OpenAI 直通与 M3 的 Anthropic 直通共用同一套流水线。
+/// 入站协议线。差异（路径/鉴权头/错误形状/日志族）全部收敛在此。
+/// M1 OpenAI 直通、M3 Anthropic 直通、M6 Responses 入站共用路由/故障转移骨架。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundWire {
     OpenAi,
     Anthropic,
+    Responses,
 }
 
 impl InboundWire {
-    /// 要求的渠道协议族（providers.family 值）
+    /// 要求的渠道协议族（providers.family 值）。Responses 线返回哨兵值，
+    /// 使其永远走跨族转换路径（Responses 不是上游 chat 直通形状）。
     pub fn family(&self) -> &'static str {
         match self {
             InboundWire::OpenAi => "openai_compat",
             InboundWire::Anthropic => "anthropic",
+            InboundWire::Responses => "responses",
         }
     }
 
@@ -70,14 +73,16 @@ impl InboundWire {
         match self {
             InboundWire::OpenAi => "openai",
             InboundWire::Anthropic => "anthropic",
+            InboundWire::Responses => "responses",
         }
     }
 
-    /// 上游路径（base_url 拼接）
+    /// 上游路径（base_url 拼接；Responses 线始终走转换，不直接使用）
     pub fn upstream_path(&self) -> &'static str {
         match self {
             InboundWire::OpenAi => "/chat/completions",
             InboundWire::Anthropic => "/v1/messages",
+            InboundWire::Responses => "/responses",
         }
     }
 
@@ -88,7 +93,7 @@ impl InboundWire {
         secret: &str,
     ) -> reqwest::RequestBuilder {
         match self {
-            InboundWire::OpenAi => req.bearer_auth(secret),
+            InboundWire::OpenAi | InboundWire::Responses => req.bearer_auth(secret),
             InboundWire::Anthropic => req.header("x-api-key", secret).header(
                 "anthropic-version",
                 anthropic_codec::DEFAULT_ANTHROPIC_VERSION,
@@ -111,13 +116,18 @@ impl InboundWire {
             InboundWire::Anthropic => {
                 (status, Json(anthropic_codec::error_body(message, err_type))).into_response()
             }
+            InboundWire::Responses => (
+                status,
+                Json(crate::codec::responses::error_body(message, err_type, code)),
+            )
+                .into_response(),
         }
     }
 
     /// Overloaded → Anthropic 侧保留 529（roadmap M3 验收 4）
     pub fn overloaded_status(&self) -> StatusCode {
         match self {
-            InboundWire::OpenAi => StatusCode::SERVICE_UNAVAILABLE,
+            InboundWire::OpenAi | InboundWire::Responses => StatusCode::SERVICE_UNAVAILABLE,
             InboundWire::Anthropic => {
                 StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
             }
@@ -260,8 +270,9 @@ fn error_sse_frame(wire: InboundWire, message: &str) -> Bytes {
             let payload = anthropic_codec::error_body(message, "api_error").to_string();
             Bytes::from(format!("event: error\ndata: {payload}\n\n"))
         }
-        InboundWire::OpenAi => {
-            let payload = error_body(message, "api_error", None).to_string();
+        InboundWire::OpenAi | InboundWire::Responses => {
+            let payload =
+                crate::codec::responses::error_body(message, "api_error", None).to_string();
             Bytes::from(format!("data: {payload}\n\n"))
         }
     }
@@ -528,6 +539,11 @@ pub async fn chat_completions(State(ctx): State<GatewayCtx>, req: Request) -> Re
 /// POST /v1/messages —— Anthropic 线主入口（M3，Claude Code 直连）。
 pub async fn anthropic_messages(State(ctx): State<GatewayCtx>, req: Request) -> Response {
     dispatch(InboundWire::Anthropic, ctx, req).await
+}
+
+/// POST /v1/responses —— Responses API 入站（M6，Codex 原生线）。
+pub async fn responses(State(ctx): State<GatewayCtx>, req: Request) -> Response {
+    dispatch(InboundWire::Responses, ctx, req).await
 }
 
 /// POST /v1/messages/count_tokens —— 粗估端点（M3，避免 Claude Code 降级）。
@@ -1002,6 +1018,17 @@ async fn try_converted_candidate(
                 ));
             }
         },
+        InboundWire::Responses => match crate::codec::responses::decode_request(body) {
+            Ok(r) => r,
+            Err(msg) => {
+                return Attempt::Delivered(wire.error_response(
+                    StatusCode::BAD_REQUEST,
+                    &msg,
+                    "invalid_request_error",
+                    None,
+                ));
+            }
+        },
     };
     // M5：Anthropic 入站历史 tool id 反解（含 tool_id_map 超长回落）
     if wire == InboundWire::Anthropic {
@@ -1424,6 +1451,7 @@ async fn convert_plain_response(
     let rendered = match wire {
         InboundWire::OpenAi => crate::codec::openai::render_response(&resp).to_string(),
         InboundWire::Anthropic => crate::codec::anthropic::render_response(&resp).to_string(),
+        InboundWire::Responses => crate::codec::responses::render_response(&resp).to_string(),
     };
     Response::builder()
         .status(status)
@@ -1480,6 +1508,7 @@ async fn convert_streaming_response(
     enum SseRenderer {
         OpenAi(crate::codec::openai::RenderState),
         Anthropic(crate::codec::anthropic::AnthropicRenderState),
+        Responses(crate::codec::responses::RenderState),
     }
     let mut renderer = match wire {
         InboundWire::OpenAi => SseRenderer::OpenAi(crate::codec::openai::RenderState {
@@ -1498,6 +1527,13 @@ async fn convert_streaming_response(
                 finished: false,
             })
         }
+        InboundWire::Responses => SseRenderer::Responses(crate::codec::responses::RenderState {
+            response_id: format!("resp_jai_{}", started.elapsed().as_millis()),
+            model: peeked.model.clone(),
+            started: false,
+            output_index: 0,
+            item_started: false,
+        }),
     };
     // 渲染单个 IR 事件 → SSE 输出帧（一个 IR 事件可能展开多个 SSE 事件）
     fn render_frame(renderer: &mut SseRenderer, ev: &crate::codec::ir::StreamEvent) -> Vec<String> {
@@ -1509,6 +1545,10 @@ async fn convert_streaming_response(
             SseRenderer::Anthropic(st) => crate::codec::anthropic::render_stream_event(ev, st)
                 .into_iter()
                 .map(|(evt, data)| format!("event: {evt}\ndata: {data}\n\n"))
+                .collect(),
+            SseRenderer::Responses(st) => crate::codec::responses::render_stream_event(ev, st)
+                .into_iter()
+                .map(|payload| format!("data: {payload}\n\n"))
                 .collect(),
         }
     }

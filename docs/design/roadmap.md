@@ -339,10 +339,21 @@
   （OpenAI + Gemini 上游）；proxy 侧新增 error SSE 帧与 tool_id_map 单测
 - 全量回归：67 单测 + M2/M3/M4/M5 集成共 27 项全绿，`cargo fmt --check` + clippy -D warnings 零警告
 
+### M6（Responses API 入站 · Codex 接入）—— 已完成 ✅
+
+- 新增 `codec/responses.rs`：Responses 请求解码（instructions/input items/tools → IR）、
+  非流式 response 对象渲染、SSE 事件流渲染（response.created / output_item.added /
+  output_text.delta / function_call_arguments.delta / response.completed）、Responses 错误形状
+- `InboundWire::Responses` 接入统一 dispatch：`POST /v1/responses` 挂路由，永远走跨族转换路径，
+  复用 M4/M5 的 IR 管道（上游可接 OpenAI chat / Anthropic / Gemini）
+- 集成测试 `tests/m6_responses_inbound.rs` 4 项全绿：文本 / 工具 / 流式 / 404 错误形状
+- 全量回归：71 单测 + M2/M3/M4/M5/M6 集成共 31 项全绿，`cargo fmt --check` + clippy -D warnings 零警告
+
 ### 待办（下一里程碑）
 
-1. M6 Responses API 入站（Codex 接入）：`POST /v1/responses` 解码/渲染/SSE
-2. M7 配置导入 + WebDAV 同步
-3. 真机验收 M1–M5（Claude Code 直通、跨族转换链路、Claude Code × GPT/Gemini 工具回传）
+1. M7 配置导入 + WebDAV 同步
+2. MCP（Model Context Protocol）管理
+3. 技能（skill）管理
+4. 真机验收 M1–M6（Claude Code/Codex 跨族链路与工具回传）
 
-> 历史快照：M1–M5 完成快照已并入本节；更早的记录见 git 历史。
+> 历史快照：M1–M6 完成快照已并入本节；更早的记录见 git 历史。

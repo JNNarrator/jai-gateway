@@ -94,6 +94,8 @@ pub fn build_router(ctx: GatewayCtx) -> Router {
             "/v1/messages/count_tokens",
             post(proxy::anthropic_count_tokens),
         )
+        // M6：Responses API 入站（Codex 原生线）
+        .route("/v1/responses", post(proxy::responses))
         .layer(middleware::from_fn_with_state(
             ctx.clone(),
             proxy::security_mw,
