@@ -1,0 +1,21 @@
+[package]
+name = "jai"
+version = "0.1.0"
+description = "JAI — 桌面 AI API 网关"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+gateway-core = { path = "../crates/gateway-core" }
+tauri = { version = "2", features = ["tray-icon"] }
+tokio.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+
+[features]
+# tauri 默认特性；custom-protocol 由发布构建注入（embedding ui/dist）
+default = []

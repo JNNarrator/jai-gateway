@@ -16,3 +16,8 @@ node_modules/
 Thumbs.db
 .idea/
 .vscode/
+
+# pnpm local store (sandbox cannot write $HOME)
+.pnpm-store/
+# tauri 生成物
+src-tauri/gen/
