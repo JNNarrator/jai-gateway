@@ -488,6 +488,21 @@ function McpTab() {
                 </div>
               </div>
               <button
+                className={btnGhost}
+                onClick={() =>
+                  act(async () => {
+                    const tools = await api.mcpToolsList(m.id);
+                    setMsg(
+                      tools.length
+                        ? `${m.name} 工具：${tools.map((t) => t.name).join("、")}`
+                        : `${m.name} 未暴露工具`,
+                    );
+                  })
+                }
+              >
+                列出工具
+              </button>
+              <button
                 className={btnDanger}
                 onClick={() => {
                   if (!confirm(`删除 MCP Server「${m.name}」？`)) return;

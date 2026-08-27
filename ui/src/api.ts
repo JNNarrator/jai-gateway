@@ -6,6 +6,7 @@ import type {
   ImportReport,
   LogRowView,
   McpServerRow,
+  McpTool,
   ModelRow,
   ProviderDto,
   SettingsDto,
@@ -97,6 +98,9 @@ export const api = {
   mcpSetEnabled: (id: string, enabled: boolean) =>
     invoke<void>("mcp_set_enabled", { id, enabled }),
   mcpDelete: (id: string) => invoke<void>("mcp_delete", { id }),
+  mcpToolsList: (id: string) => invoke<McpTool[]>("mcp_tools_list", { id }),
+  mcpToolsCall: (id: string, name: string, args: unknown) =>
+    invoke<unknown>("mcp_tools_call", { id, name, arguments: args }),
 
   // Skill 管理
   skillList: () => invoke<SkillRow[]>("skill_list"),

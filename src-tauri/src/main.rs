@@ -799,6 +799,40 @@ async fn mcp_delete(core: State<'_, AppCore>, id: String) -> Result<(), String> 
     .map_err(join_err)?
 }
 
+#[tauri::command]
+async fn mcp_tools_list(
+    core: State<'_, AppCore>,
+    id: String,
+) -> Result<Vec<gateway_core::mcp::McpTool>, String> {
+    let row = fetch_mcp_server(&core.db, &id).await?;
+    gateway_core::mcp::list_tools(&row).await
+}
+
+#[tauri::command]
+async fn mcp_tools_call(
+    core: State<'_, AppCore>,
+    id: String,
+    name: String,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let row = fetch_mcp_server(&core.db, &id).await?;
+    gateway_core::mcp::call_tool(&row, &name, arguments).await
+}
+
+async fn fetch_mcp_server(db: &Db, id: &str) -> Result<McpServerRow, String> {
+    let db = db.clone();
+    let id = id.to_string();
+    let row: Option<McpServerRow> = tokio::task::spawn_blocking(move || {
+        db.with(|c| -> Result<Option<McpServerRow>, store::StoreError> {
+            Ok(store::mcp_list(c)?.into_iter().find(|s| s.id == id))
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    row.ok_or_else(|| "MCP Server 不存在".to_string())
+}
+
 // ---------------------------------------------------------------- Skill 管理
 
 #[derive(Deserialize)]
@@ -1346,6 +1380,8 @@ fn main() {
             mcp_update,
             mcp_set_enabled,
             mcp_delete,
+            mcp_tools_list,
+            mcp_tools_call,
             skill_list,
             skill_create,
             skill_update,

@@ -378,24 +378,26 @@
 - README 与 roadmap 同步
 - 实际签名/公证/更新 feed 发布：需要仓库 secrets 与真实证书后执行
 
-### MCP（Model Context Protocol）管理 —— 基础管理已完成 ✅
+### MCP（Model Context Protocol）管理 —— 基础管理 + 工具发现/调用已完成 ✅
 
 - 新增 `mcp_servers` 表（stdio/sse/http、命令/参数/URL、启停）
 - store CRUD + Tauri IPC（`mcp_list/create/update/set_enabled/delete`）
-- UI「MCP」页：添加/编辑/启停/删除 MCP Server 配置
-- 真实 MCP 协议客户端调用（tools/list、tools/call）列入后续迭代
+- `gateway-core::mcp`：轻量 MCP 客户端，支持 initialize / tools/list / tools/call
+  （stdio 走子进程 JSON-RPC，http/sse 走 HTTP JSON-RPC）
+- Tauri IPC：`mcp_tools_list` / `mcp_tools_call`；UI「MCP」页可列出远端工具
+- 网关请求自动合并 MCP 工具/执行工具循环：列入后续迭代
 
-### 技能（Skill）管理 —— 基础管理已完成 ✅
+### 技能（Skill）管理 —— 基础管理 + 自动注入已完成 ✅
 
 - 新增 `skills` 表（名称/描述/内容/启停）
 - store CRUD + Tauri IPC（`skill_list/create/update/set_enabled/delete`）
+- `gateway-core::skills`：读取启用技能并格式化为 system 文本
+- 跨族转换路径自动将启用技能追加到 system（直通路径保持字节不变）
 - UI「技能」页：添加/编辑/启停/删除技能定义
-- 技能在网关请求中的自动注入/检索列入后续迭代
 
 ### 待办（下一里程碑）
 
-1. 真机验收 M1–M9 + MCP/Skill（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
-2. MCP 真实协议客户端接入与工具转发
-3. 技能检索/自动注入到请求上下文
+1. MCP 工具自动合并到请求工具定义，并在上游发起 MCP 工具调用时自动执行/回填结果
+2. 真机验收 M1–M9 + MCP/Skill（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
 
-> 历史快照：M1–M9 + MCP/Skill 基础管理快照已并入本节；更早的记录见 git 历史。
+> 历史快照：M1–M9 + MCP/Skill 管理（含工具发现/调用、技能自动注入）快照已并入本节；更早的记录见 git 历史。

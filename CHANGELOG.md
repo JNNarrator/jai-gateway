@@ -15,8 +15,8 @@ All notable changes to this project will be documented in this file.
   - 500 随机 body 解码器 fuzz 简表
 - M9: 发布工程
   - CHANGELOG、发布检查单、tag 触发 CI（签名/公证需真实 secrets）
-- MCP Server 管理：`mcp_servers` 表 + CRUD IPC + UI「MCP」页
-- 技能（skill）管理：`skills` 表 + CRUD IPC + UI「技能」页
+- MCP Server 管理：`mcp_servers` 表 + CRUD IPC + UI「MCP」页；支持 tools/list、tools/call 客户端调用（stdio/http/sse）
+- 技能（skill）管理：`skills` 表 + CRUD IPC + UI「技能」页；跨族转换请求自动注入启用技能到 system
 
 ### Changed
 - README/roadmap 同步至 M9 + MCP/Skill 基础管理

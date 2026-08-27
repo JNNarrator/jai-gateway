@@ -1035,6 +1035,12 @@ async fn try_converted_candidate(
         resolve_anthropic_inbound_tool_ids(&ctx.db, &mut req);
     }
 
+    // Skill 注入：把启用的技能内容追加到 system（仅跨族转换路径，避免破坏直通字节）
+    let _ = ctx.db.with_any(|c| {
+        crate::skills::apply_enabled_skills(c, &mut req);
+        Ok::<_, String>(())
+    });
+
     // 2) 护栏（M4：blocks ≤ 64 / args ≤ 256KB）
     if let Err(msg) = crate::codec::ir::validate_guards(&req) {
         return Attempt::Delivered(wire.error_response(

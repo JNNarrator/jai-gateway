@@ -77,6 +77,12 @@ export interface ImportReport {
   invalidProviders: string[];
 }
 
+export interface McpTool {
+  name: string;
+  description?: string | null;
+  inputSchema: unknown;
+}
+
 export interface McpServerRow {
   id: string;
   name: string;
