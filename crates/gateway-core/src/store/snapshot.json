@@ -1,0 +1,16 @@
+[
+  { "name": "gpt-4o", "ctx": 128000, "out": 16384 },
+  { "name": "gpt-4o-mini", "ctx": 128000, "out": 16384 },
+  { "name": "gpt-4-turbo", "ctx": 128000, "out": 4096 },
+  { "name": "o1", "ctx": 200000, "out": 100000 },
+  { "name": "o1-mini", "ctx": 128000, "out": 65536 },
+  { "name": "deepseek-chat", "ctx": 65536, "out": 8192 },
+  { "name": "deepseek-reasoner", "ctx": 65536, "out": 8192 },
+  { "name": "claude-3-5-sonnet-20241022", "ctx": 200000, "out": 8192 },
+  { "name": "claude-3-5-haiku-20241022", "ctx": 200000, "out": 8192 },
+  { "name": "claude-3-opus-20240229", "ctx": 200000, "out": 4096 },
+  { "name": "gemini-1.5-pro", "ctx": 1048576, "out": 8192 },
+  { "name": "gemini-1.5-flash", "ctx": 1048576, "out": 8192 },
+  { "name": "qwen-max", "ctx": 32768, "out": 8192 },
+  { "name": "qwen-plus", "ctx": 131072, "out": 8192 }
+]

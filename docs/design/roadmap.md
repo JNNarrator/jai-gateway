@@ -255,3 +255,30 @@
 | 流式重排缓冲内存失控 | 护栏常量（≤64 blocks / ≤256KB args）统一在 M4 落地、M8 审计 |
 | 平台密钥环差异 | M0 起启动三连探测；不支持环境在添加供应商前拦截（storage §4） |
 | WebDAV 误覆盖造成配置丢失 | M7 推送前快照留存；LLW 先于定时自动同步开放 |
+
+## 8. M1 实施进度快照（下班交接记录）
+
+> 状态：核心代码已落地并通过本地 clippy（-D warnings）与 gateway-core 18 项单测；
+> UI 已通过 `tsc --noEmit && vite build`。尚未做真机上游冒烟与 CI 最终确认。
+
+### 已完成（本分支已提交/待提交）
+- 存储 CRUD 扩展：providers / models / gateway_keys / meta、路由候选 SQL、`Db::with_any`
+- 异步日志管道：有界 1024 队列、≥64 行或 500ms 攒批、独立连接写、洪峰丢弃计数、`logs_recent`
+- OS 密钥环封装：set/get/delete/启动探测 + 共享 mock 单测（不触真实钥匙串）
+- OpenAI 旁路工具：请求 peek、增量 usage 扫描器、URL/错误形状
+- 模型快照：内嵌 JSON（14 个常见模型），`snapshot::lookup`
+- 安全中间件：Host 回环校验、Origin 白名单（默认拒绝）、Bearer/x-api-key + sha256 常量时间认证
+- 直通代理：单渠道 openai_compat、字节级 body 透传、SSE 管道、首字节 60s/空闲 120s、错误分类与 provider 状态回写
+- 模型发现：openai_compat / anthropic / gemini 三家 `/models` 归一入库（保留用户已调默认值）
+- Tauri IPC 全套：provider CRUD/测试/发现、model 限值/开关、网关密钥 info/reveal/轮换、日志查询、导出 JSON、CORS 设置、families
+- UI 五标签页：网关 / 供应商 / 模型 / 日志 / 设置（React+Tailwind，M0 卡片升级）
+- src-tauri 启动自举网关密钥、密钥环先写后库+失败回滚
+
+### 待办（回家换电脑继续）
+1. 提交并推送本快照，观察 CI（macOS/Windows Rust + web）全绿
+2. 真机验收：
+   - 添加 DeepSeek 官方/中转渠道，`provider_test` 与 `provider_discover_models`
+   - DeepSeek harness / OpenAI SDK 真实流式对话，SSE 通过、usage 落日志
+   - 断流/超时故障注入（上游 500、首字节超时、中途断流）
+3. 修正 CI 暴露的跨平台问题（若有）
+4. 提交 M1 收尾 commit 并做需求覆盖矩阵更新

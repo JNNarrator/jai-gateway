@@ -21,3 +21,6 @@ Thumbs.db
 .pnpm-store/
 # tauri 生成物
 src-tauri/gen/
+
+# shell/log noise
+nohup.out

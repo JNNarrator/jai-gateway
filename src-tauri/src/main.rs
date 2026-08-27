@@ -1,15 +1,22 @@
 //! JAI 桌面壳（Tauri 2）：网关监督进程 + 系统托盘 + IPC 命令。
 //!
 //! 稳定性基线落点：
-//! - §5-2 超时三件套：随 M1 业务代理落地（当前仅 healthz 监督面）
+//! - §5-2 超时三件套：随 M1 业务代理落地（gateway-core::server::proxy）
 //! - §5-6 进程看门狗：本文件的 restart 循环
 //! - 启动即应用 SQLite 迁移，失败即启动中止（storage §4 早拦截原则）
+//!
+//! M1 新增：providers/models/网关密钥/日志/导出/CORS 命令、
+//! 密钥环生命周期（先写凭据后落库+回滚）、模型发现入库。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use gateway_core::server::{self, AppState};
-use gateway_core::store;
-use serde::Serialize;
+use gateway_core::codec::Family;
+use gateway_core::discover::discover_models;
+use gateway_core::server::{self, GatewayCtx};
+use gateway_core::store::{self, logs, Db, GatewayKeyRow, ModelRow, ProviderRow};
+use gateway_core::vault;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -36,6 +43,14 @@ struct TrayHandles {
     stop_item: MenuItem<tauri::Wry>,
 }
 
+/// IPC 命令共享的业务核心（数据库 / 日志句柄 / HTTP 客户端）
+pub struct AppCore {
+    pub db: Db,
+    pub logs: logs::LogHandle,
+    pub http: reqwest::Client,
+    pub db_path: String,
+}
+
 struct GatewayState {
     preferred_port: u16,
     running: Arc<AtomicBool>,
@@ -56,28 +71,568 @@ impl GatewayState {
     }
 }
 
-// ---------------------------------------------------------------- IPC 命令
+// ---------------------------------------------------------------- DTO
 
-#[tauri::command]
-fn gateway_status(state: State<'_, GatewayState>) -> GwStatus {
-    state.status()
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDto {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub family: String,
+    pub enabled: bool,
+    pub priority: i64,
+    pub extra_headers: Option<String>,
+    pub last_ok_at: Option<i64>,
+    pub last_err_at: Option<i64>,
+    pub last_err_msg: Option<String>,
+    pub has_key: bool,
 }
 
-#[tauri::command]
-async fn gateway_start(app: AppHandle, state: State<'_, GatewayState>) -> Result<GwStatus, String> {
-    if state.running.load(Ordering::SeqCst) {
-        return Ok(state.status());
+fn to_dto(p: ProviderRow, has_key: bool) -> ProviderDto {
+    ProviderDto {
+        id: p.id,
+        name: p.name,
+        base_url: p.base_url,
+        family: p.family,
+        enabled: p.enabled,
+        priority: p.priority,
+        extra_headers: p.extra_headers,
+        last_ok_at: p.last_ok_at,
+        last_err_at: p.last_err_at,
+        last_err_msg: p.last_err_msg,
+        has_key,
     }
-    spawn_supervisor(&app, &state).map_err(|e| e.to_string())?;
-    reflect_status(&app, &state);
-    Ok(state.status())
+}
+
+// ---------------------------------------------------------------- 供应商命令
+
+#[tauri::command]
+async fn provider_list(core: State<'_, AppCore>) -> Result<Vec<ProviderDto>, String> {
+    let db = core.db.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        db.with(store::provider_list).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for p in rows {
+        let has_key = tokio::task::spawn_blocking({
+            let ref_ = p.keyring_ref.clone();
+            move || vault::get_secret(&ref_)
+        })
+        .await
+        .map_err(join_err)?
+        .map_err(vault_msg)?
+        .is_some();
+        out.push(to_dto(p, has_key));
+    }
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewProvider {
+    pub name: String,
+    pub base_url: String,
+    pub family: String,
+    #[serde(default = "default_priority")]
+    pub priority: i64,
+    #[serde(default)]
+    pub extra_headers: Option<String>,
+    pub api_key: String,
+}
+
+fn default_priority() -> i64 {
+    100
 }
 
 #[tauri::command]
-async fn gateway_stop(app: AppHandle, state: State<'_, GatewayState>) -> Result<GwStatus, String> {
-    request_stop(&state);
-    reflect_status(&app, &state);
-    Ok(state.status())
+async fn provider_create(
+    core: State<'_, AppCore>,
+    input: NewProvider,
+) -> Result<ProviderDto, String> {
+    validate_family(&input.family)?;
+    if input.api_key.trim().is_empty() {
+        return Err("API Key 不能为空".into());
+    }
+    if input.name.trim().is_empty() {
+        return Err("名称不能为空".into());
+    }
+
+    let id = uuid::Uuid::now_v7().to_string();
+    let keyring_ref = vault::ref_for(&id);
+
+    // storage §4：先写密钥环，成功后落库；落库失败回滚删除凭据
+    let secret = input.api_key.clone();
+    let r2 = keyring_ref.clone();
+    tokio::task::spawn_blocking(move || vault::set_secret(&r2, &secret))
+        .await
+        .map_err(join_err)?
+        .map_err(vault_msg)?;
+
+    let row = ProviderRow {
+        id: id.clone(),
+        name: input.name.trim().to_string(),
+        base_url: normalize_base(&input.base_url),
+        family: input.family,
+        enabled: true,
+        priority: input.priority,
+        extra_headers: input.extra_headers.filter(|s| !s.trim().is_empty()),
+        keyring_ref,
+        last_ok_at: None,
+        last_err_at: None,
+        last_err_msg: None,
+        created_at: store::now_ms(),
+        updated_at: store::now_ms(),
+    };
+    let db = core.db.clone();
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || db.with(|c| store::provider_insert(c, &row)))
+            .await
+            .map_err(join_err)?
+    {
+        let rollback_ref = vault::ref_for(&id);
+        let _ = tokio::task::spawn_blocking(move || vault::delete_secret(&rollback_ref)).await;
+        return Err(format!("数据库写入失败(已回滚凭据): {e}"));
+    }
+
+    let db2 = core.db.clone();
+    let created = tokio::task::spawn_blocking(move || {
+        db2.with(|c| store::provider_get(c, &id))
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "创建后读取失败".to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    Ok(to_dto(created, true))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProviderInput {
+    pub id: String,
+    pub name: Option<String>,
+    pub base_url: Option<String>,
+    pub priority: Option<i64>,
+    /// 外层 Some 表示要动这个字段；内层 None 表示清空
+    pub extra_headers: Option<Option<String>>,
+    /// Some(非空) 覆盖密钥；Some("") 忽略
+    pub api_key: Option<String>,
+}
+
+#[tauri::command]
+async fn provider_update(
+    core: State<'_, AppCore>,
+    input: UpdateProviderInput,
+) -> Result<(), String> {
+    if let Some(key) = &input.api_key {
+        if !key.is_empty() {
+            let row = fetch_provider(&core.db, &input.id).await?;
+            let kr = row.keyring_ref;
+            let k = key.clone();
+            tokio::task::spawn_blocking(move || vault::set_secret(&kr, &k))
+                .await
+                .map_err(join_err)?
+                .map_err(vault_msg)?;
+        }
+    }
+
+    let normalized = input.base_url.as_deref().map(normalize_base);
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| {
+            store::provider_update_fields(
+                c,
+                &input.id,
+                input.name.as_deref(),
+                normalized.as_deref(),
+                input.priority,
+                input.extra_headers.as_ref().map(|o| o.as_deref()),
+            )
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn provider_delete(core: State<'_, AppCore>, id: String) -> Result<(), String> {
+    let row = fetch_provider(&core.db, &id).await?;
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::provider_delete(c, &id))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    // 库先行成功；凭据尽力删除（幂等，失败不阻塞 UI）
+    let _ = tokio::task::spawn_blocking(move || vault::delete_secret(&row.keyring_ref)).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn provider_set_enabled(
+    core: State<'_, AppCore>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::provider_set_enabled(c, &id, enabled))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+/// 测试连接：跑一次模型发现。HTTP 200 即视为连通
+/// （部分中转站隐藏 /models，0 个模型也算通；错误信息给出排查提示）。
+#[tauri::command]
+async fn provider_test(core: State<'_, AppCore>, id: String) -> Result<String, String> {
+    let row = fetch_provider(&core.db, &id).await?;
+    let secret = load_secret_or_none(&row.keyring_ref).await?;
+    match discover_models(&core.http, &row.family, &row.base_url, secret.as_deref()).await {
+        Ok(models) => {
+            let n = models.len();
+            let db = core.db.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = db.with(|c| store::provider_mark_ok(c, &id));
+            });
+            Ok(format!("连接成功 · 发现 {n} 个模型"))
+        }
+        Err(msg) => {
+            let db = core.db.clone();
+            let m2 = msg.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = db.with(|c| store::provider_mark_err(c, &id, &m2));
+            });
+            Err(msg)
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 模型命令
+
+/// 自动发现 + 入库：已存在模型保留用户调过的默认值；
+/// 新模型用快照值或保守缺省（128k / 4096）。
+#[tauri::command]
+async fn provider_discover_models(
+    core: State<'_, AppCore>,
+    id: String,
+) -> Result<(usize, usize), String> {
+    let row = fetch_provider(&core.db, &id).await?;
+    let secret = load_secret_or_none(&row.keyring_ref).await?;
+
+    let models =
+        discover_models(&core.http, &row.family, &row.base_url, secret.as_deref()).await?;
+
+    let existing: std::collections::HashMap<String, ()> = {
+        let db = core.db.clone();
+        let pid = id.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with(|c| store::model_list_by_provider(c, &pid))
+                .map(|v| v.into_iter().map(|m| (m.model_name, ())).collect())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(join_err)??
+    };
+
+    let mut added = 0usize;
+    for m in &models {
+        if existing.contains_key(&m.id) {
+            continue; // 已有：绝不动用户配置过的默认值
+        }
+        let (ctx_w, out_w) =
+            store::snapshot::lookup(&m.id).unwrap_or((128000, 4096));
+        let db = core.db.clone();
+        let pid = id.clone();
+        let name = m.id.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with(|c| store::model_upsert(c, &pid, &name, Some(ctx_w), out_w))
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(join_err)??;
+        added += 1;
+    }
+    Ok((models.len(), added))
+}
+
+#[tauri::command]
+async fn model_list(
+    core: State<'_, AppCore>,
+    provider_id: String,
+) -> Result<Vec<ModelRow>, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::model_list_by_provider(c, &provider_id))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelLimitsInput {
+    pub model_id: String,
+    /// null 表示回到「默认」
+    pub context_window: Option<i64>,
+    pub max_output_tokens: i64,
+}
+
+#[tauri::command]
+async fn model_set_limits(core: State<'_, AppCore>, input: ModelLimitsInput) -> Result<(), String> {
+    if input.max_output_tokens <= 0 {
+        return Err("最大输出必须 > 0".into());
+    }
+    if let Some(w) = input.context_window {
+        if w <= 0 {
+            return Err("上下文窗口必须 > 0".into());
+        }
+    }
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| {
+            store::model_update_limits(
+                c,
+                &input.model_id,
+                input.context_window,
+                input.max_output_tokens,
+            )
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn model_toggle(core: State<'_, AppCore>, model_id: String, enabled: bool) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::model_toggle(c, &model_id, enabled))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+// ---------------------------------------------------------------- 网关密钥
+
+fn gen_gateway_key() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    let body: String = (0..28)
+        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .collect();
+    format!("sk-jai-{body}")
+}
+
+/// 首次启动自举一个活跃密钥（storage §6-3）。
+fn ensure_gateway_key(core: &AppCore) -> Result<(), String> {
+    core.db
+        .with(|c| {
+            if store::gw_key_active(c)?.is_none() {
+                store::gw_key_rotate(c, &gen_gateway_key(), Some("初始"))?;
+            }
+            Ok::<_, store::StoreError>(())
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayKeyInfo {
+    pub prefix: String,
+    pub label: Option<String>,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    /// 仅 reveal/regenerate 携带全文；info 恒为空串
+    pub key: String,
+}
+
+fn key_info(k: GatewayKeyRow, with_full: bool) -> GatewayKeyInfo {
+    GatewayKeyInfo {
+        prefix: k.prefix,
+        label: k.label,
+        created_at: k.created_at,
+        last_used_at: k.last_used_at,
+        key: if with_full { k.key } else { String::new() },
+    }
+}
+
+#[tauri::command]
+async fn gateway_key_info(core: State<'_, AppCore>) -> Result<Option<GatewayKeyInfo>, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| match store::gw_key_active(c) {
+            Ok(k) => Ok(k.map(|row| key_info(row, false))),
+            Err(e) => Err(e.to_string()),
+        })
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn gateway_key_reveal(core: State<'_, AppCore>) -> Result<GatewayKeyInfo, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| match store::gw_key_active(c) {
+            Ok(Some(k)) => Ok(key_info(k, true)),
+            Ok(None) => Err("无活跃网关密钥".to_string()),
+            Err(e) => Err(e.to_string()),
+        })
+    })
+    .await
+    .map_err(join_err)?
+}
+
+/// 轮换并返回新全量密钥（UI 弹窗一次性展示旧密钥即刻失效）。
+#[tauri::command]
+async fn gateway_key_regenerate(core: State<'_, AppCore>) -> Result<GatewayKeyInfo, String> {
+    let new_key = gen_gateway_key();
+    let nk = new_key.clone();
+    let db = core.db.clone();
+    let row = tokio::task::spawn_blocking(move || {
+        db.with(|c| store::gw_key_rotate(c, &nk, Some("手动轮换")))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    Ok(GatewayKeyInfo {
+        prefix: row.prefix,
+        label: row.label,
+        created_at: row.created_at,
+        last_used_at: None,
+        key: new_key,
+    })
+}
+
+// ---------------------------------------------------------------- 日志 / 导出 / 设置
+
+#[tauri::command]
+async fn logs_recent(core: State<'_, AppCore>, limit: i64) -> Result<Vec<logs::LogRowView>, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || logs::logs_recent(&db, limit).map_err(|e| e.to_string()))
+        .await
+        .map_err(join_err)?
+}
+
+/// 导出 JSON（storage §8 语义：meta+providers+models，零敏感字段——
+/// 密钥环引用与网关密钥列都不出现）。
+#[tauri::command]
+async fn export_config_json(core: State<'_, AppCore>) -> Result<String, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| -> Result<String, String> {
+            let providers: Vec<_> = store::provider_list(c)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|mut p| {
+                    p.keyring_ref = String::new(); // 双保险剔除引用
+                    p
+                })
+                .collect();
+            let mut all_models = Vec::new();
+            for p in &providers {
+                all_models.extend(
+                    store::model_list_by_provider(c, &p.id)
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+            let meta_rows: Vec<(String, String)> = {
+                let mut stmt = c
+                    .prepare("SELECT key,value FROM meta")
+                    .map_err(|e| e.to_string())?;
+                let it = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map_err(|e| e.to_string())?;
+                it.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            serde_json::to_string_pretty(&serde_json::json!({
+                "format": "jai-export/v1",
+                "exportedAt": store::now_ms(),
+                "note": "API Key 保存在各设备系统钥匙串中，不随导出迁移",
+                "meta": meta_rows,
+                "providers": providers,
+                "models": all_models,
+            }))
+            .map_err(|e| e.to_string())
+        })
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn cors_allow_get(core: State<'_, AppCore>) -> Result<Vec<String>, String> {
+    let raw = core
+        .db
+        .with(|c| store::meta_get(c, "cors_allow"))
+        .map_err(|e| e.to_string())?;
+    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+}
+
+#[tauri::command]
+async fn cors_allow_set(core: State<'_, AppCore>, list: Vec<String>) -> Result<(), String> {
+    let payload = serde_json::to_string(&list).map_err(|e| e.to_string())?;
+    core.db
+        .with(|c| store::meta_set(c, "cors_allow", &payload))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn families() -> Vec<&'static str> {
+    vec!["openai_compat", "anthropic", "gemini"]
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn join_err(e: tokio::task::JoinError) -> String {
+    format!("内部任务失败: {e}")
+}
+
+fn vault_msg(e: vault::VaultError) -> String {
+    format!("系统密钥环操作失败（检查本机凭据设置）: {e}")
+}
+
+fn validate_family(f: &str) -> Result<(), String> {
+    Family::from_db_str(f).map(|_| ()).ok_or_else(|| format!("不支持的协议族: {f}"))
+}
+
+/// base_url 归一：去首尾空白与尾部斜杠。
+fn normalize_base(s: &str) -> String {
+    s.trim().trim_end_matches('/').to_string()
+}
+
+async fn fetch_provider(db: &Db, id: &str) -> Result<ProviderRow, String> {
+    let db2 = db.clone();
+    let id2 = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        db2.with(|c| store::provider_get(c, &id2))
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "供应商不存在".to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+async fn load_secret_or_none(keyring_ref: &str) -> Result<Option<String>, String> {
+    let r = keyring_ref.to_string();
+    tokio::task::spawn_blocking(move || vault::get_secret(&r))
+        .await
+        .map_err(join_err)?
+        .map_err(vault_msg)
 }
 
 // ---------------------------------------------------------------- 监督循环
@@ -88,9 +643,8 @@ enum StopKind {
 }
 
 /// 启动带看门狗的网关任务。
-/// 端口顺延（roadmap M0 验收 3）由 bind_with_fallback 保证；
-/// 异常退出自动重启（稳定性基线 §5-6）由下方 restart 循环保证。
-fn spawn_supervisor(app: &AppHandle, st: &GatewayState) -> Result<(), tauri::Error> {
+/// 端口顺延由 bind_with_fallback 保证；异常退出自动重启（§5-6）由此循环保证。
+fn spawn_supervisor(app: &AppHandle, st: &GatewayState, core: &AppCore) -> Result<(), tauri::Error> {
     if st.supervisor.lock().unwrap().is_some() {
         return Ok(());
     }
@@ -104,6 +658,7 @@ fn spawn_supervisor(app: &AppHandle, st: &GatewayState) -> Result<(), tauri::Err
     let port_cell = st.port.clone();
     let restarts = st.restarts.clone();
     let preferred_port = st.preferred_port;
+    let ctx = GatewayCtx::new(core.db.clone(), core.logs.clone());
 
     let app_handle = app.clone();
     // detached 任务：生命周期由 running 标志与 stop 信号管理，无需持有句柄
@@ -123,18 +678,11 @@ fn spawn_supervisor(app: &AppHandle, st: &GatewayState) -> Result<(), tauri::Err
             port_cell.store(actual_port, Ordering::SeqCst);
             println!("[gateway] listening on 127.0.0.1:{actual_port}");
 
-            let app_state = AppState {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                started_at_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
-            };
-
+            let serve_ctx = ctx.clone();
             let serve = tokio::spawn(server::run_until_shutdown(
                 listener,
-                server::build_router(app_state),
-                stop_rx.clone(), // watch::Receiver 是 Clone
+                server::build_router(serve_ctx),
+                stop_rx.clone(),
             ));
             tokio::pin!(serve);
 
@@ -161,7 +709,6 @@ fn spawn_supervisor(app: &AppHandle, st: &GatewayState) -> Result<(), tauri::Err
                     if stop_flag.load(Ordering::SeqCst) {
                         break;
                     }
-                    // ---- 看门狗：异常退出延迟重启 ----
                     let n = restarts.fetch_add(1, Ordering::SeqCst) + 1;
                     eprintln!("[watchdog] 网关异常退出({reason})，第 {n} 次自动重启");
                     let _ = app_handle.emit("gateway://event", format!("restart:{n}"));
@@ -228,9 +775,23 @@ fn main() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("jai.db");
-            // open_and_migrate 内含 PRAGMA 三件套（WAL/NORMAL/foreign_keys）
-            store::open_and_migrate(&db_path.to_string_lossy())?;
+            let db_str = db_path.to_string_lossy().to_string();
+
+            let db = Db::open(&db_str)?;
+            // 日志管道第二条连接 + 有界队列（稳定性基线 §5-3）
+            let (log_handle, _log_task) = logs::spawn_logger(&db_str)?;
             println!("[store] db ready at {}", db_path.display());
+
+            let core = AppCore {
+                db: db.clone(),
+                logs: log_handle,
+                http: reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .expect("reqwest client"),
+                db_path: db_str,
+            };
+            ensure_gateway_key(&core)?;
 
             // 2) 托盘
             let status_item =
@@ -263,9 +824,10 @@ fn main() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| {
                     let st = app.state::<GatewayState>();
+                    let core = app.state::<AppCore>();
                     match event.id().as_ref() {
                         "gw-start" => {
-                            if let Err(e) = spawn_supervisor(app, &st) {
+                            if let Err(e) = spawn_supervisor(app, &st, &core) {
                                 eprintln!("[tray] start failed: {e}");
                             }
                             reflect_status(app, &st);
@@ -286,7 +848,7 @@ fn main() {
                 })
                 .build(app)?;
 
-            // 3) 受管状态 + 初始状态外显
+            // 3) 受管状态 + 启动即拉起网关（常驻预期）
             let gw = GatewayState {
                 preferred_port: server::DEFAULT_PORT,
                 running: Arc::new(AtomicBool::new(false)),
@@ -301,9 +863,11 @@ fn main() {
                 })),
             };
             app.manage(gw);
+            app.manage(core);
             {
                 let st = app.state::<GatewayState>();
-                spawn_supervisor(app.handle(), &st)?;
+                let core_state = app.state::<AppCore>();
+                spawn_supervisor(app.handle(), &st, &core_state)?;
                 reflect_status(app.handle(), &st);
             }
 
@@ -312,8 +876,57 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             gateway_status,
             gateway_start,
-            gateway_stop
+            gateway_stop,
+            provider_list,
+            provider_create,
+            provider_update,
+            provider_delete,
+            provider_set_enabled,
+            provider_test,
+            provider_discover_models,
+            model_list,
+            model_set_limits,
+            model_toggle,
+            gateway_key_info,
+            gateway_key_reveal,
+            gateway_key_regenerate,
+            logs_recent,
+            export_config_json,
+            cors_allow_get,
+            cors_allow_set,
+            families,
         ])
         .run(tauri::generate_context!())
         .expect("error while running jai");
+}
+
+// ---------------------------------------------------------------- 网关启停命令
+
+#[tauri::command]
+fn gateway_status(state: State<'_, GatewayState>) -> GwStatus {
+    state.status()
+}
+
+#[tauri::command]
+async fn gateway_start(
+    app: AppHandle,
+    state: State<'_, GatewayState>,
+    core: State<'_, AppCore>,
+) -> Result<GwStatus, String> {
+    if state.running.load(Ordering::SeqCst) {
+        return Ok(state.status());
+    }
+    spawn_supervisor(&app, &state, &core).map_err(|e| e.to_string())?;
+    reflect_status(&app, &state);
+    Ok(state.status())
+}
+
+#[tauri::command]
+async fn gateway_stop(
+    app: AppHandle,
+    state: State<'_, GatewayState>,
+) -> Result<GwStatus, String> {
+    request_stop(&state);
+    reflect_status(&app, &state);
+    Ok(state.status())
 }

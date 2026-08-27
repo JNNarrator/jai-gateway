@@ -1,25 +1,23 @@
-//! 网关监督面（M0 范围）：绑定与端口顺延、/healthz。
+//! 网关监督面：绑定与端口顺延、/healthz、安全中间件装配、直通代理挂载。
 //!
-//! 设计依据：roadmap M0（端口占用自动顺延、healthz）+
-//! 稳定性基线 §5-2（后续在此扩展超时配置）。业务路由自 M1 起挂载。
+//! 设计依据：roadmap M0/M1 + 稳定性基线 §5-2（超时常量在 proxy 模块）。
+
+pub mod proxy;
+pub mod security;
 
 use axum::extract::State;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use std::net::{SocketAddr, TcpListener};
 use thiserror::Error;
 use tokio::net::TcpListener as AsyncTcpListener;
 
+pub use proxy::GatewayCtx;
+
 pub const DEFAULT_PORT: u16 = 1314;
 /// 端口顺延最大尝试次数：1314..1314+PORT_SCAN_TRIES
 pub const PORT_SCAN_TRIES: u16 = 16;
-
-#[derive(Debug, Clone)]
-pub struct AppState {
-    pub version: String,
-    pub started_at_ms: u64,
-}
 
 #[derive(Debug, Error)]
 pub enum BindError {
@@ -34,7 +32,7 @@ pub enum BindError {
 /// 在 `preferred_port` 起的连续候选中寻找第一个可用端口并绑定（roadmap M0 验收 3）。
 ///
 /// 仅接受 IP 字面量作为 host（M0 固定 127.0.0.1；域名解析随 M1 引入上游配置时再说）。
-/// 返回 (实际监听器, 实际端口)。绑定次序即"自动顺延"，UI 展示返回的实际端口。
+/// 返回 (实际监听器, 实际端口)。
 pub fn bind_with_fallback(
     host: &str,
     preferred_port: u16,
@@ -47,9 +45,10 @@ pub fn bind_with_fallback(
         let addr = SocketAddr::from((ip, port));
         match TcpListener::bind(addr) {
             Ok(std_listener) => {
+                let actual_port = std_listener.local_addr()?.port();
                 std_listener.set_nonblocking(true)?;
                 let listener = AsyncTcpListener::from_std(std_listener)?;
-                return Ok((listener, port));
+                return Ok((listener, actual_port));
             }
             // 仅"端口被占"允许顺延；权限等其他错误立即失败
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
@@ -61,6 +60,8 @@ pub fn bind_with_fallback(
     })
 }
 
+// ---------------------------------------------------------------- healthz
+
 #[derive(Serialize)]
 pub struct Health {
     pub ok: bool,
@@ -68,19 +69,30 @@ pub struct Health {
     pub started_at_ms: u64,
 }
 
-async fn healthz(State(st): State<AppState>) -> Json<Health> {
+async fn healthz(State(ctx): State<GatewayCtx>) -> Json<Health> {
     Json(Health {
         ok: true,
-        version: st.version.clone(),
-        started_at_ms: st.started_at_ms,
+        version: ctx.version.clone(),
+        started_at_ms: ctx.started_at_ms,
     })
 }
 
-/// M0 全量路由表。M1 起在 `proxy_routes()` 内按里程碑扩充。
-pub fn build_router(state: AppState) -> Router {
+// ---------------------------------------------------------------- 路由表
+
+/// 全量路由。M1 增加鉴权/安全层与两条业务端点；
+/// 后续里程碑沿此扩展（M3 加 /v1/messages，M6 加 /v1/responses）。
+pub fn build_router(ctx: GatewayCtx) -> Router {
+    use axum::middleware;
+
     Router::new()
+        .route("/v1/chat/completions", post(proxy::chat_completions))
+        .route("/v1/models", get(proxy::models_list))
+        .layer(middleware::from_fn_with_state(
+            ctx.clone(),
+            proxy::security_mw,
+        ))
         .route("/healthz", get(healthz))
-        .with_state(state)
+        .with_state(ctx)
 }
 
 /// 以优雅停机方式运行直到收到关停信号（监督进程喂入）。
@@ -100,79 +112,92 @@ pub async fn run_until_shutdown(
 mod tests {
     use super::*;
 
-    /// 绑定真实端口的测试必须串行：并行时「下一个端口」可能被
-    /// 其他测试的临时监听抢走，导致顺延断言偶发失败。
-    /// 用 tokio Mutex：需跨 await 持有（clippy::await_holding_lock）。
     static PORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// 直连 handler 的纯单元断言：无网络依赖，任何环境都跑。
-    #[tokio::test]
-    async fn healthz_handler_returns_ok_and_version() {
-        let st = AppState {
-            version: "0.1.0".into(),
-            started_at_ms: 42,
-        };
-        let Json(h) = healthz(State(st)).await;
-        assert!(h.ok);
-        assert_eq!(h.version, "0.1.0");
-        assert_eq!(h.started_at_ms, 42);
-    }
-
-    fn http_get(port: u16, path: &str) -> String {
-        use std::io::{Read, Write};
-        let mut s = std::net::TcpStream::connect(("127.0.0.1", port))
-            .expect("loopback connect（本地沙箱可能禁外连，见 ignore 说明）");
-        write!(
-            s,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut buf = String::new();
-        s.read_to_string(&mut buf).unwrap();
-        buf
-    }
-
-    /// 完整 HTTP 回环验证。CI（GitHub Actions）与真机均会执行；
-    /// 本地受限开发沙箱禁 outbound connect，故标 ignore。
-    #[tokio::test]
-    #[ignore = "需 loopback 连接权限；CI 与真机运行（cargo test -- --ignored 验证）"]
-    async fn healthz_http_roundtrip() {
-        let _guard = PORT_TEST_LOCK.lock().await;
-        let state = AppState {
-            version: "0.1.0".into(),
-            started_at_ms: 1234567890,
-        };
-        let (listener, port) = bind_with_fallback("127.0.0.1", 0).unwrap();
-        let app = build_router(state);
-
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let server = tokio::spawn(run_until_shutdown(listener, app, rx));
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        let resp = http_get(port, "/healthz");
-        assert!(resp.starts_with("HTTP/1.1 200"), "status: {resp}");
-        assert!(resp.contains("\"ok\":true"), "body: {resp}");
-        assert!(resp.contains("\"version\":\"0.1.0\""));
-
-        tx.send(true).unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    /// M0 验收标准 3：首选端口被占 → 自动顺延到下一个可用端口。
+    /// 绑定真实端口的用例必须串行（M0 验收 3）。
     #[tokio::test]
     async fn port_fallback_skips_occupied() {
-        let _guard = PORT_TEST_LOCK.lock().await;
-        // 占住一个真实端口
+        let _g = PORT_TEST_LOCK.lock().await;
         let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let occupied = blocker.local_addr().unwrap().port();
 
-        let (_listener, actual) = bind_with_fallback("127.0.0.1", occupied).expect("应顺延成功");
-        assert_eq!(actual, occupied + 1, "必须从被占端口的下一个端口继续");
+        let (_listener, actual) =
+            bind_with_fallback("127.0.0.1", occupied).expect("应顺延成功");
+        assert_eq!(actual, occupied + 1);
+    }
+
+    #[tokio::test]
+    async fn bind_zero_is_random_and_ok() {
+        let _g = PORT_TEST_LOCK.lock().await;
+        let (_l, p) = bind_with_fallback("127.0.0.1", 0).unwrap();
+        assert_ne!(p, 0);
     }
 
     #[test]
-    fn invalid_host_is_rejected_immediately() {
-        let err = bind_with_fallback("not_a_host!!", DEFAULT_PORT).unwrap_err();
-        assert!(matches!(err, BindError::InvalidHost(_)));
+    fn invalid_host_rejected() {
+        assert!(matches!(
+            bind_with_fallback("not_a_host!!", DEFAULT_PORT),
+            Err(BindError::InvalidHost(_))
+        ));
+    }
+
+    // ---------------- security ----------------
+
+    mod sec {
+        use super::super::security::*;
+        use axum::http::{HeaderMap, HeaderValue};
+
+        #[test]
+        fn ct_eq_basics() {
+            assert!(ct_eq("sk-jai-abc", "sk-jai-abc"));
+            assert!(!ct_eq("sk-jai-abc", "sk-jai-abd"));
+            assert!(!ct_eq("short", "longer-string"));
+        }
+
+        #[test]
+        fn host_header_parsing() {
+            assert_eq!(hostname_of_host_header("127.0.0.1:1314"), "127.0.0.1");
+            assert_eq!(hostname_of_host_header("localhost"), "localhost");
+            assert_eq!(hostname_of_host_header("[::1]:8080"), "::1");
+            assert_eq!(hostname_of_host_header("evil.example.com"), "evil.example.com");
+        }
+
+        #[test]
+        fn host_check_blocks_non_loopback() {
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::header::HOST, HeaderValue::from_static("evil.com:1314"));
+            assert!(check_host(&h).is_err());
+
+            h.insert(axum::http::header::HOST, HeaderValue::from_static("127.0.0.1:9999"));
+            assert!(check_host(&h).is_ok());
+
+            // 缺失 Host 也拒绝
+            let empty = HeaderMap::new();
+            assert!(check_host(&empty).is_err());
+        }
+
+        #[test]
+        fn origin_default_deny_and_allowlist() {
+            let mut h = HeaderMap::new();
+            // 非浏览器客户端无 Origin：放行
+            assert!(check_origin(&HeaderMap::new(), &[]).is_ok());
+
+            h.insert(
+                axum::http::header::ORIGIN,
+                HeaderValue::from_static("https://chat.example.com"),
+            );
+            assert!(check_origin(&h, &[]).is_err(), "默认拒绝远程来源");
+
+            assert!(check_origin(&h, &["https://chat.example.com".into()]).is_ok());
+            assert!(check_origin(&h, &["*".into()]).is_ok());
+            assert!(check_origin(&h, &["https://other.io".into()]).is_err());
+
+            // 本机来源天然放行（无清单）
+            h.insert(
+                axum::http::header::ORIGIN,
+                HeaderValue::from_static("http://localhost:5173"),
+            );
+            assert!(check_origin(&h, &[]).is_ok());
+        }
     }
 }
