@@ -78,32 +78,38 @@ pub fn spawn_retention_loop(
     interval: std::time::Duration,
     retention_days: i64,
     row_cap: i64,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(interval).await;
-            let db2 = db.clone();
-            let days = retention_days;
-            let cap = row_cap;
-            let res = tokio::task::spawn_blocking(move || {
-                let now = super::now_ms();
-                db2.with(|c| run_retention(c, now, days, cap))
-            })
-            .await;
-            match res {
-                Ok(Ok(stats)) => {
-                    if stats.logs_expired > 0 || stats.logs_capped > 0 || stats.tool_ids_expired > 0
-                    {
-                        eprintln!(
-                            "[retention] 清理完成: logs_expired={} logs_capped={} tool_ids_expired={}",
-                            stats.logs_expired, stats.logs_capped, stats.tool_ids_expired
-                        );
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("retention runtime build failed");
+        runtime.block_on(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let db2 = db.clone();
+                let days = retention_days;
+                let cap = row_cap;
+                let res = tokio::task::spawn_blocking(move || {
+                    let now = super::now_ms();
+                    db2.with(|c| run_retention(c, now, days, cap))
+                })
+                .await;
+                match res {
+                    Ok(Ok(stats)) => {
+                        if stats.logs_expired > 0 || stats.logs_capped > 0 || stats.tool_ids_expired > 0
+                        {
+                            eprintln!(
+                                "[retention] 清理完成: logs_expired={} logs_capped={} tool_ids_expired={}",
+                                stats.logs_expired, stats.logs_capped, stats.tool_ids_expired
+                            );
+                        }
                     }
+                    Ok(Err(e)) => eprintln!("[retention] 清理失败(下轮重试): {e}"),
+                    Err(e) => eprintln!("[retention] 任务 join 失败: {e}"),
                 }
-                Ok(Err(e)) => eprintln!("[retention] 清理失败(下轮重试): {e}"),
-                Err(e) => eprintln!("[retention] 任务 join 失败: {e}"),
             }
-        }
+        });
     })
 }
 

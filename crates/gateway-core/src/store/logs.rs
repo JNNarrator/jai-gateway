@@ -117,58 +117,66 @@ fn open_logger_conn(path: &str) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
-/// 启动后台写日志任务。同步函数（启动路径调用），内部不做 async 文件 IO。
-pub fn spawn_logger(db_path: &str) -> Result<(LogHandle, tokio::task::JoinHandle<()>), StoreError> {
+/// 启动后台写日志任务。同步函数（启动路径调用），不依赖调用方是否已进入 Tokio 运行时：
+/// 内部创建独立 current-thread runtime，避免 Tauri setup 阶段 `tokio::spawn` 触发
+/// “there is no reactor running”。
+pub fn spawn_logger(db_path: &str) -> Result<(LogHandle, std::thread::JoinHandle<()>), StoreError> {
     let (tx, mut rx) = mpsc::channel::<LogEvent>(CHANNEL_CAP);
     let dropped = Arc::new(AtomicU64::new(0));
 
     let conn = Arc::new(Mutex::new(open_logger_conn(db_path)?));
     let drops = dropped.clone();
 
-    let task = tokio::spawn(async move {
-        let mut batch: Vec<LogEvent> = Vec::with_capacity(BATCH_MAX_ROWS);
-        loop {
-            // 有积压则立即冲刷；否则等事件或定时间隔
-            if batch.len() < BATCH_MAX_ROWS {
-                tokio::select! {
-                    ev = rx.recv() => match ev {
-                        Some(ev) => { batch.push(ev); continue; }
-                        None => break,
-                    },
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(BATCH_FLUSH_INTERVAL_MS)) => {}
+    let task = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("logger runtime build failed");
+        runtime.block_on(async move {
+            let mut batch: Vec<LogEvent> = Vec::with_capacity(BATCH_MAX_ROWS);
+            loop {
+                // 有积压则立即冲刷；否则等事件或定时间隔
+                if batch.len() < BATCH_MAX_ROWS {
+                    tokio::select! {
+                        ev = rx.recv() => match ev {
+                            Some(ev) => { batch.push(ev); continue; }
+                            None => break,
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(BATCH_FLUSH_INTERVAL_MS)) => {}
+                    }
                 }
-            }
 
-            if batch.is_empty() {
-                continue;
-            }
-
-            // LogEvent 是 Send 的；Box<dyn ToSql> 不是 —— 参数行在阻塞线程内构造
-            let rows_src = std::mem::take(&mut batch);
-            let row_count = rows_src.len();
-            let c = conn.clone();
-            let res = tokio::task::spawn_blocking(move || {
-                let guard = c.lock().unwrap_or_else(|p| p.into_inner());
-                let mut stmt = guard.prepare_cached(INSERT_SQL)?;
-                for ev in &rows_src {
-                    stmt.execute(params_from_iter(event_params(ev)))?;
+                if batch.is_empty() {
+                    continue;
                 }
-                Ok::<_, rusqlite::Error>(())
-            })
-            .await;
 
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    eprintln!("[logs] 写入失败(丢 {row_count} 条): {e}")
+                // LogEvent 是 Send 的；Box<dyn ToSql> 不是 —— 参数行在阻塞线程内构造
+                let rows_src = std::mem::take(&mut batch);
+                let row_count = rows_src.len();
+                let c = conn.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    let guard = c.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut stmt = guard.prepare_cached(INSERT_SQL)?;
+                    for ev in &rows_src {
+                        stmt.execute(params_from_iter(event_params(ev)))?;
+                    }
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .await;
+
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        eprintln!("[logs] 写入失败(丢 {row_count} 条): {e}")
+                    }
+                    Err(e) => eprintln!("[logs] 写入任务 join 失败: {e}"),
                 }
-                Err(e) => eprintln!("[logs] 写入任务 join 失败: {e}"),
+                let _ = &drops;
             }
-            let _ = &drops;
-        }
-        if !batch.is_empty() {
-            eprintln!("[logs] 退出时未冲刷批次 {} 条", batch.len());
-        }
+            if !batch.is_empty() {
+                eprintln!("[logs] 退出时未冲刷批次 {} 条", batch.len());
+            }
+        });
     });
 
     Ok((
@@ -279,7 +287,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(900)).await;
         let dropped = handle.dropped_total();
         drop(handle);
-        let _ = task.await;
+        let _ = task.join();
 
         let rows = logs_recent(&db, 100).unwrap();
         assert_eq!(rows.len(), 10, "全部事件都应落库");
