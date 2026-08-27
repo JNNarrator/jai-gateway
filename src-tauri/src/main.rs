@@ -329,8 +329,7 @@ async fn provider_discover_models(
     let row = fetch_provider(&core.db, &id).await?;
     let secret = load_secret_or_none(&row.keyring_ref).await?;
 
-    let models =
-        discover_models(&core.http, &row.family, &row.base_url, secret.as_deref()).await?;
+    let models = discover_models(&core.http, &row.family, &row.base_url, secret.as_deref()).await?;
 
     let existing: std::collections::HashMap<String, ()> = {
         let db = core.db.clone();
@@ -349,8 +348,7 @@ async fn provider_discover_models(
         if existing.contains_key(&m.id) {
             continue; // 已有：绝不动用户配置过的默认值
         }
-        let (ctx_w, out_w) =
-            store::snapshot::lookup(&m.id).unwrap_or((128000, 4096));
+        let (ctx_w, out_w) = store::snapshot::lookup(&m.id).unwrap_or((128000, 4096));
         let db = core.db.clone();
         let pid = id.clone();
         let name = m.id.clone();
@@ -415,7 +413,11 @@ async fn model_set_limits(core: State<'_, AppCore>, input: ModelLimitsInput) -> 
 }
 
 #[tauri::command]
-async fn model_toggle(core: State<'_, AppCore>, model_id: String, enabled: bool) -> Result<(), String> {
+async fn model_toggle(
+    core: State<'_, AppCore>,
+    model_id: String,
+    enabled: bool,
+) -> Result<(), String> {
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
         db.with(|c| store::model_toggle(c, &model_id, enabled))
@@ -520,7 +522,10 @@ async fn gateway_key_regenerate(core: State<'_, AppCore>) -> Result<GatewayKeyIn
 // ---------------------------------------------------------------- 日志 / 导出 / 设置
 
 #[tauri::command]
-async fn logs_recent(core: State<'_, AppCore>, limit: i64) -> Result<Vec<logs::LogRowView>, String> {
+async fn logs_recent(
+    core: State<'_, AppCore>,
+    limit: i64,
+) -> Result<Vec<logs::LogRowView>, String> {
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || logs::logs_recent(&db, limit).map_err(|e| e.to_string()))
         .await
@@ -545,7 +550,9 @@ async fn cors_allow_get(core: State<'_, AppCore>) -> Result<Vec<String>, String>
         .db
         .with(|c| store::meta_get(c, "cors_allow"))
         .map_err(|e| e.to_string())?;
-    Ok(raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+    Ok(raw
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default())
 }
 
 #[tauri::command]
@@ -629,7 +636,10 @@ async fn settings_set_port(core: State<'_, AppCore>, port: u16) -> Result<u16, S
 /// 日志记录开关：写 meta + 实时切换 LogHandle（不重启即生效）。
 /// 关闭不影响已入队事件。
 #[tauri::command]
-async fn settings_set_logs_enabled(core: State<'_, AppCore>, enabled: bool) -> Result<bool, String> {
+async fn settings_set_logs_enabled(
+    core: State<'_, AppCore>,
+    enabled: bool,
+) -> Result<bool, String> {
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
         db.with(|c| store::meta_set(c, "logs_enabled", if enabled { "true" } else { "false" }))
@@ -652,7 +662,9 @@ fn vault_msg(e: vault::VaultError) -> String {
 }
 
 fn validate_family(f: &str) -> Result<(), String> {
-    Family::from_db_str(f).map(|_| ()).ok_or_else(|| format!("不支持的协议族: {f}"))
+    Family::from_db_str(f)
+        .map(|_| ())
+        .ok_or_else(|| format!("不支持的协议族: {f}"))
 }
 
 /// base_url 归一：去首尾空白与尾部斜杠。
@@ -689,7 +701,11 @@ enum StopKind {
 
 /// 启动带看门狗的网关任务。
 /// 端口顺延由 bind_with_fallback 保证；异常退出自动重启（§5-6）由此循环保证。
-fn spawn_supervisor(app: &AppHandle, st: &GatewayState, core: &AppCore) -> Result<(), tauri::Error> {
+fn spawn_supervisor(
+    app: &AppHandle,
+    st: &GatewayState,
+    core: &AppCore,
+) -> Result<(), tauri::Error> {
     if st.supervisor.lock().unwrap().is_some() {
         return Ok(());
     }
@@ -830,9 +846,8 @@ fn main() {
             // 读取持久化设置（meta KV）：端口 / 日志开关（roadmap M2 设置页）
             let preferred_port: u16 = db
                 .with(|c| {
-                    store::meta_get(c, "gateway_port").map(|v| {
-                        v.and_then(|s| s.parse::<u16>().ok())
-                    })
+                    store::meta_get(c, "gateway_port")
+                        .map(|v| v.and_then(|s| s.parse::<u16>().ok()))
                 })
                 .ok()
                 .flatten()
@@ -998,10 +1013,7 @@ async fn gateway_start(
 }
 
 #[tauri::command]
-async fn gateway_stop(
-    app: AppHandle,
-    state: State<'_, GatewayState>,
-) -> Result<GwStatus, String> {
+async fn gateway_stop(app: AppHandle, state: State<'_, GatewayState>) -> Result<GwStatus, String> {
     request_stop(&state);
     reflect_status(&app, &state);
     Ok(state.status())

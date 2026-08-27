@@ -15,7 +15,7 @@ use axum::Router;
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
 use gateway_core::vault;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 // ---------------------------------------------------------------- mock 上游
 
@@ -26,39 +26,43 @@ async fn spawn_anthropic_mock(
 ) -> u16 {
     let app = Router::new().route(
         "/v1/messages",
-        post(move |headers: axum::http::HeaderMap, body: String| async move {
-            let mut rec = inbound_headers.lock().unwrap();
-            for (k, v) in [
-                ("x-api-key", "sk-upstream-abc"),
-                ("anthropic-version", "2023-06-01"),
-            ] {
-                if let Some(vv) = headers.get(k).and_then(|v| v.to_str().ok()) {
-                    if vv == v {
-                        rec.push((k.to_string(), vv.to_string()));
+        post(
+            move |headers: axum::http::HeaderMap, body: String| async move {
+                let mut rec = inbound_headers.lock().unwrap();
+                for (k, v) in [
+                    ("x-api-key", "sk-upstream-abc"),
+                    ("anthropic-version", "2023-06-01"),
+                ] {
+                    if let Some(vv) = headers.get(k).and_then(|v| v.to_str().ok()) {
+                        if vv == v {
+                            rec.push((k.to_string(), vv.to_string()));
+                        }
                     }
                 }
-            }
-            let _ = body;
-            let payload = if (400..600).contains(&status) {
-                json!({
-                    "type":"error",
-                    "error":{"type":"api_error","message":format!("mock {status}")}
-                })
-            } else {
-                json!({"id":"msg_mock","type":"message","role":"assistant",
+                let _ = body;
+                let payload = if (400..600).contains(&status) {
+                    json!({
+                        "type":"error",
+                        "error":{"type":"api_error","message":format!("mock {status}")}
+                    })
+                } else {
+                    json!({"id":"msg_mock","type":"message","role":"assistant",
                     "model":"claude-sonnet-4",
                     "content":[{"type":"text","text":"from-anthropic-mock"}],
                     "stop_reason":"end_turn","usage":{"input_tokens":11,"output_tokens":7}})
-            };
-            Response::builder()
-                .status(status)
-                .header("content-type", "application/json")
-                .header("x-mock-tag", "anthropic")
-                .body(Body::from(payload.to_string()))
-                .unwrap()
-        }),
+                };
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .header("x-mock-tag", "anthropic")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap()
+            },
+        ),
     );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -75,7 +79,10 @@ struct Fixture {
     db: Db,
     key: String,
     headers: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    _keepalive: (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>),
+    _keepalive: (
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ),
 }
 
 async fn fixture(upstream_status: u16) -> Fixture {

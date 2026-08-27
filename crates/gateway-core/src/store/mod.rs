@@ -84,10 +84,7 @@ impl Db {
     }
 
     /// 闭包可返回任意错误类型（IPC 层常把多步操作折叠成 String）。
-    pub fn with_any<T, E>(
-        &self,
-        f: impl FnOnce(&Connection) -> Result<T, E>,
-    ) -> Result<T, E> {
+    pub fn with_any<T, E>(&self, f: impl FnOnce(&Connection) -> Result<T, E>) -> Result<T, E> {
         let guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
         f(&guard)
     }
@@ -288,15 +285,18 @@ pub fn model_upsert(
                context_window=excluded.context_window,
                max_output_tokens=excluded.max_output_tokens"
         ),
-        params![id, provider_id, model_name, context_window, max_output_tokens],
+        params![
+            id,
+            provider_id,
+            model_name,
+            context_window,
+            max_output_tokens
+        ],
     )?;
     Ok(())
 }
 
-pub fn model_get(
-    c: &Connection,
-    model_id: &str,
-) -> Result<Option<ModelRow>, StoreError> {
+pub fn model_get(c: &Connection, model_id: &str) -> Result<Option<ModelRow>, StoreError> {
     let sql = format!("SELECT {MODEL_COLS} FROM models WHERE id=?1");
     Ok(c.query_row(&sql, [model_id], row_to_model).optional()?)
 }
@@ -462,6 +462,41 @@ pub fn meta_set(c: &Connection, key: &str, value_json: &str) -> Result<(), Store
         params![key, value_json],
     )?;
     Ok(())
+}
+
+// ================================================================ tool_id_map（协议 IR §5-B）
+
+/// 超长 tool_use id 映射 TTL（storage §5：7 天滚动过期）。
+pub const TOOL_ID_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// 写入/更新 outbound_id → canonical_id 映射。
+pub fn tool_id_put(
+    c: &Connection,
+    outbound_id: &str,
+    canonical_id: &str,
+) -> Result<(), StoreError> {
+    let now = now_ms();
+    c.execute(
+        "INSERT INTO tool_id_map(outbound_id, canonical_id, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(outbound_id) DO UPDATE SET
+           canonical_id=excluded.canonical_id,
+           created_at=excluded.created_at,
+           expires_at=excluded.expires_at",
+        params![outbound_id, canonical_id, now, now + TOOL_ID_TTL_MS],
+    )?;
+    Ok(())
+}
+
+/// 查超长工具 id 映射（未过期才有效）。
+pub fn tool_id_get(c: &Connection, outbound_id: &str) -> Result<Option<String>, StoreError> {
+    Ok(c.query_row(
+        "SELECT canonical_id FROM tool_id_map
+         WHERE outbound_id=?1 AND expires_at>?2",
+        params![outbound_id, now_ms()],
+        |r| r.get(0),
+    )
+    .optional()?)
 }
 
 // ================================================================ utils

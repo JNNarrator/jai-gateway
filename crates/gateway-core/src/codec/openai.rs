@@ -15,8 +15,7 @@ pub struct PeekRequest {
 }
 
 pub fn peek(body: &[u8]) -> Result<PeekRequest, String> {
-    let v: Value =
-        serde_json::from_slice(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
+    let v: Value = serde_json::from_slice(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
     let model = v
         .get("model")
         .and_then(Value::as_str)
@@ -104,9 +103,10 @@ impl UsageScanner {
             }
 
             // 寻找下一个 "usage" 关键字
-            if let Some(pos) =
-                find_subslice(&self.buf[self.scan_from.min(self.buf.len())..], b"\"usage\"")
-            {
+            if let Some(pos) = find_subslice(
+                &self.buf[self.scan_from.min(self.buf.len())..],
+                b"\"usage\"",
+            ) {
                 let key_at = self.scan_from + pos;
                 self.scan_from = key_at + b"\"usage\"".len();
                 if let Some(rel_brace) = self.buf[self.scan_from..]
@@ -160,9 +160,7 @@ impl UsageScanner {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// 从 usage JSON 提取 IR Usage 四元组（protocol-ir §5-D）。
@@ -214,16 +212,15 @@ pub fn error_body(message: &str, err_type: &str, code: Option<&str>) -> Value {
 // 依据 protocol-ir §4 映射表；tool calling 三段（定义/发起/结果）在此归一。
 
 use crate::codec::ir::{
-    Block, CanonMessage, CanonicalRequest, Role, SampleParams, StopReason, ToolChoice, ToolSpec,
-    Usage,
+    Block, CanonMessage, CanonicalRequest, CanonicalResponse, Role, SampleParams, StopReason,
+    StreamEvent, ToolChoice, ToolSpec, Usage,
 };
 use serde_json::Map;
 
 /// 解码 OpenAI chat completions 请求体。
 /// 失败返回 Err(客户端可读消息) —— 调用方按 400 处理。
 pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
-    let v: Value =
-        serde_json::from_slice(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
+    let v: Value = serde_json::from_slice(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
 
     let model = v
         .get("model")
@@ -240,7 +237,10 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
             return Err("n>1（多候选）跨协议转换不支持；请使用 n=1".into());
         }
     }
-    if v.get("logprobs").or_else(|| v.get("top_logprobs")).is_some() {
+    if v.get("logprobs")
+        .or_else(|| v.get("top_logprobs"))
+        .is_some()
+    {
         return Err("logprobs/top_logprobs 跨协议转换不支持".into());
     }
     if let Some(stream) = v.get("stream").and_then(Value::as_bool) {
@@ -255,10 +255,7 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
 
     if let Some(arr) = v.get("messages").and_then(Value::as_array) {
         for m in arr {
-            let role = m
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let role = m.get("role").and_then(Value::as_str).unwrap_or_default();
             let content = m.get("content");
             match role {
                 "system" => match content.and_then(Value::as_str) {
@@ -285,10 +282,9 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                     // tool_calls → ToolUse 块
                     if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
                         for tc in tcs {
-                            if let (Some(id), Some(fn_obj)) = (
-                                tc.get("id").and_then(Value::as_str),
-                                tc.get("function"),
-                            ) {
+                            if let (Some(id), Some(fn_obj)) =
+                                (tc.get("id").and_then(Value::as_str), tc.get("function"))
+                            {
                                 let name = fn_obj
                                     .get("name")
                                     .and_then(Value::as_str)
@@ -322,10 +318,7 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    let is_error = m
-                        .get("is_error")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
+                    let is_error = m.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                     let text = content
                         .and_then(Value::as_str)
                         .map(str::to_string)
@@ -403,7 +396,10 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
             .or_else(|| v.get("max_completion_tokens"))
             .and_then(Value::as_u64)
             .map(|n| n as u32),
-        temperature: v.get("temperature").and_then(Value::as_f64).map(|f| f as f32),
+        temperature: v
+            .get("temperature")
+            .and_then(Value::as_f64)
+            .map(|f| f as f32),
         top_p: v.get("top_p").and_then(Value::as_f64).map(|f| f as f32),
         top_k: None, // OpenAI 入站无 top_k
         stop_sequences: v
@@ -467,7 +463,9 @@ fn content_blocks(content: Option<&Value>) -> Result<Vec<Block>, String> {
                 match p.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         if let Some(t) = p.get("text").and_then(Value::as_str) {
-                            blocks.push(Block::Text { text: t.to_string() });
+                            blocks.push(Block::Text {
+                                text: t.to_string(),
+                            });
                         }
                     }
                     Some("image_url") => {
@@ -581,6 +579,336 @@ fn krate_has_cache() -> bool {
     false
 }
 
+// ================================================================ M5：UpstreamCodec::OpenAI
+
+// Anthropic 入站 × OpenAI 上游 时使用（Claude Code × GPT 模型）。
+
+/// 编码请求：IR → OpenAI chat completions body。
+pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value, String> {
+    let mut body = json!({
+        "model": req.model,
+        "messages": [],
+    });
+
+    // message 数组（system 作为第一条 system 消息还原，§4-C）
+    let mut messages: Vec<Value> = Vec::new();
+    if !req.system.is_empty() {
+        messages.push(json!({"role":"system","content": req.system.join("\n\n")}));
+    }
+    for m in &req.messages {
+        match m.role {
+            Role::User => {
+                // 普通文本（串接）+ tool 结果 → 独立 role=tool 消息
+                let mut text = String::new();
+                let mut tool_msgs: Vec<Value> = Vec::new();
+                for b in &m.blocks {
+                    match b {
+                        Block::Text { text: t } => text.push_str(t),
+                        Block::Image {
+                            data_base64, url, ..
+                        } => {
+                            // OpenAI 可接受 url 或 base64 data url；目前传 url 优先
+                            if let Some(u) = url {
+                                messages.push(json!({
+                                    "role":"user",
+                                    "content":[{"type":"image_url","image_url":{"url":u}}]
+                                }));
+                            } else if let Some(b64) = data_base64 {
+                                messages.push(json!({
+                                    "role":"user",
+                                    "content":[{"type":"image_url",
+                                        "image_url":{"url": format!("data:image/png;base64,{b64}")}}]
+                                }));
+                            }
+                        }
+                        Block::ToolResult {
+                            call_id,
+                            content,
+                            is_error,
+                        } => {
+                            let content_text = content
+                                .iter()
+                                .filter_map(|c| c.as_text())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let content_val = if *is_error {
+                                json!({"error": content_text})
+                            } else {
+                                Value::String(content_text)
+                            };
+                            tool_msgs.push(json!({
+                                "role":"tool",
+                                "tool_call_id": call_id,
+                                "content": content_val,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if !text.is_empty() {
+                    messages.push(json!({"role":"user","content":text}));
+                }
+                messages.extend(tool_msgs);
+            }
+            Role::Assistant => {
+                let mut content = String::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                for b in &m.blocks {
+                    match b {
+                        Block::Text { text } => content.push_str(text),
+                        Block::ToolUse { id, name, input } => {
+                            tool_calls.push(json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(input)
+                                        .unwrap_or_else(|_| "{}".into()),
+                                },
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut msg = json!({
+                    "role":"assistant",
+                    "content": if content.is_empty() { Value::Null } else { Value::String(content) },
+                });
+                if !tool_calls.is_empty() {
+                    msg["tool_calls"] = Value::Array(tool_calls);
+                }
+                messages.push(msg);
+            }
+        }
+    }
+    body["messages"] = Value::Array(messages);
+
+    // tools
+    if !req.tools.is_empty() {
+        body["tools"] = Value::Array(
+            req.tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type":"function",
+                        "function":{
+                            "name": t.name,
+                            "description": t.description.as_deref().unwrap_or(""),
+                            "parameters": t.input_schema,
+                        },
+                    })
+                })
+                .collect(),
+        );
+        let choice = match &req.tool_choice {
+            ToolChoice::Auto => None,
+            ToolChoice::None => Some(json!("none")),
+            ToolChoice::Required => Some(json!("required")),
+            ToolChoice::Specific(name) => Some(json!({
+                "type":"function","function":{"name": name}
+            })),
+        };
+        if let Some(c) = choice {
+            body["tool_choice"] = c;
+        }
+    }
+
+    // 采样参数
+    let p = &req.params;
+    if let Some(m) = p.max_output_tokens {
+        body["max_completion_tokens"] = json!(m);
+    }
+    if let Some(t) = p.temperature {
+        body["temperature"] = json!(super::anthropic::round_f32(t));
+    }
+    if let Some(v) = p.top_p {
+        body["top_p"] = json!(super::anthropic::round_f32(v));
+    }
+    if !p.stop_sequences.is_empty() {
+        body["stop"] = json!(p.stop_sequences);
+    }
+    if let Some(f) = p.frequency_penalty {
+        body["frequency_penalty"] = json!(super::anthropic::round_f32(f));
+    }
+    if let Some(pr) = p.presence_penalty {
+        body["presence_penalty"] = json!(super::anthropic::round_f32(pr));
+    }
+    if let Some(seed) = p.seed {
+        body["seed"] = json!(seed);
+    }
+    if req.stream {
+        body["stream"] = json!(true);
+        // 注入 usage 采集（§4-A：出站注入 include_usage，回传前剥除）
+        body["stream_options"] = json!({"include_usage": true});
+    }
+
+    Ok(body)
+}
+
+/// 解析 OpenAI 非流式响应 → CanonicalResponse。
+pub fn parse_response(body: &[u8]) -> Result<crate::codec::ir::CanonicalResponse, String> {
+    let v: Value =
+        serde_json::from_slice(body).map_err(|e| format!("OpenAI 响应 JSON 解析失败: {e}"))?;
+    let id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let model = v
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let mut output: Vec<Block> = Vec::new();
+    if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+        if let Some(c) = choices.first() {
+            if let Some(msg) = c.get("message") {
+                if let Some(content) = msg.get("content").and_then(Value::as_str) {
+                    if !content.is_empty() {
+                        output.push(Block::Text {
+                            text: content.to_string(),
+                        });
+                    }
+                }
+                if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tcs {
+                        if let Some(fn_obj) = tc.get("function") {
+                            output.push(Block::ToolUse {
+                                id: tc
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                name: fn_obj
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                input: fn_obj
+                                    .get("arguments")
+                                    .and_then(Value::as_str)
+                                    .and_then(|s| serde_json::from_str(s).ok())
+                                    .unwrap_or_else(|| json!({})),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let stop_reason = match v
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(Value::as_str)
+    {
+        Some("stop") => StopReason::EndTurn,
+        Some("length") => StopReason::MaxTokens,
+        Some("tool_calls") => StopReason::ToolUse,
+        Some("content_filter") => StopReason::SafetyBlock,
+        _ => StopReason::EndTurn,
+    };
+    let usage = parse_usage(v.get("usage"));
+
+    Ok(CanonicalResponse {
+        id,
+        model,
+        output,
+        stop_reason,
+        usage,
+    })
+}
+
+fn parse_usage(u: Option<&Value>) -> Usage {
+    let get = |k: &str| {
+        u.and_then(|v| v.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let cache_read = u
+        .and_then(|v| v.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(Value::as_u64);
+    Usage {
+        input_tokens: get("prompt_tokens"),
+        output_tokens: get("completion_tokens"),
+        cache_read_tokens: cache_read,
+        cache_write_tokens: None,
+    }
+}
+
+/// 解析 OpenAI SSE 一个 `data: {...}` 包 → StreamEvent 列表。
+pub fn parse_stream_event(raw: &[u8]) -> Result<Vec<crate::codec::ir::StreamEvent>, String> {
+    let v: Value =
+        serde_json::from_slice(raw).map_err(|e| format!("OpenAI SSE JSON 解析失败: {e}"))?;
+
+    let mut out = Vec::new();
+    // usage chunk（choices 为空但有 usage）
+    if v.get("choices").map(Value::is_array) == Some(false) || v.get("choices").is_none() {
+        if let Some(u) = v.get("usage") {
+            let usage = parse_usage(Some(u));
+            out.push(StreamEvent::Finish {
+                stop_reason: StopReason::EndTurn,
+                usage,
+            });
+            return Ok(out);
+        }
+    }
+
+    if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+        if let Some(c) = choices.first() {
+            if let Some(delta) = c.get("delta") {
+                if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                    if !content.is_empty() {
+                        out.push(StreamEvent::TextDelta {
+                            text: content.to_string(),
+                        });
+                    }
+                }
+                if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tcs {
+                        let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                        if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                            let name = tc
+                                .pointer("/function/name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            out.push(StreamEvent::ToolCallStart {
+                                index: idx,
+                                id: id.to_string(),
+                                name: name.to_string(),
+                            });
+                        }
+                        if let Some(args) =
+                            tc.pointer("/function/arguments").and_then(Value::as_str)
+                        {
+                            if !args.is_empty() {
+                                out.push(StreamEvent::ToolCallArgsDelta {
+                                    index: idx,
+                                    args_fragment: args.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(fr) = c.get("finish_reason").and_then(Value::as_str) {
+                let stop_reason = match fr {
+                    "stop" => StopReason::EndTurn,
+                    "length" => StopReason::MaxTokens,
+                    "tool_calls" => StopReason::ToolUse,
+                    "content_filter" => StopReason::SafetyBlock,
+                    _ => StopReason::EndTurn,
+                };
+                let usage = parse_usage(v.get("usage"));
+                out.push(StreamEvent::Finish { stop_reason, usage });
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------- 流式渲染
 
 /// OpenAI SSE 渲染状态。
@@ -611,10 +939,7 @@ pub fn render_stream_event(
     match e {
         Ev::Start { .. } => {
             st.started = true;
-            Some(
-                chunk_base(json!({"role": "assistant", "content": ""}))
-                    .to_string(),
-            )
+            Some(chunk_base(json!({"role": "assistant", "content": ""})).to_string())
         }
         Ev::TextDelta { text } => {
             if text.is_empty() {
@@ -623,35 +948,31 @@ pub fn render_stream_event(
             Some(chunk_base(json!({"content": text})).to_string())
         }
         Ev::ThinkingDelta { .. } => None, // OpenAI 无 thinking 增量（v1 不产出）
-        Ev::ToolCallStart { index, id, name } => {
-            Some(
-                chunk_base(json!({
-                    "tool_calls": [{
-                        "index": index,
-                        "id": id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": ""},
-                    }],
-                }))
-                .to_string(),
-            )
-        }
-        Ev::ToolCallArgsDelta { index, args_fragment } => {
-            Some(
-                chunk_base(json!({
-                    "tool_calls": [{
-                        "index": index,
-                        "function": {"arguments": args_fragment},
-                    }],
-                }))
-                .to_string(),
-            )
-        }
+        Ev::ToolCallStart { index, id, name } => Some(
+            chunk_base(json!({
+                "tool_calls": [{
+                    "index": index,
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": ""},
+                }],
+            }))
+            .to_string(),
+        ),
+        Ev::ToolCallArgsDelta {
+            index,
+            args_fragment,
+        } => Some(
+            chunk_base(json!({
+                "tool_calls": [{
+                    "index": index,
+                    "function": {"arguments": args_fragment},
+                }],
+            }))
+            .to_string(),
+        ),
         Ev::ToolCallEnd { .. } => None, // OpenAI 无显式结束事件
-        Ev::Finish {
-            stop_reason,
-            usage,
-        } => {
+        Ev::Finish { stop_reason, usage } => {
             let fr = match stop_reason {
                 StopReason::EndTurn => "stop",
                 StopReason::MaxTokens => "length",
@@ -726,7 +1047,10 @@ mod tests {
             url_join("https://api.x.com/v1/", "chat/completions"),
             "https://api.x.com/v1/chat/completions"
         );
-        assert_eq!(url_join("https://g.cn", "/v1beta/models"), "https://g.cn/v1beta/models");
+        assert_eq!(
+            url_join("https://g.cn", "/v1beta/models"),
+            "https://g.cn/v1beta/models"
+        );
     }
 
     // ---------------- M4: decode / render ----------------
@@ -782,7 +1106,11 @@ mod tests {
         }
         let m2 = &req.messages[2];
         match &m2.blocks[0] {
-            IrBlock::ToolResult { call_id, content, is_error } => {
+            IrBlock::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
                 assert_eq!(call_id, "call_1");
                 assert_eq!(content[0].as_text(), Some("sunny"));
                 assert!(!is_error);
@@ -805,7 +1133,9 @@ mod tests {
             id: "chatcmpl-1".into(),
             model: "gpt-4o".into(),
             output: vec![
-                IrBlock::Text { text: "请稍候".into() },
+                IrBlock::Text {
+                    text: "请稍候".into(),
+                },
                 IrBlock::ToolUse {
                     id: "call_9".into(),
                     name: "get_weather".into(),
@@ -835,17 +1165,16 @@ mod tests {
             started: false,
         };
         let s1 = super::render_stream_event(
-            &StreamEvent::Start { model: "gpt-4o".into() },
+            &StreamEvent::Start {
+                model: "gpt-4o".into(),
+            },
             &mut st,
         )
         .unwrap();
         assert!(s1.contains("\"role\":\"assistant\""));
 
-        let s2 = super::render_stream_event(
-            &StreamEvent::TextDelta { text: "你".into() },
-            &mut st,
-        )
-        .unwrap();
+        let s2 = super::render_stream_event(&StreamEvent::TextDelta { text: "你".into() }, &mut st)
+            .unwrap();
         assert!(s2.contains("\"content\":\"你\""));
 
         let s3 = super::render_stream_event(

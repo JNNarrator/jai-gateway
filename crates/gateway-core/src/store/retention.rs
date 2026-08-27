@@ -85,12 +85,11 @@ pub fn spawn_retention_loop(
             let db2 = db.clone();
             let days = retention_days;
             let cap = row_cap;
-            let res =
-                tokio::task::spawn_blocking(move || {
-                    let now = super::now_ms();
-                    db2.with(|c| run_retention(c, now, days, cap))
-                })
-                .await;
+            let res = tokio::task::spawn_blocking(move || {
+                let now = super::now_ms();
+                db2.with(|c| run_retention(c, now, days, cap))
+            })
+            .await;
             match res {
                 Ok(Ok(stats)) => {
                     if stats.logs_expired > 0 || stats.logs_capped > 0 || stats.tool_ids_expired > 0
@@ -111,7 +110,7 @@ pub fn spawn_retention_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{open_and_migrate, now_ms};
+    use crate::store::{now_ms, open_and_migrate};
 
     fn insert_log(c: &Connection, ts: i64) {
         c.execute(
@@ -145,9 +144,13 @@ mod tests {
         assert_eq!(stats.tool_ids_expired, 1);
         assert_eq!(stats.logs_capped, 0);
 
-        let left: i64 = conn.query_row("SELECT COUNT(*) FROM request_logs", [], |r| r.get(0)).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM request_logs", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(left, 1);
-        let tool_left: i64 = conn.query_row("SELECT COUNT(*) FROM tool_id_map", [], |r| r.get(0)).unwrap();
+        let tool_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tool_id_map", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(tool_left, 1);
     }
 

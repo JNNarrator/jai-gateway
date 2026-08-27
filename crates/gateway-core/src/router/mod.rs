@@ -19,9 +19,7 @@ pub enum AttemptVerdict {
         kind: &'static str,
     },
     /// 建议切换到下一个候选渠道
-    Failover {
-        kind: &'static str,
-    },
+    Failover { kind: &'static str },
     /// 请求成功，进入响应阶段
     Success,
 }
@@ -35,9 +33,7 @@ pub fn first_byte_verdict(err_is_connect: bool) -> AttemptVerdict {
             kind: "ProviderOther",
         }
     } else {
-        AttemptVerdict::Failover {
-            kind: "Overloaded",
-        }
+        AttemptVerdict::Failover { kind: "Overloaded" }
     }
 }
 
@@ -57,17 +53,11 @@ pub fn classify_status(status: u16, body_excerpt: &str) -> AttemptVerdict {
         408 => AttemptVerdict::Failover {
             kind: "ProviderOther",
         },
-        429 => AttemptVerdict::Failover {
-            kind: "RateLimit",
-        },
-        529 => AttemptVerdict::Failover {
-            kind: "Overloaded",
-        },
+        429 => AttemptVerdict::Failover { kind: "RateLimit" },
+        529 => AttemptVerdict::Failover { kind: "Overloaded" },
         // 5xx 一律可切换；其他 4xx 视为客户端请求错误，停止
         400 => {
-            if body_excerpt.contains("context_length")
-                || body_excerpt.contains("context_window")
-            {
+            if body_excerpt.contains("context_length") || body_excerpt.contains("context_window") {
                 AttemptVerdict::Stop {
                     kind: "ContextTooLong",
                 }
@@ -77,9 +67,7 @@ pub fn classify_status(status: u16, body_excerpt: &str) -> AttemptVerdict {
                 }
             }
         }
-        s if (500..600).contains(&s) => AttemptVerdict::Failover {
-            kind: "Overloaded",
-        },
+        s if (500..600).contains(&s) => AttemptVerdict::Failover { kind: "Overloaded" },
         s if (400..500).contains(&s) => AttemptVerdict::Stop {
             kind: "InvalidRequest",
         },
@@ -184,9 +172,7 @@ mod tests {
         );
         assert_eq!(
             first_byte_verdict(false),
-            AttemptVerdict::Failover {
-                kind: "Overloaded"
-            }
+            AttemptVerdict::Failover { kind: "Overloaded" }
         );
     }
 }

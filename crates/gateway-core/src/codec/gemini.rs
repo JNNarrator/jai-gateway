@@ -12,7 +12,7 @@
 //!   本层解析时生成 `_k{n}` 后缀 id（冲突由调用方处理）
 //! - usage：`usageMetadata.promptTokenCount / candidatesTokenCount`
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::codec::ir::{
     Block, CanonicalRequest, CanonicalResponse, Role, StopReason, StreamEvent, ToolChoice, Usage,
@@ -65,7 +65,11 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                 Block::ToolUse { name, input, .. } => {
                     parts.push(json!({"functionCall": {"name": name, "args": input}}));
                 }
-                Block::ToolResult { call_id: _, content, is_error } => {
+                Block::ToolResult {
+                    call_id: _,
+                    content,
+                    is_error,
+                } => {
                     // Gemini functionResponse 按 name 关联；调用方负责把 call_id 映射为 name
                     let text = content
                         .iter()
@@ -153,10 +157,7 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
         gen.insert("topK".into(), json!(k));
     }
     if !p.stop_sequences.is_empty() {
-        gen.insert(
-            "stopSequences".into(),
-            json!(p.stop_sequences),
-        );
+        gen.insert("stopSequences".into(), json!(p.stop_sequences));
     }
     if let Some(seed) = p.seed {
         gen.insert("seed".into(), json!(seed));
@@ -186,11 +187,16 @@ pub fn parse_response(body: &[u8]) -> Result<CanonicalResponse, String> {
     let mut output: Vec<Block> = Vec::new();
     if let Some(cands) = v.get("candidates").and_then(Value::as_array) {
         if let Some(c) = cands.first() {
-            if let Some(content) = c.get("content").and_then(|x| x.get("parts")).and_then(Value::as_array)
+            if let Some(content) = c
+                .get("content")
+                .and_then(|x| x.get("parts"))
+                .and_then(Value::as_array)
             {
                 for p in content {
                     if let Some(t) = p.get("text").and_then(Value::as_str) {
-                        output.push(Block::Text { text: t.to_string() });
+                        output.push(Block::Text {
+                            text: t.to_string(),
+                        });
                     } else if let Some(fc) = p.get("functionCall") {
                         // Gemini 无 id → 合成 id（fn 名 + _k0）；冲突后缀由上层兜底
                         let name = fc.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -221,9 +227,7 @@ pub fn parse_response(body: &[u8]) -> Result<CanonicalResponse, String> {
             }
         }
         Some("MAX_TOKENS") => StopReason::MaxTokens,
-        Some("SAFETY") | Some("PROHIBITED_CONTENT") | Some("RECITATION") => {
-            StopReason::SafetyBlock
-        }
+        Some("SAFETY") | Some("PROHIBITED_CONTENT") | Some("RECITATION") => StopReason::SafetyBlock,
         _ => StopReason::EndTurn,
     };
 
@@ -239,7 +243,11 @@ pub fn parse_response(body: &[u8]) -> Result<CanonicalResponse, String> {
 }
 
 fn parse_usage(u: Option<&Value>) -> Usage {
-    let get = |k: &str| u.and_then(|v| v.get(k)).and_then(Value::as_u64).unwrap_or(0);
+    let get = |k: &str| {
+        u.and_then(|v| v.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
     Usage {
         input_tokens: get("promptTokenCount"),
         output_tokens: get("candidatesTokenCount"),
@@ -271,7 +279,9 @@ pub fn parse_stream_event(raw: &[u8]) -> Result<Vec<StreamEvent>, String> {
                 for p in parts {
                     if let Some(t) = p.get("text").and_then(Value::as_str) {
                         if !t.is_empty() {
-                            out.push(StreamEvent::TextDelta { text: t.to_string() });
+                            out.push(StreamEvent::TextDelta {
+                                text: t.to_string(),
+                            });
                         }
                     } else if let Some(fc) = p.get("functionCall") {
                         let name = fc
@@ -368,7 +378,10 @@ mod tests {
         assert_eq!(v["contents"][0]["role"], "user");
         assert_eq!(v["contents"][0]["parts"][0]["text"], "hi");
         assert_eq!(v["contents"][1]["role"], "model");
-        assert_eq!(v["tools"][0]["functionDeclarations"][0]["name"], "get_weather");
+        assert_eq!(
+            v["tools"][0]["functionDeclarations"][0]["name"],
+            "get_weather"
+        );
         assert_eq!(v["generationConfig"]["maxOutputTokens"], 2048);
     }
 
@@ -392,13 +405,18 @@ mod tests {
             role: Role::User,
             blocks: vec![Block::ToolResult {
                 call_id: "call_1".into(),
-                content: vec![Block::Text { text: "sunny".into() }],
+                content: vec![Block::Text {
+                    text: "sunny".into(),
+                }],
                 is_error: false,
             }],
         }];
         let v = encode_request(&req).unwrap();
         let part = &v["contents"][0]["parts"][0];
-        assert!(part.get("functionResponse").is_some(), "tool 结果应为 functionResponse");
+        assert!(
+            part.get("functionResponse").is_some(),
+            "tool 结果应为 functionResponse"
+        );
     }
 
     #[test]
@@ -415,7 +433,11 @@ mod tests {
         }"#;
         let r = parse_response(body).unwrap();
         assert_eq!(r.output.len(), 2);
-        assert_eq!(r.stop_reason, StopReason::ToolUse, "含 functionCall 推断升级");
+        assert_eq!(
+            r.stop_reason,
+            StopReason::ToolUse,
+            "含 functionCall 推断升级"
+        );
         match &r.output[1] {
             Block::ToolUse { id, name, input } => {
                 assert_eq!(id, "get_weather_k0");
@@ -430,10 +452,8 @@ mod tests {
 
     #[test]
     fn parse_stream_text_and_finish() {
-        let evts = parse_stream_event(
-            br#"{"candidates":[{"content":{"parts":[{"text":"ni"}]}}]}"#,
-        )
-        .unwrap();
+        let evts = parse_stream_event(br#"{"candidates":[{"content":{"parts":[{"text":"ni"}]}}]}"#)
+            .unwrap();
         assert!(matches!(&evts[0], StreamEvent::TextDelta { text } if text == "ni"));
 
         let fin = parse_stream_event(
@@ -441,7 +461,13 @@ mod tests {
                 "usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1}}"#,
         )
         .unwrap();
-        assert!(matches!(&fin[0], StreamEvent::Finish { stop_reason: StopReason::EndTurn, .. }));
+        assert!(matches!(
+            &fin[0],
+            StreamEvent::Finish {
+                stop_reason: StopReason::EndTurn,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -453,8 +479,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(evts.len(), 3);
-        assert!(matches!(&evts[0], StreamEvent::ToolCallStart { id, name, .. }
-            if id == "f_k0" && name == "f"));
+        assert!(
+            matches!(&evts[0], StreamEvent::ToolCallStart { id, name, .. }
+            if id == "f_k0" && name == "f")
+        );
         assert!(matches!(&evts[1], StreamEvent::ToolCallArgsDelta { .. }));
         assert!(matches!(&evts[2], StreamEvent::ToolCallEnd { .. }));
     }

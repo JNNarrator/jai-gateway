@@ -13,7 +13,7 @@ use gateway_core::codec::ir::{
     Block, CanonMessage, CanonicalRequest, Role, SampleParams, ToolChoice, ToolSpec,
 };
 use gateway_core::codec::openai;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// 一个含 tools + tool_result 的标准多轮请求的 OpenAI 原始 body。
 const GOLDEN_OPENAI_BODY: &[u8] = br#"{
@@ -40,12 +40,14 @@ fn golden_ir_survives_anthropic_encode() {
     let ir = openai::decode_request(GOLDEN_OPENAI_BODY).unwrap();
 
     // 工具调用 + 结果块均进入 IR
-    assert!(ir.messages.iter().any(|m| m.blocks.iter().any(
-        |b| matches!(b, Block::ToolUse { name, .. } if name == "get_weather")
-    )));
-    assert!(ir.messages.iter().any(|m| m.blocks.iter().any(
-        |b| matches!(b, Block::ToolResult { call_id, .. } if call_id == "call_1")
-    )));
+    assert!(ir.messages.iter().any(|m| m
+        .blocks
+        .iter()
+        .any(|b| matches!(b, Block::ToolUse { name, .. } if name == "get_weather"))));
+    assert!(ir.messages.iter().any(|m| m
+        .blocks
+        .iter()
+        .any(|b| matches!(b, Block::ToolResult { call_id, .. } if call_id == "call_1"))));
 
     // Anthropic 编码
     let enc = acodec::encode_request(&ir).unwrap();
@@ -55,19 +57,15 @@ fn golden_ir_survives_anthropic_encode() {
     assert!(enc["messages"].as_array().unwrap().len() >= 2);
 
     // tool_result 块在场（user 宿主）
-    let has_tool_result = enc["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|m| {
-            m["content"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-                })
-                .unwrap_or(false)
-        });
+    let has_tool_result = enc["messages"].as_array().unwrap().iter().any(|m| {
+        m["content"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
+            .unwrap_or(false)
+    });
     assert!(has_tool_result, "tool_result 应保留");
 }
 
@@ -79,7 +77,10 @@ fn golden_ir_survives_gemini_encode() {
     // systemInstruction 合并
     assert_eq!(enc["systemInstruction"]["parts"][0]["text"], "be helpful");
     // functionDeclarations
-    assert_eq!(enc["tools"][0]["functionDeclarations"][0]["name"], "get_weather");
+    assert_eq!(
+        enc["tools"][0]["functionDeclarations"][0]["name"],
+        "get_weather"
+    );
     // 消息轮次存在（user 含 functionCall + functionResponse 聚合）
     let contents = enc["contents"].as_array().unwrap();
     assert!(!contents.is_empty());
@@ -123,7 +124,10 @@ fn param_mapping_across_families() {
     let g = gcodec::encode_request(&ir).unwrap();
     assert_eq!(g["generationConfig"]["temperature"], 0.9);
     assert_eq!(g["generationConfig"]["topP"], 0.8);
-    assert_eq!(g["generationConfig"]["stopSequences"], json!(["END", "STOP"]));
+    assert_eq!(
+        g["generationConfig"]["stopSequences"],
+        json!(["END", "STOP"])
+    );
     assert_eq!(g["generationConfig"]["seed"], 42);
     // frequency_penalty Gemini 不支持 → 不出现在输出
     assert!(g["generationConfig"].get("frequencyPenalty").is_none());

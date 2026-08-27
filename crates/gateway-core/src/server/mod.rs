@@ -134,8 +134,7 @@ mod tests {
         let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let occupied = blocker.local_addr().unwrap().port();
 
-        let (_listener, actual) =
-            bind_with_fallback("127.0.0.1", occupied).expect("应顺延成功");
+        let (_listener, actual) = bind_with_fallback("127.0.0.1", occupied).expect("应顺延成功");
         assert_eq!(actual, occupied + 1);
     }
 
@@ -172,16 +171,25 @@ mod tests {
             assert_eq!(hostname_of_host_header("127.0.0.1:1314"), "127.0.0.1");
             assert_eq!(hostname_of_host_header("localhost"), "localhost");
             assert_eq!(hostname_of_host_header("[::1]:8080"), "::1");
-            assert_eq!(hostname_of_host_header("evil.example.com"), "evil.example.com");
+            assert_eq!(
+                hostname_of_host_header("evil.example.com"),
+                "evil.example.com"
+            );
         }
 
         #[test]
         fn host_check_blocks_non_loopback() {
             let mut h = HeaderMap::new();
-            h.insert(axum::http::header::HOST, HeaderValue::from_static("evil.com:1314"));
+            h.insert(
+                axum::http::header::HOST,
+                HeaderValue::from_static("evil.com:1314"),
+            );
             assert!(check_host(&h).is_err());
 
-            h.insert(axum::http::header::HOST, HeaderValue::from_static("127.0.0.1:9999"));
+            h.insert(
+                axum::http::header::HOST,
+                HeaderValue::from_static("127.0.0.1:9999"),
+            );
             assert!(check_host(&h).is_ok());
 
             // 缺失 Host 也拒绝

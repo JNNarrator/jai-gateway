@@ -29,7 +29,9 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     Image {
         media_type: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,9 +194,15 @@ pub struct CanonicalResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "evt", rename_all = "snake_case")]
 pub enum StreamEvent {
-    Start { model: String },
-    TextDelta { text: String },
-    ThinkingDelta { text: String },
+    Start {
+        model: String,
+    },
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        text: String,
+    },
     ToolCallStart {
         index: usize,
         id: String,
@@ -204,7 +212,9 @@ pub enum StreamEvent {
         index: usize,
         args_fragment: String,
     },
-    ToolCallEnd { index: usize },
+    ToolCallEnd {
+        index: usize,
+    },
     Finish {
         stop_reason: StopReason,
         usage: Usage,
@@ -246,10 +256,102 @@ pub fn extension_warn_note(req: &CanonicalRequest) -> Option<String> {
         return None;
     }
     let names: Vec<&str> = req.extensions.keys().map(String::as_str).collect();
-    Some(format!(
-        "未知字段已按 Lenient 丢弃：{}",
-        names.join(", ")
-    ))
+    Some(format!("未知字段已按 Lenient 丢弃：{}", names.join(", ")))
+}
+
+// ================================================================ tool id 可逆编码（§5-B）
+
+/// 出站侧 tool_use id 确定性内嵌编码：`toolu_` + base58("jai1." + inbound_id)。
+/// 客户端历史回传时反解复原；Anthropic 上限 64 字符，超长回落 tool_id_map（M5 验收 2，
+/// 存储接线在 store::tool_id_map；当前纯函数不感知 DB，超长时仍返回确定性编码，后续 M8 接映射）。
+const TOOL_ID_MAGIC: &str = "jai1.";
+const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/// 出站侧 tool_use id 确定性内嵌编码：`toolu_` + base58("jai1." + inbound_id)。
+/// 客户端历史回传时反解复原；Anthropic 原生 `toolu_*` 幂等直通。
+pub fn canonical_to_anthropic_id(inbound: &str) -> String {
+    if inbound.starts_with("toolu_") {
+        return inbound.to_string(); // 已编码过 / Anthropic 原生 id，幂等
+    }
+    let encoded = base58_encode(format!("{TOOL_ID_MAGIC}{inbound}").as_bytes());
+    format!("toolu_{encoded}")
+}
+
+/// 反解：`toolu_xxx` → 原始入站 id。
+///
+/// 优先识别本网关的 `toolu_` + base58("jai1." + id) 格式并还原；
+/// 其他 `toolu_*`（Anthropic 原生或旧版简单前缀）按原后缀返回，保证多轮中
+/// 未经过本网关编码的 id 也能保持可关联。
+pub fn decode_anthropic_tool_id(anthropic_id: &str) -> Option<String> {
+    let encoded = anthropic_id.strip_prefix("toolu_")?;
+    if let Some(bytes) = base58_decode(encoded) {
+        if let Ok(s) = String::from_utf8(bytes) {
+            if let Some(orig) = s.strip_prefix(TOOL_ID_MAGIC) {
+                return Some(orig.to_string());
+            }
+        }
+    }
+    Some(encoded.to_string())
+}
+
+fn base58_encode(input: &[u8]) -> String {
+    let mut zeros = 0;
+    while zeros < input.len() && input[zeros] == 0 {
+        zeros += 1;
+    }
+    let mut data = input.to_vec();
+    let mut first = zeros;
+    let mut encoded: Vec<u8> = Vec::new();
+    while first < data.len() {
+        let mut rem = 0usize;
+        let mut i = first;
+        while i < data.len() {
+            let acc = rem * 256 + data[i] as usize;
+            data[i] = (acc / 58) as u8;
+            rem = acc % 58;
+            i += 1;
+        }
+        encoded.push(BASE58_ALPHABET[rem]);
+        while first < data.len() && data[first] == 0 {
+            first += 1;
+        }
+    }
+    let mut out = String::with_capacity(zeros + encoded.len());
+    for _ in 0..zeros {
+        out.push('1');
+    }
+    for &b in encoded.iter().rev() {
+        out.push(b as char);
+    }
+    out
+}
+
+fn base58_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut leading_ones = 0usize;
+    for c in s.bytes() {
+        if out.is_empty() && c == b'1' {
+            leading_ones += 1;
+            continue;
+        }
+        let val = BASE58_ALPHABET.iter().position(|&a| a == c)? as u32;
+        let mut carry = val;
+        for b in out.iter_mut().rev() {
+            let acc = *b as u32 * 58 + carry;
+            *b = (acc & 0xff) as u8;
+            carry = acc >> 8;
+        }
+        while carry > 0 {
+            out.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    while out.len() > 1 && out[0] == 0 {
+        out.remove(0);
+    }
+    let mut result = vec![0u8; leading_ones];
+    result.extend(out);
+    Some(result)
 }
 
 // ================================================================ 护栏校验
@@ -342,5 +444,45 @@ mod tests {
         let note = extension_warn_note(&req).expect("有扩展字段");
         assert!(note.contains("foo"));
         assert!(note.contains("Lenient"));
+    }
+
+    #[test]
+    fn anthropic_tool_id_base58_roundtrip() {
+        for id in [
+            "call_abc123",
+            "call-9",
+            "fn_12345678901234567890",
+            "奇怪_id-符号",
+        ] {
+            let encoded = canonical_to_anthropic_id(id);
+            assert!(encoded.starts_with("toolu_"), "编码应带前缀: {encoded}");
+            assert!(
+                encoded.len() <= 64,
+                "典型 id 不应超过 Anthropic 64 上限: {encoded}"
+            );
+            assert_eq!(
+                decode_anthropic_tool_id(&encoded).as_deref(),
+                Some(id),
+                "base58 反解应还原原始 id"
+            );
+            assert_eq!(
+                canonical_to_anthropic_id(&encoded),
+                encoded,
+                "已编码 id 应幂等"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_id_native_prefix_fallback() {
+        // Anthropic 原生 id 不带 jai1 magic：反解保持后缀，不破坏关联
+        assert_eq!(
+            decode_anthropic_tool_id("toolu_01ABCxYz").as_deref(),
+            Some("01ABCxYz")
+        );
+        assert_eq!(
+            canonical_to_anthropic_id("toolu_01ABCxYz"),
+            "toolu_01ABCxYz"
+        );
     }
 }

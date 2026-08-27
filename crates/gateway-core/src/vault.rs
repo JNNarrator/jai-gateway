@@ -147,10 +147,7 @@ mod tests {
         let r = ref_for("test-provider");
         assert!(get_secret(&r).unwrap().is_none());
         set_secret(&r, "sk-upstream-xyz").unwrap();
-        assert_eq!(
-            get_secret(&r).unwrap().as_deref(),
-            Some("sk-upstream-xyz")
-        );
+        assert_eq!(get_secret(&r).unwrap().as_deref(), Some("sk-upstream-xyz"));
         delete_secret(&r).unwrap();
         assert!(get_secret(&r).unwrap().is_none());
         delete_secret(&r).unwrap(); // 幂等

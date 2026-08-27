@@ -107,7 +107,10 @@ mod tests {
         let l = AuthRateLimiter::new();
         for i in 0..MAX_FAILS_PER_WINDOW - 1 {
             assert!(!l.record_failure(ip(), 1000 + i as i64));
-            assert!(matches!(l.status(ip(), 1000 + i as i64), BanStatus::Allowed));
+            assert!(matches!(
+                l.status(ip(), 1000 + i as i64),
+                BanStatus::Allowed
+            ));
         }
     }
 
@@ -123,7 +126,10 @@ mod tests {
                          BanStatus::Banned(ms) if ms <= BAN_MS && ms > BAN_MS - 10_000));
 
         // 封禁期内仍报 Banned
-        assert!(matches!(l.status(ip(), 2000 + 60_000), BanStatus::Banned(_)));
+        assert!(matches!(
+            l.status(ip(), 2000 + 60_000),
+            BanStatus::Banned(_)
+        ));
         // 过期后放行（封禁自第 10 次失败时刻 2000+9 起算 BAN_MS）
         let last_fail = 2000 + (MAX_FAILS_PER_WINDOW as i64 - 1);
         assert!(matches!(

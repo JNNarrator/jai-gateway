@@ -17,7 +17,7 @@ use axum::Router;
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
 use gateway_core::vault;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 // ---------------------------------------------------------------- mock 上游
 
@@ -44,7 +44,9 @@ async fn spawn_mock(status: u16, tag: &'static str) -> u16 {
                 .unwrap()
         }),
     );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -63,7 +65,10 @@ struct Fixture {
     db: Db,
     key: String,
     /// 持有 stop 信号 + 服务器任务：drop 时随测试进程结束
-    _keepalive: (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>),
+    _keepalive: (
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ),
 }
 
 async fn fixture(priority_a: i64, priority_b: i64, status_a: u16, status_b: u16) -> Fixture {
@@ -187,7 +192,10 @@ async fn primary_500_fails_over_to_secondary() {
 
     // 日志记录二级渠道命中（provider_id = p-B）
     let rows = fx.recent_logs(20).await;
-    let ok_row = rows.iter().find(|r| r.http_status == 200).expect("有成功日志");
+    let ok_row = rows
+        .iter()
+        .find(|r| r.http_status == 200)
+        .expect("有成功日志");
     assert_eq!(ok_row.provider_id.as_deref(), Some("p-B"));
     assert_eq!(ok_row.route_mode, "passthrough");
 }
@@ -201,7 +209,10 @@ async fn priority_reversal_flips_winner() {
     assert_eq!(body["choices"][0]["message"]["content"], "from-A");
 
     let rows = fx.recent_logs(20).await;
-    let ok_row = rows.iter().find(|r| r.http_status == 200).expect("有成功日志");
+    let ok_row = rows
+        .iter()
+        .find(|r| r.http_status == 200)
+        .expect("有成功日志");
     assert_eq!(ok_row.provider_id.as_deref(), Some("p-A"));
 }
 
@@ -219,10 +230,7 @@ async fn deterministic_400_stops_without_failover() {
         "B 渠道不应被尝试"
     );
     // 且没有任何成功日志
-    assert!(
-        !rows.iter().any(|r| r.http_status == 200),
-        "不应有成功记录"
-    );
+    assert!(!rows.iter().any(|r| r.http_status == 200), "不应有成功记录");
 }
 
 /// 补充：流式请求走同一故障转移语义

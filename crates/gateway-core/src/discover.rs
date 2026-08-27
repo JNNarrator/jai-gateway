@@ -29,15 +29,16 @@ pub async fn discover_models(
     match family {
         "openai_compat" => {
             let url = crate::codec::openai::url_join(base_url, "/models");
-            let mut req = client
-                .get(&url)
-                .timeout(DISCOVERY_TIMEOUT);
+            let mut req = client.get(&url).timeout(DISCOVERY_TIMEOUT);
             if let Some(k) = secret {
                 req = req.bearer_auth(k);
             }
             let resp = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
             ensure_ok(resp.status(), &url).await?;
-            let v: Value = resp.json().await.map_err(|e| format!("JSON 解析失败: {e}"))?;
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("JSON 解析失败: {e}"))?;
             let arr = v
                 .get("data")
                 .and_then(Value::as_array)
@@ -45,7 +46,10 @@ pub async fn discover_models(
             Ok(arr
                 .iter()
                 .filter_map(|m| m.get("id").and_then(Value::as_str))
-                .map(|id| DiscoveredModel { id: id.to_string(), display_name: None })
+                .map(|id| DiscoveredModel {
+                    id: id.to_string(),
+                    display_name: None,
+                })
                 .collect())
         }
         "anthropic" => {
@@ -59,8 +63,14 @@ pub async fn discover_models(
             }
             let resp = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
             ensure_ok(resp.status(), &url).await?;
-            let v: Value = resp.json().await.map_err(|e| format!("JSON 解析失败: {e}"))?;
-            let arr = v.get("data").and_then(Value::as_array).ok_or("响应缺少 data")?;
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("JSON 解析失败: {e}"))?;
+            let arr = v
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or("响应缺少 data")?;
             Ok(arr
                 .iter()
                 .filter_map(|m| {
@@ -84,7 +94,10 @@ pub async fn discover_models(
             }
             let resp = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
             ensure_ok(resp.status(), &url).await?;
-            let v: Value = resp.json().await.map_err(|e| format!("JSON 解析失败: {e}"))?;
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("JSON 解析失败: {e}"))?;
             let arr = v
                 .get("models")
                 .and_then(Value::as_array)
@@ -98,10 +111,7 @@ pub async fn discover_models(
                     let ok_method = m
                         .get("supportedGenerationMethods")
                         .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .any(|x| x.as_str() == Some("generateContent"))
-                        })
+                        .map(|a| a.iter().any(|x| x.as_str() == Some("generateContent")))
                         .unwrap_or(true);
                     if !ok_method {
                         return None;

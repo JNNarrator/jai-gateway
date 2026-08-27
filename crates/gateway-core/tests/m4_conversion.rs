@@ -10,13 +10,13 @@
 
 use axum::body::Body;
 use axum::extract::State;
+use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
-use axum::response::Response;
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
 use gateway_core::vault;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 // ---------------------------------------------------------------- mock 上游
 
@@ -56,7 +56,9 @@ async fn spawn_anthropic_mock(mode: &'static str) -> u16 {
                 .unwrap()
         }),
     );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -117,7 +119,9 @@ async fn spawn_gemini_mock(mode: &'static str) -> u16 {
             ),
         )
         .with_state(GemSt { mode });
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -130,7 +134,10 @@ async fn spawn_gemini_mock(mode: &'static str) -> u16 {
 struct Fixture {
     port: u16,
     key: String,
-    _keepalive: (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>),
+    _keepalive: (
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ),
 }
 
 impl Fixture {
@@ -254,7 +261,10 @@ async fn openai_to_anthropic_non_stream() {
     });
     let (status, body) = fx.post_chat(body).await;
     assert_eq!(status, 200);
-    assert_eq!(body["choices"][0]["message"]["content"], "converted-from-anthropic");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "converted-from-anthropic"
+    );
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     assert_eq!(body["usage"]["prompt_tokens"], 5);
     assert_eq!(body["usage"]["completion_tokens"], 3);
@@ -303,7 +313,10 @@ async fn openai_to_gemini_text() {
     });
     let (status, body) = fx.post_chat(body).await;
     assert_eq!(status, 200);
-    assert_eq!(body["choices"][0]["message"]["content"], "converted-from-gemini");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "converted-from-gemini"
+    );
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     assert_eq!(body["usage"]["prompt_tokens"], 4);
     assert_eq!(body["usage"]["completion_tokens"], 6);

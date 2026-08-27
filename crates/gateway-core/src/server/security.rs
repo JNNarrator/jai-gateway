@@ -37,9 +37,7 @@ pub fn hostname_of_host_header(h: &str) -> String {
     }
     match h.rsplit_once(':') {
         // 无括号 IPv6 裸地址没有端口（含多个冒号）→ 视为裸地址
-        Some((host, port)) if !port.is_empty() && !host.contains(':') => {
-            host.to_ascii_lowercase()
-        }
+        Some((host, port)) if !port.is_empty() && !host.contains(':') => host.to_ascii_lowercase(),
         _ => h.to_ascii_lowercase(),
     }
 }
@@ -107,7 +105,7 @@ fn origin_host(origin: &str) -> Option<String> {
     let rest = origin
         .strip_prefix("https://")
         .or_else(|| origin.strip_prefix("http://"))?;
-    let hostport = rest.split(['/','?']).next()?;
+    let hostport = rest.split(['/', '?']).next()?;
     if hostport.is_empty() {
         return None;
     }
@@ -129,13 +127,15 @@ pub async fn authenticate(db: &Db, headers: &HeaderMap) -> Result<AuthedKey, Res
 
     let token2 = token.clone();
     let db2 = db.clone();
-    let active = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, store::StoreError> {
-        db2.with(|c| {
-            Ok(store::gw_key_active(c)?
-                .map(|k| vec![(k.id, k.key)])
-                .unwrap_or_default())
-        })
-    })
+    let active = tokio::task::spawn_blocking(
+        move || -> Result<Vec<(String, String)>, store::StoreError> {
+            db2.with(|c| {
+                Ok(store::gw_key_active(c)?
+                    .map(|k| vec![(k.id, k.key)])
+                    .unwrap_or_default())
+            })
+        },
+    )
     .await;
 
     let pairs = match active {
@@ -165,7 +165,10 @@ pub async fn authenticate(db: &Db, headers: &HeaderMap) -> Result<AuthedKey, Res
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    let v = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let v = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     v.strip_prefix("Bearer ")
         .or_else(|| v.strip_prefix("bearer "))
         .map(str::trim)
@@ -202,10 +205,8 @@ fn openai_error_unauthorized(message: &str) -> Response {
         )),
     )
         .into_response();
-    resp.headers_mut().insert(
-        "WWW-Authenticate",
-        HeaderValue::from_static("Bearer"),
-    );
+    resp.headers_mut()
+        .insert("WWW-Authenticate", HeaderValue::from_static("Bearer"));
     resp
 }
 

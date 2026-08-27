@@ -40,9 +40,7 @@ pub struct LogEvent {
 }
 
 /// 17 列的动态参数行，与 INSERT 列序一一对应。
-fn event_params(
-    e: &LogEvent,
-) -> Vec<Box<dyn rusqlite::types::ToSql>> {
+fn event_params(e: &LogEvent) -> Vec<Box<dyn rusqlite::types::ToSql>> {
     vec![
         Box::new(e.ts),
         Box::new(e.inbound_family.clone()),
@@ -60,10 +58,11 @@ fn event_params(
         Box::new(e.is_stream as i64),
         Box::new(e.tool_calls),
         Box::new(e.error_kind.clone()),
-        Box::new(e
-            .error_summary
-            .as_deref()
-            .map(|s| s.chars().take(300).collect::<String>())),
+        Box::new(
+            e.error_summary
+                .as_deref()
+                .map(|s| s.chars().take(300).collect::<String>()),
+        ),
     ]
 }
 
@@ -262,8 +261,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pipeline_persists_batch_and_order() {
-        let dir =
-            std::env::temp_dir().join(format!("jai-logs-test-{}-{}", std::process::id(), rand_suffix()));
+        let dir = std::env::temp_dir().join(format!(
+            "jai-logs-test-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.db");
 

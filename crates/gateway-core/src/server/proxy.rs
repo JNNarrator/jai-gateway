@@ -13,20 +13,18 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::{Body, to_bytes};
+use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::codec::anthropic as anthropic_codec;
-use crate::codec::openai::{
-    PeekRequest, UsageScanner, error_body, extract_usage, peek, url_join,
-};
+use crate::codec::openai::{error_body, extract_usage, peek, url_join, PeekRequest, UsageScanner};
 use crate::router::{self, AttemptVerdict};
 use crate::store::logs::LogEvent;
 use crate::store::{self, Db};
@@ -91,12 +89,10 @@ impl InboundWire {
     ) -> reqwest::RequestBuilder {
         match self {
             InboundWire::OpenAi => req.bearer_auth(secret),
-            InboundWire::Anthropic => req
-                .header("x-api-key", secret)
-                .header(
-                    "anthropic-version",
-                    anthropic_codec::DEFAULT_ANTHROPIC_VERSION,
-                ),
+            InboundWire::Anthropic => req.header("x-api-key", secret).header(
+                "anthropic-version",
+                anthropic_codec::DEFAULT_ANTHROPIC_VERSION,
+            ),
         }
     }
 
@@ -112,11 +108,9 @@ impl InboundWire {
             InboundWire::OpenAi => {
                 (status, Json(error_body(message, err_type, code))).into_response()
             }
-            InboundWire::Anthropic => (
-                status,
-                Json(anthropic_codec::error_body(message, err_type)),
-            )
-                .into_response(),
+            InboundWire::Anthropic => {
+                (status, Json(anthropic_codec::error_body(message, err_type))).into_response()
+            }
         }
     }
 
@@ -124,7 +118,9 @@ impl InboundWire {
     pub fn overloaded_status(&self) -> StatusCode {
         match self {
             InboundWire::OpenAi => StatusCode::SERVICE_UNAVAILABLE,
-            InboundWire::Anthropic => StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            InboundWire::Anthropic => {
+                StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+            }
         }
     }
 }
@@ -165,11 +161,7 @@ impl GatewayCtx {
 // ---------------------------------------------------------------- 中间件
 
 /// 安全中间件：Host/Origin 校验 + 鉴权限速判定 + 强制鉴权。/healthz 豁免。
-pub async fn security_mw(
-    State(ctx): State<GatewayCtx>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn security_mw(State(ctx): State<GatewayCtx>, req: Request, next: Next) -> Response {
     if req.uri().path() == "/healthz" {
         return next.run(req).await;
     }
@@ -234,9 +226,7 @@ fn emit_log(
     error_kind: Option<String>,
     error_summary: Option<String>,
 ) {
-    let (ui, uo, ucr, ucw) = usage
-        .map(extract_usage)
-        .unwrap_or((None, None, None, None));
+    let (ui, uo, ucr, ucw) = usage.map(extract_usage).unwrap_or((None, None, None, None));
     logs.emit(LogEvent {
         ts: store::now_ms(),
         inbound_family: inbound_family.into(),
@@ -262,10 +252,89 @@ fn empty_resp(status: StatusCode) -> Response {
     (status, Json(json!({}))).into_response()
 }
 
+/// 转换流中途出错时发给客户端的 SSE 错误帧（protocol-ir §5-E/§6）。
+/// Anthropic 线使用 `event: error`；OpenAI 线使用 `data: {"error":...}`。
+fn error_sse_frame(wire: InboundWire, message: &str) -> Bytes {
+    match wire {
+        InboundWire::Anthropic => {
+            let payload = anthropic_codec::error_body(message, "api_error").to_string();
+            Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+        }
+        InboundWire::OpenAi => {
+            let payload = error_body(message, "api_error", None).to_string();
+            Bytes::from(format!("data: {payload}\n\n"))
+        }
+    }
+}
+
+/// M5：Anthropic 入站历史中的 tool id 解析。
+/// 先查超长 id 映射表，再回落 `decode_anthropic_tool_id` 的确定性反解。
+fn resolve_anthropic_inbound_tool_ids(db: &Db, req: &mut crate::codec::ir::CanonicalRequest) {
+    use crate::codec::ir::Block;
+    for m in &mut req.messages {
+        for b in &mut m.blocks {
+            match b {
+                Block::ToolUse { id, .. } => {
+                    if let Some(canonical) = lookup_tool_id(db, id) {
+                        *id = canonical;
+                    }
+                }
+                Block::ToolResult { call_id, .. } => {
+                    if let Some(canonical) = lookup_tool_id(db, call_id) {
+                        *call_id = canonical;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 查 tool_id_map；`decode_anthropic_tool_id` 会先剥掉 `toolu_` 前缀，
+/// 因此这里同时尝试原样 id 和补回前缀后的完整 outbound_id。
+fn lookup_tool_id(db: &Db, id: &str) -> Option<String> {
+    if let Some(canonical) = db.with_any(|c| store::tool_id_get(c, id)).ok().flatten() {
+        return Some(canonical);
+    }
+    let full = format!("toolu_{id}");
+    db.with_any(|c| store::tool_id_get(c, &full)).ok().flatten()
+}
+
+/// M5：Anthropic 出站 tool_use id 映射。
+/// 普通 id 使用确定性 base58 内嵌编码；超过 Anthropic 64 字符上限时，
+/// 在 `tool_id_map` 落一条短 id → 原始 id 的映射并返回短 id。
+fn map_anthropic_tool_id(db: &Db, canonical_id: &str) -> String {
+    if canonical_id.starts_with("toolu_") {
+        return canonical_id.to_string();
+    }
+    let encoded = crate::codec::ir::canonical_to_anthropic_id(canonical_id);
+    if encoded.len() <= 64 {
+        return encoded;
+    }
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(canonical_id.as_bytes());
+        format!("{:x}", h.finalize())
+    };
+    let outbound = format!("toolu_{}", &digest[..56]);
+    if let Err(e) = db.with_any(|c| store::tool_id_put(c, &outbound, canonical_id)) {
+        eprintln!("[convert] tool_id_map 写入失败: {e}");
+    }
+    outbound
+}
+
 /// 极简 ASCII 空白 trim（u8 slice 无内置 trim）。
 fn trim_ascii(s: &[u8]) -> &[u8] {
-    let start = s.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(s.len());
-    let end = s.iter().rposition(|b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
+    let start = s
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(s.len());
+    let end = s
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(start);
     &s[start..end]
 }
 
@@ -293,15 +362,15 @@ async fn resolve_remote_images(
                     continue;
                 };
                 if !(url_str.starts_with("http://") || url_str.starts_with("https://")) {
-                    return Err(format!("不支持的图片源: {url_str}（仅 http/https 或 data URL）"));
+                    return Err(format!(
+                        "不支持的图片源: {url_str}（仅 http/https 或 data URL）"
+                    ));
                 }
-                let resp = tokio::time::timeout(
-                    Duration::from_secs(8),
-                    ctx.http.get(&url_str).send(),
-                )
-                .await
-                .map_err(|_| format!("图片拉取超时(8s): {url_str}"))?
-                .map_err(|e| format!("图片拉取失败: {e}"))?;
+                let resp =
+                    tokio::time::timeout(Duration::from_secs(8), ctx.http.get(&url_str).send())
+                        .await
+                        .map_err(|_| format!("图片拉取超时(8s): {url_str}"))?
+                        .map_err(|e| format!("图片拉取失败: {e}"))?;
                 if !resp.status().is_success() {
                     return Err(format!(
                         "图片拉取失败: {url_str} → HTTP {}",
@@ -406,9 +475,7 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
             let mut seen = std::collections::HashSet::new();
             rows.into_iter()
                 .filter(|(id, _)| seen.insert(id.clone()))
-                .map(|(id, owner)| {
-                    json!({"id": id, "object": "model", "owned_by": owner})
-                })
+                .map(|(id, owner)| json!({"id": id, "object": "model", "owned_by": owner}))
                 .collect::<Vec<_>>()
         }
         Ok(Err(e)) => {
@@ -464,10 +531,7 @@ pub async fn anthropic_messages(State(ctx): State<GatewayCtx>, req: Request) -> 
 }
 
 /// POST /v1/messages/count_tokens —— 粗估端点（M3，避免 Claude Code 降级）。
-pub async fn anthropic_count_tokens(
-    State(_ctx): State<GatewayCtx>,
-    req: Request,
-) -> Response {
+pub async fn anthropic_count_tokens(State(_ctx): State<GatewayCtx>, req: Request) -> Response {
     let body = match to_bytes(req.into_body(), MAX_REQUEST_BODY).await {
         Ok(b) => b,
         Err(_) => {
@@ -639,7 +703,9 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             Some(ct) => b.header(header::CONTENT_TYPE, ct),
             None => b.header(header::CONTENT_TYPE, "application/json"),
         };
-        return b.body(Body::from(err.body)).unwrap_or_else(|_| empty_resp(err.status));
+        return b
+            .body(Body::from(err.body))
+            .unwrap_or_else(|_| empty_resp(err.status));
     }
 
     emit_log(
@@ -781,8 +847,8 @@ async fn try_candidate(
         }
     };
 
-    let up_status = StatusCode::from_u16(resp.status().as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let up_status =
+        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     if !up_status.is_success() {
         // 先取头再消费 body（bytes() 会拿走 Response 的所有权）
@@ -821,7 +887,8 @@ async fn try_candidate(
                     None => b.header(header::CONTENT_TYPE, "application/json"),
                 };
                 return Attempt::Delivered(
-                    b.body(Body::from(bytes)).unwrap_or_else(|_| empty_resp(up_status)),
+                    b.body(Body::from(bytes))
+                        .unwrap_or_else(|_| empty_resp(up_status)),
                 );
             }
             AttemptVerdict::Failover { kind } => {
@@ -871,18 +938,37 @@ async fn try_candidate(
         .unwrap_or(false);
 
     let delivered = if ct_is_sse || peeked.stream {
-        streaming_response(ctx.clone(), wire, peeked.clone(), cand.clone(), resp, up_status, started)
-            .await
+        streaming_response(
+            ctx.clone(),
+            wire,
+            peeked.clone(),
+            cand.clone(),
+            resp,
+            up_status,
+            started,
+        )
+        .await
     } else {
-        plain_response(ctx.clone(), wire, peeked.clone(), cand.clone(), resp, up_status, started)
-            .await
+        plain_response(
+            ctx.clone(),
+            wire,
+            peeked.clone(),
+            cand.clone(),
+            resp,
+            up_status,
+            started,
+        )
+        .await
     };
     Attempt::Delivered(delivered)
 }
 
-// ---------------------------------------------------------------- M4：跨族转换
+// ---------------------------------------------------------------- M4/M5：跨族转换
 
-/// 尝试单渠道的**跨族转换**（入站 OpenAI → 上游 Anthropic / Gemini）。
+/// 尝试单渠道的**跨族转换**：
+/// - M4：入站 OpenAI → 上游 Anthropic / Gemini
+/// - M5：入站 Anthropic → 上游 OpenAI / Gemini
+///
 /// 全链路：InboundCodec 解码 → IR → UpstreamCodec 编码 → 上游 → 响应解析 → 渲染回入站形状。
 async fn try_converted_candidate(
     ctx: &GatewayCtx,
@@ -892,31 +978,35 @@ async fn try_converted_candidate(
     body: &Bytes,
     started: Instant,
 ) -> Attempt {
-    // M4 只支持 OpenAI 入站的跨族转换（Anthropic 入站 → OpenAI/Gemini 在 M5）
-    if wire != InboundWire::OpenAi {
-        let msg = format!(
-            "渠道 {} 协议族为 {}，该入站线的跨族转换自 M5 起提供",
-            cand.provider_name, cand.family
-        );
-        return Attempt::Failed {
-            kind: "ProviderOther",
-            summary: msg,
-            last_http: None,
-        };
-    }
-
-    // 1) 解码入站
-    let req = match crate::codec::openai::decode_request(body) {
-        Ok(r) => r,
-        Err(msg) => {
-            return Attempt::Delivered(wire.error_response(
-                StatusCode::BAD_REQUEST,
-                &msg,
-                "invalid_request_error",
-                None,
-            ));
-        }
+    // 1) 解码入站（按入站线分发）
+    let mut req = match wire {
+        InboundWire::OpenAi => match crate::codec::openai::decode_request(body) {
+            Ok(r) => r,
+            Err(msg) => {
+                return Attempt::Delivered(wire.error_response(
+                    StatusCode::BAD_REQUEST,
+                    &msg,
+                    "invalid_request_error",
+                    None,
+                ));
+            }
+        },
+        InboundWire::Anthropic => match crate::codec::anthropic::decode_request(body) {
+            Ok(r) => r,
+            Err(msg) => {
+                return Attempt::Delivered(wire.error_response(
+                    StatusCode::BAD_REQUEST,
+                    &msg,
+                    "invalid_request_error",
+                    None,
+                ));
+            }
+        },
     };
+    // M5：Anthropic 入站历史 tool id 反解（含 tool_id_map 超长回落）
+    if wire == InboundWire::Anthropic {
+        resolve_anthropic_inbound_tool_ids(&ctx.db, &mut req);
+    }
 
     // 2) 护栏（M4：blocks ≤ 64 / args ≤ 256KB）
     if let Err(msg) = crate::codec::ir::validate_guards(&req) {
@@ -928,8 +1018,8 @@ async fn try_converted_candidate(
         ));
     }
 
-    // 2.5) 跨族不支持的能力面：response_format(json_schema) → 400（M4 验收 5）
-    if req.extensions.contains_key("response_format") {
+    // 2.5) 跨族不支持的能力面：response_format(json_schema) → 400（仅 OpenAI 入站有该字段）
+    if wire == InboundWire::OpenAi && req.extensions.contains_key("response_format") {
         let msg =
             "response_format（json_schema）在跨协议转换中不支持；支持子集：无。请改用提示词约束输出";
         return Attempt::Delivered(wire.error_response(
@@ -996,6 +1086,23 @@ async fn try_converted_candidate(
             let out = ctx.http.post(&url).header("x-goog-api-key", "");
             (url, (out, body))
         }
+        "openai_compat" => {
+            // M5：Anthropic 入站 → OpenAI 兼容上游
+            let body = match crate::codec::openai::encode_request(&req) {
+                Ok(b) => b,
+                Err(msg) => {
+                    return Attempt::Delivered(wire.error_response(
+                        StatusCode::BAD_REQUEST,
+                        &msg,
+                        "invalid_request_error",
+                        None,
+                    ));
+                }
+            };
+            let url = url_join(&cand.base_url, "/chat/completions");
+            let out = ctx.http.post(&url).bearer_auth("");
+            (url, (out, body))
+        }
         other => {
             return Attempt::Failed {
                 kind: "ProviderOther",
@@ -1042,6 +1149,7 @@ async fn try_converted_candidate(
     let mut out_req = match cand.family.as_str() {
         "anthropic" => out.header("x-api-key", &secret),
         "gemini" => out.header("x-goog-api-key", &secret),
+        "openai_compat" => out.bearer_auth(&secret),
         _ => out,
     };
     if let Some(eh_raw) = cand.extra_headers.as_deref() {
@@ -1060,7 +1168,12 @@ async fn try_converted_candidate(
     }
     drop(url);
 
-    let resp = match out_req.json(&body_json).timeout(Duration::from_secs(300)).send().await {
+    let resp = match out_req
+        .json(&body_json)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("上游连接失败: {e}");
@@ -1086,8 +1199,8 @@ async fn try_converted_candidate(
         }
     };
 
-    let up_status = StatusCode::from_u16(resp.status().as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let up_status =
+        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     if !up_status.is_success() {
         let mut bytes = resp.bytes().await.unwrap_or_default();
@@ -1118,12 +1231,7 @@ async fn try_converted_candidate(
                     "ContextTooLong" => ("invalid_request_error", Some("context_length_exceeded")),
                     _ => ("invalid_request_error", None),
                 };
-                return Attempt::Delivered(wire.error_response(
-                    up_status,
-                    &snippet,
-                    tname,
-                    code,
-                ));
+                return Attempt::Delivered(wire.error_response(up_status, &snippet, tname, code));
             }
             AttemptVerdict::Failover { kind } => {
                 provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
@@ -1168,9 +1276,27 @@ async fn try_converted_candidate(
         .unwrap_or(false);
 
     if ct_is_sse || req.stream {
-        convert_streaming_response(ctx.clone(), wire, peeked.clone(), cand.clone(), resp, up_status, started).await
+        convert_streaming_response(
+            ctx.clone(),
+            wire,
+            peeked.clone(),
+            cand.clone(),
+            resp,
+            up_status,
+            started,
+        )
+        .await
     } else {
-        convert_plain_response(ctx.clone(), wire, peeked.clone(), cand.clone(), resp, up_status, started).await
+        convert_plain_response(
+            ctx.clone(),
+            wire,
+            peeked.clone(),
+            cand.clone(),
+            resp,
+            up_status,
+            started,
+        )
+        .await
     }
 }
 
@@ -1201,9 +1327,12 @@ async fn convert_plain_response(
                 Some("ProviderOther".into()),
                 Some(format!("[convert] {msg}")),
             );
-            return Attempt::Delivered(
-                wire.error_response(StatusCode::BAD_GATEWAY, &msg, "api_error", None),
-            );
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_GATEWAY,
+                &msg,
+                "api_error",
+                None,
+            ));
         }
         Err(_) => {
             emit_log(
@@ -1217,7 +1346,10 @@ async fn convert_plain_response(
                 false,
                 None,
                 Some("Overloaded".into()),
-                Some(format!("[convert] Overloaded read timeout (status={})", status.as_u16())),
+                Some(format!(
+                    "[convert] Overloaded read timeout (status={})",
+                    status.as_u16()
+                )),
             );
             return Attempt::Delivered(wire.error_response(
                 wire.overloaded_status(),
@@ -1232,9 +1364,10 @@ async fn convert_plain_response(
     let parsed = match cand.family.as_str() {
         "anthropic" => crate::codec::anthropic::parse_response(&bytes),
         "gemini" => crate::codec::gemini::parse_response(&bytes),
+        "openai_compat" => crate::codec::openai::parse_response(&bytes),
         other => Err(format!("未知上游协议族: {other}")),
     };
-    let resp = match parsed {
+    let mut resp = match parsed {
         Ok(r) => r,
         Err(msg) => {
             emit_log(
@@ -1250,11 +1383,23 @@ async fn convert_plain_response(
                 Some("ProviderOther".into()),
                 Some(format!("[convert] 解析失败: {msg}")),
             );
-            return Attempt::Delivered(
-                wire.error_response(StatusCode::BAD_GATEWAY, &msg, "api_error", None),
-            );
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_GATEWAY,
+                &msg,
+                "api_error",
+                None,
+            ));
         }
     };
+
+    // M5：Anthropic 入站出站 tool id 先映射（含超长 tool_id_map 回落）
+    if wire == InboundWire::Anthropic {
+        for b in &mut resp.output {
+            if let crate::codec::ir::Block::ToolUse { id, .. } = b {
+                *id = map_anthropic_tool_id(&ctx.db, id);
+            }
+        }
+    }
 
     let usage = &resp.usage;
     let uval = json!({
@@ -1275,12 +1420,15 @@ async fn convert_plain_response(
         None,
     );
 
-    // 渲染为入站（OpenAI）形状
-    let rendered = crate::codec::openai::render_response(&resp);
+    // 渲染为入站形状（OpenAI / Anthropic）
+    let rendered = match wire {
+        InboundWire::OpenAi => crate::codec::openai::render_response(&resp).to_string(),
+        InboundWire::Anthropic => crate::codec::anthropic::render_response(&resp).to_string(),
+    };
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(rendered.to_string()))
+        .body(Body::from(rendered))
         .map(Attempt::Delivered)
         .unwrap_or_else(|_| Attempt::Delivered(empty_resp(status)))
 }
@@ -1328,26 +1476,57 @@ async fn convert_streaming_response(
         }
     };
 
-    // 组装下游 SSE 帧：OpenAI RenderState
-    let mut render = crate::codec::openai::RenderState {
-        id: format!("chatcmpl-jai-{}", started.elapsed().as_millis()),
-        model: peeked.model.clone(),
-        started: false,
+    // 按入站线选择渲染器
+    enum SseRenderer {
+        OpenAi(crate::codec::openai::RenderState),
+        Anthropic(crate::codec::anthropic::AnthropicRenderState),
+    }
+    let mut renderer = match wire {
+        InboundWire::OpenAi => SseRenderer::OpenAi(crate::codec::openai::RenderState {
+            id: format!("chatcmpl-jai-{}", started.elapsed().as_millis()),
+            model: peeked.model.clone(),
+            started: false,
+        }),
+        InboundWire::Anthropic => {
+            SseRenderer::Anthropic(crate::codec::anthropic::AnthropicRenderState {
+                message_id: format!("msg_jai_{}", started.elapsed().as_millis()),
+                model: peeked.model.clone(),
+                active_block: None,
+                text_started: false,
+                active_tool_index: None,
+                next_block_index: 0,
+                finished: false,
+            })
+        }
     };
+    // 渲染单个 IR 事件 → SSE 输出帧（一个 IR 事件可能展开多个 SSE 事件）
+    fn render_frame(renderer: &mut SseRenderer, ev: &crate::codec::ir::StreamEvent) -> Vec<String> {
+        match renderer {
+            SseRenderer::OpenAi(st) => crate::codec::openai::render_stream_event(ev, st)
+                .map(|line| format!("data: {line}\n\n"))
+                .into_iter()
+                .collect(),
+            SseRenderer::Anthropic(st) => crate::codec::anthropic::render_stream_event(ev, st)
+                .into_iter()
+                .map(|(evt, data)| format!("event: {evt}\ndata: {data}\n\n"))
+                .collect(),
+        }
+    }
 
     // SSE 事件 ⊆ 格式转换：上游原始帧 → IR → 入站帧
-    // 简单起见逐块缓冲行；跨块分割由 SSE 行扫描器（每行独立 JSON）处理
     let upstream_family = cand.family.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     // 首字节先入行缓冲（不丢数据）
     let first_lines: Vec<u8> = first_chunk.to_vec();
 
-    // Start 事件先发（OpenAI 客户端期待 role=assistant 首帧）
-    if let Some(line) = crate::codec::openai::render_stream_event(
-        &crate::codec::ir::StreamEvent::Start { model: peeked.model.clone() },
-        &mut render,
+    // Start 事件先发
+    for frame in render_frame(
+        &mut renderer,
+        &crate::codec::ir::StreamEvent::Start {
+            model: peeked.model.clone(),
+        },
     ) {
-        let _ = tx.send(Ok(Bytes::from(format!("data: {line}\n\n")))).await;
+        let _ = tx.send(Ok(Bytes::from(frame))).await;
     }
 
     {
@@ -1359,10 +1538,89 @@ async fn convert_streaming_response(
             let t0 = Instant::now();
             let mut line_buf: Vec<u8> = first_lines;
 
+            // 解析并发送当前行缓冲（首字节可能已包含整个 SSE 流）
+            macro_rules! drain_sse_lines {
+                () => {{
+                    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                        let line = line.strip_suffix(b"\r").unwrap_or(&line);
+                        let line: &[u8] = line;
+                        if !line.starts_with(b"data:") {
+                            continue;
+                        }
+                        let payload: &[u8] = trim_ascii(&line[5..]);
+                        if payload.is_empty() || payload == b"[DONE]" {
+                            continue;
+                        }
+                        let mut events: Vec<crate::codec::ir::StreamEvent> =
+                            match upstream_family.as_str() {
+                                "anthropic" => {
+                                    match crate::codec::anthropic::parse_stream_event(payload) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            eprintln!("[convert] anthropic SSE: {e}");
+                                            continue;
+                                        }
+                                    }
+                                }
+                                "gemini" => match crate::codec::gemini::parse_stream_event(payload) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        eprintln!("[convert] gemini SSE: {e}");
+                                        continue;
+                                    }
+                                },
+                                "openai_compat" => match crate::codec::openai::parse_stream_event(payload)
+                                {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        eprintln!("[convert] openai SSE: {e}");
+                                        continue;
+                                    }
+                                },
+                                _ => continue,
+                            };
+                        // M5：Anthropic 入站出站 tool id 先映射（含超长 tool_id_map 回落）
+                        if wire2 == InboundWire::Anthropic {
+                            for ev in &mut events {
+                                if let crate::codec::ir::StreamEvent::ToolCallStart { id, .. } = ev
+                                {
+                                    *id = map_anthropic_tool_id(&ctx2.db, id);
+                                }
+                            }
+                        }
+                        for ev in events {
+                            for frame in render_frame(&mut renderer, &ev) {
+                                if tx.send(Ok(Bytes::from(frame))).await.is_err() {
+                                    emit_log(
+                                        &ctx2.logs,
+                                        wire2.log_family(),
+                                        Some(&peeked2),
+                                        Some(&pid),
+                                        None,
+                                        status.as_u16() as i64,
+                                        ms_since(t0),
+                                        true,
+                                        None,
+                                        Some("InvalidRequest".into()),
+                                        Some("client disconnected mid-stream".into()),
+                                    );
+                                    drop(tx);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }};
+            }
+            drain_sse_lines!();
+
             loop {
                 let nxt = tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream_stream.next());
                 match nxt.await {
                     Err(_) => {
+                        let msg = format!("上游流空闲超时({}s)", STREAM_IDLE_TIMEOUT.as_secs());
+                        let _ = tx.send(Ok(error_sse_frame(wire2, &msg))).await;
                         drop(tx);
                         emit_log(
                             &ctx2.logs,
@@ -1384,68 +1642,11 @@ async fn convert_streaming_response(
                     }
                     Ok(Some(Ok(chunk))) => {
                         line_buf.extend_from_slice(&chunk);
-                        while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
-                            let line: Vec<u8> = line_buf.drain(..=pos).collect();
-                            let line = line.strip_suffix(b"\r").unwrap_or(&line);
-                            let line: &[u8] = line;
-                            if !line.starts_with(b"data:") {
-                                continue;
-                            }
-                            let payload: &[u8] = trim_ascii(&line[5..]);
-                            if payload.is_empty() || payload == b"[DONE]" {
-                                continue;
-                            }
-                            let events: Vec<crate::codec::ir::StreamEvent> =
-                                match upstream_family.as_str() {
-                                    "anthropic" => {
-                                        match crate::codec::anthropic::parse_stream_event(payload)
-                                        {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                eprintln!("[convert] anthropic SSE: {e}");
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    "gemini" => match crate::codec::gemini::parse_stream_event(payload)
-                                    {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            eprintln!("[convert] gemini SSE: {e}");
-                                            continue;
-                                        }
-                                    },
-                                    _ => continue,
-                                };
-                            for ev in events {
-                                if let Some(out) =
-                                    crate::codec::openai::render_stream_event(&ev, &mut render)
-                                {
-                                    if tx.send(Ok(Bytes::from(format!("data: {out}\n\n")))).await
-                                        .is_err()
-                                    {
-                                        emit_log(
-                                            &ctx2.logs,
-                                            wire2.log_family(),
-                                            Some(&peeked2),
-                                            Some(&pid),
-                                            None,
-                                            status.as_u16() as i64,
-                                            ms_since(t0),
-                                            true,
-                                            None,
-                                            Some("InvalidRequest".into()),
-                                            Some("client disconnected mid-stream".into()),
-                                        );
-                                        drop(tx);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+                        drain_sse_lines!();
                     }
                     Ok(Some(Err(e))) => {
                         let msg = format!("stream aborted by upstream: {e}");
+                        let _ = tx.send(Ok(error_sse_frame(wire2, &msg))).await;
                         provider_mark_fail(&ctx2.db, &pid, &msg);
                         emit_log(
                             &ctx2.logs,
@@ -1464,10 +1665,17 @@ async fn convert_streaming_response(
                         break;
                     }
                     Ok(None) => {
-                        // 自然结束：补 [DONE]
-                        let _ = tx
-                            .send(Ok(Bytes::from_static(b"data: [DONE]\n\n")))
-                            .await;
+                        // 自然结束：Anthropic 补 message_stop，OpenAI 补 [DONE]
+                        if wire2 == InboundWire::Anthropic {
+                            let _ = tx
+                                .send(Ok(Bytes::from(format!(
+                                    "event: message_stop\ndata: {}\n\n",
+                                    crate::codec::anthropic::render_message_stop()
+                                ))))
+                                .await;
+                        } else {
+                            let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
+                        }
                         emit_log(
                             &ctx2.logs,
                             wire2.log_family(),
@@ -1499,7 +1707,8 @@ async fn convert_streaming_response(
         .header(header::CACHE_CONTROL, "no-cache")
         .header(
             "x-jai-provider",
-            HeaderValue::from_str(&cand.provider_name).unwrap_or(HeaderValue::from_static("unknown")),
+            HeaderValue::from_str(&cand.provider_name)
+                .unwrap_or(HeaderValue::from_static("unknown")),
         )
         .header("x-jai-mode", HeaderValue::from_static("converted"))
         .body(Body::from_stream(client_stream))
@@ -1834,8 +2043,51 @@ async fn streaming_response(
         .header(header::CACHE_CONTROL, "no-cache")
         .header(
             "x-jai-provider",
-            HeaderValue::from_str(&cand.provider_name).unwrap_or(HeaderValue::from_static("unknown")),
+            HeaderValue::from_str(&cand.provider_name)
+                .unwrap_or(HeaderValue::from_static("unknown")),
         )
         .body(Body::from_stream(client_stream))
         .unwrap_or_else(|_| empty_resp(status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_error_sse_frame_shape() {
+        let bytes = error_sse_frame(InboundWire::Anthropic, "上游中途断开");
+        let s = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            s.starts_with(
+                "event: error
+"
+            ),
+            "Anthropic 应发 event: error，得到: {s:?}"
+        );
+        assert!(s.contains("\"type\":\"error\""), "应含 Anthropic 错误对象");
+        assert!(s.contains("上游中途断开"));
+    }
+
+    #[test]
+    fn openai_error_sse_frame_shape() {
+        let bytes = error_sse_frame(InboundWire::OpenAi, "upstream boom");
+        let s = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(s.starts_with("data: "), "OpenAI 应发 data: 错误帧");
+        assert!(s.contains("upstream boom"));
+    }
+
+    #[test]
+    fn long_tool_id_map_roundtrip_in_proxy() {
+        let db = Db::in_memory().unwrap();
+        let long = format!("call_{}", "x".repeat(80));
+        let short = map_anthropic_tool_id(&db, &long);
+        assert!(short.starts_with("toolu_"), "短 id 应带前缀: {short}");
+        assert!(short.len() <= 64, "短 id 长度 {} 应 ≤ 64", short.len());
+        let stored = db
+            .with_any(|c| store::tool_id_get(c, &short))
+            .unwrap()
+            .expect("映射应已落库");
+        assert_eq!(stored, long);
+    }
 }

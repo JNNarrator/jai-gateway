@@ -5,9 +5,9 @@
 //! 让「全文扫描无敏感串」能在单测/集成层验证，而不是只能靠真机 grep。
 
 use rusqlite::Connection;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use super::{StoreError, provider_list, model_list_by_provider};
+use super::{model_list_by_provider, provider_list, StoreError};
 
 /// 构建导出 JSON 字符串。`providers.keyring_ref` 字段被整体剔除（字段名都不出现）。
 pub fn build_export_json(c: &Connection) -> Result<String, StoreError> {
@@ -109,7 +109,10 @@ mod tests {
         // M2 验收 4：全文扫描
         assert!(!s.contains("sk-jai"), "网关密钥全文不得出现");
         assert!(!s.contains("sk-"), "任何 sk-* 形式的密钥不得出现");
-        assert!(!s.contains("keyring"), "keyring 引用不得出现（字段名也不要）");
+        assert!(
+            !s.contains("keyring"),
+            "keyring 引用不得出现（字段名也不要）"
+        );
         assert!(!s.contains("jai/provider"), "密钥环引用地址不得出现");
         assert!(!s.contains("sk-upstream"), "上游密钥不得出现");
         assert!(!s.contains("secret"), "秘密字样不得出现");

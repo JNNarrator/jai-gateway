@@ -321,10 +321,28 @@
   （Anthropic/Gemini 文本/工具/流式端到端、429 全败 OpenAI 形状、参数映射、往返不变性）
 - 全量回归：57 单测 + M2/M3/M4 集成共 78 项全绿，clippy -D warnings 零警告
 
+### M5（跨族转换·下半场：Anthropic 客户端 × OpenAI/Gemini 模型）—— 已完成 ✅
+
+- InboundCodec::Anthropic 全量（`codec/anthropic.rs` M5 段）：decode_request（system 字符串/块、
+  tool_use/tool_result 反解、thinking Lenient 丢弃 + WARN）、render_response、render_stream_event
+  + AnthropicRenderState（message_start input_tokens 前置 0、message_delta 终局补齐、message_stop）
+- UpstreamCodec::OpenAI（`codec/openai.rs` M5 段）：encode_request（system 还原首条消息、tool_calls、
+  role=tool、max_completion_tokens、stream_options 注入）、parse_response、parse_stream_event
+- proxy 转换接线：Anthropic 入站 → OpenAI/Gemini 上游，非流式与流式全链路；流式转换修复
+  「首字节已含完整 SSE 流时未消费行缓冲」问题（单 chunk 场景不丢内容）
+- tool id 闭环：`canonical_to_anthropic_id` 改为 `toolu_` + base58("jai1."+原始 id) 确定性编码，
+  `decode_anthropic_tool_id` 识别 magic 并还原；超长 id（>64）回落 `tool_id_map`（store 新增
+  tool_id_put/tool_id_get + 7 天 TTL），流式/非流式出站映射入站回传还原
+- 流式中途错误：Anthropic 入站收到 `event: error` 帧（OpenAI 线 `data: {"error":...}`），
+  不再静默断流
+- 集成测试 `tests/m5_anthropic_inbound.rs` 6 项全绿：text/tool/stream/长 id 多轮回传
+  （OpenAI + Gemini 上游）；proxy 侧新增 error SSE 帧与 tool_id_map 单测
+- 全量回归：67 单测 + M2/M3/M4/M5 集成共 27 项全绿，`cargo fmt --check` + clippy -D warnings 零警告
+
 ### 待办（下一里程碑）
 
-1. M5 跨族转换下半场：Anthropic 入站 render 侧（`InboundCodec::Anthropic` 响应渲染 + 嵌套顺序缓冲）
-2. 修复 CI 暴露的跨平台问题（若有）
-3. 真机验收 M1–M4（Claude Code 直通、OpenAI 客户端 × Claude/Gemini 转换链路）
+1. M6 Responses API 入站（Codex 接入）：`POST /v1/responses` 解码/渲染/SSE
+2. M7 配置导入 + WebDAV 同步
+3. 真机验收 M1–M5（Claude Code 直通、跨族转换链路、Claude Code × GPT/Gemini 工具回传）
 
-> 历史快照：M1–M4 完成快照已并入本节；更早的记录见 git 历史。
+> 历史快照：M1–M5 完成快照已并入本节；更早的记录见 git 历史。
