@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+dist/
+node_modules/
+
+# Local data & secrets
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.env.*
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
