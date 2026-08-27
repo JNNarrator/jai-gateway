@@ -6,6 +6,7 @@ import type {
   LogRowView,
   ModelRow,
   ProviderDto,
+  SettingsDto,
 } from "./types";
 
 export const api = {
@@ -62,5 +63,10 @@ export const api = {
   exportConfigJson: () => invoke<string>("export_config_json"),
   corsAllowGet: () => invoke<string[]>("cors_allow_get"),
   corsAllowSet: (list: string[]) => invoke<void>("cors_allow_set", { list }),
+  settingsGet: () => invoke<SettingsDto>("settings_get"),
+  settingsSetPort: (port: number) =>
+    invoke<number>("settings_set_port", { port }),
+  settingsSetLogsEnabled: (enabled: boolean) =>
+    invoke<boolean>("settings_set_logs_enabled", { enabled }),
   families: () => invoke<string[]>("families"),
 };

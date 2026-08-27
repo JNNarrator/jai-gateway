@@ -3,8 +3,10 @@
 //! 设计权威：docs/design/storage-schema.md（v1 已定稿）。
 //! 迁移机制：`PRAGMA user_version` 逐版本事务推进，零外部依赖（§7）。
 
+pub mod export;
 pub mod logs;
 pub mod migrations;
+pub mod retention;
 pub mod snapshot;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -16,6 +18,8 @@ use thiserror::Error;
 pub enum StoreError {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 // ================================================================ 连接与迁移
@@ -331,6 +335,7 @@ pub fn model_toggle(c: &Connection, model_id: &str, enabled: bool) -> Result<(),
 }
 
 /// 路由候选查询 —— storage §3 定案 SQL。按 (priority, rowid) 序逐渠道尝试。
+#[derive(Debug, Clone)]
 pub struct RouteCandidate {
     pub provider_id: String,
     pub provider_name: String,

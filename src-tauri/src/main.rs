@@ -528,47 +528,12 @@ async fn logs_recent(core: State<'_, AppCore>, limit: i64) -> Result<Vec<logs::L
 }
 
 /// 导出 JSON（storage §8 语义：meta+providers+models，零敏感字段——
-/// 密钥环引用与网关密钥列都不出现）。
+/// 构建逻辑在 gateway-core::store::export，保证单测覆盖「全文无敏感串」）。
 #[tauri::command]
 async fn export_config_json(core: State<'_, AppCore>) -> Result<String, String> {
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
-        db.with_any(|c| -> Result<String, String> {
-            let providers: Vec<_> = store::provider_list(c)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|mut p| {
-                    p.keyring_ref = String::new(); // 双保险剔除引用
-                    p
-                })
-                .collect();
-            let mut all_models = Vec::new();
-            for p in &providers {
-                all_models.extend(
-                    store::model_list_by_provider(c, &p.id)
-                        .map_err(|e| e.to_string())?,
-                );
-            }
-            let meta_rows: Vec<(String, String)> = {
-                let mut stmt = c
-                    .prepare("SELECT key,value FROM meta")
-                    .map_err(|e| e.to_string())?;
-                let it = stmt
-                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .map_err(|e| e.to_string())?;
-                it.collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.to_string())?
-            };
-            serde_json::to_string_pretty(&serde_json::json!({
-                "format": "jai-export/v1",
-                "exportedAt": store::now_ms(),
-                "note": "API Key 保存在各设备系统钥匙串中，不随导出迁移",
-                "meta": meta_rows,
-                "providers": providers,
-                "models": all_models,
-            }))
-            .map_err(|e| e.to_string())
-        })
+        db.with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
     })
     .await
     .map_err(join_err)?
@@ -594,6 +559,86 @@ async fn cors_allow_set(core: State<'_, AppCore>, list: Vec<String>) -> Result<(
 #[tauri::command]
 fn families() -> Vec<&'static str> {
     vec!["openai_compat", "anthropic", "gemini"]
+}
+
+// ---------------------------------------------------------------- 设置（M2）
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsDto {
+    /// 偏好监听端口；重启网关后生效（端口占用自动顺延）
+    pub preferred_port: u16,
+    /// 日志记录总开关（关闭后新请求不再落库）
+    pub logs_enabled: bool,
+    /// 日志保留天数（meta 可覆盖；默认 30）
+    pub retention_days: i64,
+    /// 日志行数上限（meta 可覆盖；默认 5 万）
+    pub log_row_cap: i64,
+}
+
+#[tauri::command]
+async fn settings_get(core: State<'_, AppCore>) -> Result<SettingsDto, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| -> Result<SettingsDto, String> {
+            let port = store::meta_get(c, "gateway_port")
+                .map_err(|e| e.to_string())?
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(server::DEFAULT_PORT);
+            let logs_enabled = store::meta_get(c, "logs_enabled")
+                .map_err(|e| e.to_string())?
+                .map(|s| s != "false")
+                .unwrap_or(true);
+            let retention_days = store::meta_get(c, "retention_days")
+                .map_err(|e| e.to_string())?
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(store::retention::DEFAULT_RETENTION_DAYS);
+            let log_row_cap = store::meta_get(c, "log_row_cap")
+                .map_err(|e| e.to_string())?
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(store::retention::DEFAULT_LOG_ROW_CAP);
+            Ok(SettingsDto {
+                preferred_port: port,
+                logs_enabled,
+                retention_days,
+                log_row_cap,
+            })
+        })
+    })
+    .await
+    .map_err(join_err)?
+}
+
+/// 设置偏好端口。仅持久化；网关重启后生效（避免运行中静默换端口引发
+/// 已连接客户端困惑，UI 会提示「重启网关生效」）。
+#[tauri::command]
+async fn settings_set_port(core: State<'_, AppCore>, port: u16) -> Result<u16, String> {
+    if port == 0 {
+        return Err("端口必须 ≥ 1".into());
+    }
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::meta_set(c, "gateway_port", &port.to_string()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    Ok(port)
+}
+
+/// 日志记录开关：写 meta + 实时切换 LogHandle（不重启即生效）。
+/// 关闭不影响已入队事件。
+#[tauri::command]
+async fn settings_set_logs_enabled(core: State<'_, AppCore>, enabled: bool) -> Result<bool, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::meta_set(c, "logs_enabled", if enabled { "true" } else { "false" }))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    core.logs.set_enabled(enabled);
+    Ok(enabled)
 }
 
 // ---------------------------------------------------------------- helpers
@@ -782,6 +827,34 @@ fn main() {
             let (log_handle, _log_task) = logs::spawn_logger(&db_str)?;
             println!("[store] db ready at {}", db_path.display());
 
+            // 读取持久化设置（meta KV）：端口 / 日志开关（roadmap M2 设置页）
+            let preferred_port: u16 = db
+                .with(|c| {
+                    store::meta_get(c, "gateway_port").map(|v| {
+                        v.and_then(|s| s.parse::<u16>().ok())
+                    })
+                })
+                .ok()
+                .flatten()
+                .unwrap_or(server::DEFAULT_PORT);
+            let logs_enabled: bool = db
+                .with(|c| {
+                    Ok(store::meta_get(c, "logs_enabled")?
+                        .map(|s| s != "false")
+                        .unwrap_or(true))
+                })
+                .unwrap_or(true);
+            log_handle.set_enabled(logs_enabled);
+
+            // 保活 timer（roadmap M2「保活 timer」）：每日清理日志保留窗口与
+            // tool_id_map TTL；异常不影响主路径（任务内部自愈）。
+            let _retention_task = store::retention::spawn_retention_loop(
+                db.clone(),
+                std::time::Duration::from_secs(24 * 3600),
+                store::retention::DEFAULT_RETENTION_DAYS,
+                store::retention::DEFAULT_LOG_ROW_CAP,
+            );
+
             let core = AppCore {
                 db: db.clone(),
                 logs: log_handle,
@@ -850,10 +923,10 @@ fn main() {
 
             // 3) 受管状态 + 启动即拉起网关（常驻预期）
             let gw = GatewayState {
-                preferred_port: server::DEFAULT_PORT,
+                preferred_port,
                 running: Arc::new(AtomicBool::new(false)),
                 stop_flag: Arc::new(AtomicBool::new(false)),
-                port: Arc::new(AtomicU16::new(server::DEFAULT_PORT)),
+                port: Arc::new(AtomicU16::new(preferred_port)),
                 restarts: Arc::new(AtomicU64::new(0)),
                 supervisor: Mutex::new(None),
                 tray: Mutex::new(Some(TrayHandles {
@@ -894,6 +967,9 @@ fn main() {
             export_config_json,
             cors_allow_get,
             cors_allow_set,
+            settings_get,
+            settings_set_port,
+            settings_set_logs_enabled,
             families,
         ])
         .run(tauri::generate_context!())

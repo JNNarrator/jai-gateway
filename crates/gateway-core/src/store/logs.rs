@@ -4,7 +4,7 @@
 //! （≥64 行或 ≥500ms）→ 独立连接批量 INSERT。洪峰时丢弃并计数告警。
 
 use rusqlite::{params_from_iter, Connection};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -77,11 +77,16 @@ const INSERT_SQL: &str = "INSERT INTO request_logs(ts,inbound_family,route_mode,
 pub struct LogHandle {
     tx: mpsc::Sender<LogEvent>,
     dropped: Arc<AtomicU64>,
+    enabled: Arc<AtomicBool>,
 }
 
 impl LogHandle {
     /// 非阻塞投递；通道满即丢弃并计数（洪峰语义）。
+    /// 日志开关关闭时直接丢弃（设置页「记录日志」开关，roadmap M2）。
     pub fn emit(&self, ev: LogEvent) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
         if self.tx.try_send(ev).is_err() {
             let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 100 == 1 {
@@ -92,6 +97,15 @@ impl LogHandle {
 
     pub fn dropped_total(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// 设置日志开关（不影响已入队事件）。
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
     }
 }
 
@@ -158,7 +172,14 @@ pub fn spawn_logger(db_path: &str) -> Result<(LogHandle, tokio::task::JoinHandle
         }
     });
 
-    Ok((LogHandle { tx, dropped }, task))
+    Ok((
+        LogHandle {
+            tx,
+            dropped,
+            enabled: Arc::new(AtomicBool::new(true)),
+        },
+        task,
+    ))
 }
 
 // ================================================================ 查询

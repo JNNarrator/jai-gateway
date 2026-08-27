@@ -3,6 +3,7 @@
 //! 设计依据：roadmap M0/M1 + 稳定性基线 §5-2（超时常量在 proxy 模块）。
 
 pub mod proxy;
+pub mod ratelimit;
 pub mod security;
 
 use axum::extract::State;
@@ -96,16 +97,22 @@ pub fn build_router(ctx: GatewayCtx) -> Router {
 }
 
 /// 以优雅停机方式运行直到收到关停信号（监督进程喂入）。
+///
+/// `into_make_service_with_connect_info`：让限速/审计中间件能拿到对端 IP
+/// （axum 0.8 中 ConnectInfo 扩展注入依赖此服务构建器）。
 pub async fn run_until_shutdown(
     listener: AsyncTcpListener,
     app: Router,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.changed().await;
-        })
-        .await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.changed().await;
+    })
+    .await
 }
 
 #[cfg(test)]

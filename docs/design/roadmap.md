@@ -208,12 +208,12 @@
 | 3 代理服务：OpenAI 入站 | M1 |
 | 3 代理服务：Anthropic 入站 + count_tokens | M3 |
 | 3 代理服务：Responses API 入站（Codex） | M6 |
-| 3 双协议路由 / 流式 / tool calling / 多渠道顺延 | M1 / M4 / M2 |
-| 4 数据持久化 + 导出 JSON + 日志脱敏 | M0(库) / M2(导出) / M1(日志) |
+| 3 双协议路由 / 流式 / tool calling / 多渠道顺延 | M1 / M4 / M2 ✅ |
+| 4 数据持久化 + 导出 JSON + 日志脱敏 | M0(库) / M2 ✅(导出) / M1(日志) |
 | 7 WebDAV 同步 + 配置导入（提前） | M7 |
-| 5 基础 UI（供应商/模型/状态卡/日志/设置/托盘） | M1 / M2 |
-| 6 网关进程（端口顺延、自定义端口） | M0 / M2 |
-| 非功能：本地安全四项 | M1（鉴权/Host-Origin/CORS）、M2（限速） |
+| 5 基础 UI（供应商/模型/状态卡/日志/设置/托盘） | M1 / M2 ✅ |
+| 6 网关进程（端口顺延、自定义端口） | M0 / M2 ✅(自定义端口) |
+| 非功能：本地安全四项 | M1（鉴权/Host-Origin/CORS）、M2 ✅（限速） |
 | 非功能：稳定性/可用性（一票否决） | 全局基线 §5，量化验收在 M8 |
 | 非功能：低资源占用 | M8（量化验收） |
 | 发布工程 | M9 |
@@ -256,12 +256,12 @@
 | 平台密钥环差异 | M0 起启动三连探测；不支持环境在添加供应商前拦截（storage §4） |
 | WebDAV 误覆盖造成配置丢失 | M7 推送前快照留存；LLW 先于定时自动同步开放 |
 
-## 8. M1 实施进度快照（下班交接记录）
+## 8. 实施进度快照（下班交接记录）
 
-> 状态：核心代码已落地并通过本地 clippy（-D warnings）与 gateway-core 18 项单测；
-> UI 已通过 `tsc --noEmit && vite build`。尚未做真机上游冒烟与 CI 最终确认。
+### M1（单渠道直通端到端）—— 已完成 ✅
 
-### 已完成（本分支已提交/待提交）
+核心代码落地并通过本地 clippy（-D warnings）与 gateway-core 单测；UI 通过 `tsc --noEmit && vite build`。真机上游冒烟待有环境时执行。
+
 - 存储 CRUD 扩展：providers / models / gateway_keys / meta、路由候选 SQL、`Db::with_any`
 - 异步日志管道：有界 1024 队列、≥64 行或 500ms 攒批、独立连接写、洪峰丢弃计数、`logs_recent`
 - OS 密钥环封装：set/get/delete/启动探测 + 共享 mock 单测（不触真实钥匙串）
@@ -274,11 +274,26 @@
 - UI 五标签页：网关 / 供应商 / 模型 / 日志 / 设置（React+Tailwind，M0 卡片升级）
 - src-tauri 启动自举网关密钥、密钥环先写后库+失败回滚
 
-### 待办（回家换电脑继续）
-1. 提交并推送本快照，观察 CI（macOS/Windows Rust + web）全绿
-2. 真机验收：
-   - 添加 DeepSeek 官方/中转渠道，`provider_test` 与 `provider_discover_models`
-   - DeepSeek harness / OpenAI SDK 真实流式对话，SSE 通过、usage 落日志
-   - 断流/超时故障注入（上游 500、首字节超时、中途断流）
-3. 修正 CI 暴露的跨平台问题（若有）
-4. 提交 M1 收尾 commit 并做需求覆盖矩阵更新
+### M2（多渠道路由）—— 已完成 ✅
+
+- 路由执行器：`router` 模块实现 `AttemptVerdict` 分类（Stop/Failover/Success）；`proxy` 逐渠道循环尝试
+- 故障转移规则集：{连接拒绝、超时、UpstreamAuth、RateLimit、Overloaded、上游 5xx} → 下一渠道；
+  InvalidRequest / ContextTooLong → 即刻返回不切换；首字节下发后禁止切换（SSE 管道纪律不变）
+- 集成测试（真实 HTTP 双渠道 mock）：一级恒 500 → 顺延命中二级并落日志（`provider_id` 断言）、
+  priority 反转行为反转、确定性 400 不切换不尝试二级、流式顺延 —— `tests/m2_failover.rs` 4 项全绿
+- 保活 timer：`store::retention::run_retention`（30 天 / 5 万行 / tool_id_map TTL，mock clock 可测）+
+  `spawn_retention_loop` 常驻循环（src-tauri 启动时拉起，每日一次）
+- 导出构建器下沉：`store::export::build_export_json`，单测扫描全文无 `sk-`/`keyring`/`provider/` 敏感串（M2 验收 4）
+- 鉴权限速：`server::ratelimit::AuthRateLimiter`（同源 10 次/分钟失败 → 封禁 5 分钟），
+  中间件接入 ConnectInfo（`into_make_service_with_connect_info`）；封禁期直接 429
+- 设置能力：`settings_get` / `settings_set_port` / `settings_set_logs_enabled` IPC + UI 设置页
+  （端口保存重启生效、日志开关实时切换、保留策略展示）；启动时从 meta 恢复端口与日志开关
+- 提供商健康徽标 UI：最近成功/失败徽章 + 时间 + 失败摘要（数据源为已有 last_ok_at / last_err_*）
+
+### 待办（下一里程碑）
+
+1. M3 Claude Code 接入：入站 Anthropic passthrough + count_tokens（见 §3 M3）
+2. 修复 CI 暴露的跨平台问题（若有）
+3. 真机验收 M1/M2（DeepSeek harness / OpenAI 客户端真实流式对话、断流/超时故障注入）
+
+> 历史快照：M1/M2 完成快照已并入本节；更早的记录见 git 历史。

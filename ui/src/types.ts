@@ -55,3 +55,10 @@ export interface LogRowView {
   errorKind?: string | null;
   errorSummary?: string | null;
 }
+
+export interface SettingsDto {
+  preferredPort: number;
+  logsEnabled: boolean;
+  retentionDays: number;
+  logRowCap: number;
+}

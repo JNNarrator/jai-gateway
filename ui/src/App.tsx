@@ -34,6 +34,17 @@ const btnPrimary = `${btnCls} bg-amber-600 text-black hover:bg-amber-500`;
 const btnGhost = `${btnCls} border border-neutral-700 text-neutral-300 hover:border-neutral-500`;
 const btnDanger = `${btnCls} border border-red-900/60 text-red-400 hover:bg-red-950`;
 
+function fmtClock(ms: number | null | undefined): string {
+  if (!ms) return "—";
+  return new Date(ms).toLocaleString("zh-CN", {
+    hour12: false,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 // ---------------------------------------------------------------- 页面
 
 type Tab = "gateway" | "providers" | "models" | "logs" | "settings";
@@ -369,12 +380,31 @@ function ProviderCard(props: {
             {!p.hasKey && (
               <span className="text-[11px] text-amber-500">⚠ 缺少凭据</span>
             )}
+            {p.lastOkAt && !p.lastErrAt && (
+              <span className="flex items-center gap-1 text-[11px] text-emerald-500">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                最近成功
+              </span>
+            )}
+            {p.lastErrAt && (!p.lastOkAt || (p.lastErrAt ?? 0) > (p.lastOkAt ?? 0)) && (
+              <span className="flex items-center gap-1 text-[11px] text-red-400">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-red-500" />
+                最近失败
+              </span>
+            )}
           </div>
           <div className="truncate font-mono text-xs text-neutral-500">
             {p.baseUrl}
           </div>
-          {p.lastErrMsg && (
-            <div className="mt-1 text-xs text-red-400">最近错误：{p.lastErrMsg}</div>
+          {(p.lastErrAt && (p.lastOkAt ?? 0) >= (p.lastErrAt ?? 0)) && (
+            <div className="mt-1 text-[11px] text-emerald-600/70">
+              最近成功：{fmtClock(p.lastOkAt)}
+            </div>
+          )}
+          {(p.lastErrAt && (p.lastErrAt ?? 0) > (p.lastOkAt ?? 0)) && (
+            <div className="mt-1 text-xs text-red-400">
+              最近失败（{fmtClock(p.lastErrAt)}）：{p.lastErrMsg}
+            </div>
           )}
           {props.msg && (
             <div
@@ -778,7 +808,7 @@ function LogsTab() {
         )}
       </div>
       <p className="text-xs text-neutral-600">
-        日志只含元数据（不含 prompt 与响应内容），滚动保留 30 天 / 上限 50,000 行（清理策略随 M7 生效）。
+        日志只含元数据（不含 prompt 与响应内容），滚动保留 30 天 / 上限 50,000 行，每日自动清理（策略见「设置」页）。
       </p>
     </div>
   );
@@ -789,11 +819,26 @@ function LogsTab() {
 function SettingsTab() {
   const [raw, setRaw] = useState("");
   const [saved, setSaved] = useState(false);
+  const [port, setPort] = useState(1314);
+  const [logsEnabled, setLogsEnabled] = useState(true);
+  const [retentionDays, setRetentionDays] = useState(30);
+  const [logRowCap, setLogRowCap] = useState(50000);
+  const [portMsg, setPortMsg] = useState("");
+  const [logMsg, setLogMsg] = useState("");
 
   useEffect(() => {
     api
       .corsAllowGet()
       .then((l) => setRaw(l.join("\n")))
+      .catch(() => {});
+    api
+      .settingsGet()
+      .then((s) => {
+        setPort(s.preferredPort);
+        setLogsEnabled(s.logsEnabled);
+        setRetentionDays(s.retentionDays);
+        setLogRowCap(s.logRowCap);
+      })
       .catch(() => {});
   }, []);
 
@@ -805,9 +850,70 @@ function SettingsTab() {
     setTimeout(() => setSaved(false), 1500);
   }
 
+  async function savePort() {
+    setPortMsg("");
+    const n = Number(port);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+      setPortMsg("端口需为 1–65535 的整数");
+      return;
+    }
+    await api.settingsSetPort(n);
+    setPortMsg("已保存：重启网关后生效（端口占用自动顺延）");
+  }
+
+  async function toggleLogs(on: boolean) {
+    await api.settingsSetLogsEnabled(on);
+    setLogsEnabled(on);
+    setLogMsg(on ? "日志记录已开启" : "日志记录已关闭（新请求不再落库）");
+    setTimeout(() => setLogMsg(""), 2500);
+  }
+
   return (
     <div className="mx-auto max-w-2xl space-y-4">
       <h1 className="text-lg font-semibold">设置</h1>
+
+      <Card title="网关端口">
+        <div className="flex items-center gap-2">
+          <input
+            className={`${inputCls} w-32 font-mono`}
+            type="number"
+            value={port}
+            onChange={(e) => setPort(Number(e.target.value))}
+          />
+          <button className={btnPrimary} onClick={savePort}>
+            保存
+          </button>
+          <span className="text-xs text-neutral-500">
+            默认 1314；被占用时顺延，实际端口见「网关」页
+          </span>
+        </div>
+        {portMsg && <div className="mt-2 text-xs text-emerald-400">{portMsg}</div>}
+      </Card>
+
+      <Card title="请求日志">
+        <div className="flex items-center gap-3">
+          <button
+            className={logsEnabled ? btnPrimary : btnGhost}
+            onClick={() => toggleLogs(true)}
+          >
+            记录
+          </button>
+          <button
+            className={!logsEnabled ? btnPrimary : btnGhost}
+            onClick={() => toggleLogs(false)}
+          >
+            关闭
+          </button>
+          <span className="text-xs text-neutral-500">
+            当前：{logsEnabled ? "记录中" : "已关闭"}
+          </span>
+        </div>
+        <p className="mt-3 text-xs leading-relaxed text-neutral-500">
+          保留策略：{retentionDays} 天 / 上限 {logRowCap.toLocaleString("zh-CN")} 行
+          （每日自动清理）。日志仅含元数据，不含 prompt 与响应明文。
+        </p>
+        {logMsg && <div className="mt-2 text-xs text-emerald-400">{logMsg}</div>}
+      </Card>
 
       <Card title="浏览器跨域白名单（CORS）">
         <p className="mb-3 text-xs leading-relaxed text-neutral-500">
