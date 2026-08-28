@@ -659,8 +659,19 @@ function McpForm({
   const [command, setCommand] = useState(initial?.command ?? "");
   const [args, setArgs] = useState(initial?.args ?? "");
   const [url, setUrl] = useState(initial?.url ?? "");
+  const [argsErr, setArgsErr] = useState("");
 
   async function submit() {
+    if (kind === "stdio" && args.trim()) {
+      try {
+        const parsed = JSON.parse(args);
+        if (!Array.isArray(parsed)) throw new Error("必须是数组");
+        setArgsErr("");
+      } catch {
+        setArgsErr("参数需为合法 JSON 数组，例如 [\"-y\",\"包名\"]");
+        return;
+      }
+    }
     if (initial) {
       await api.mcpUpdate({
         id: initial.id,
@@ -704,7 +715,8 @@ function McpForm({
           </label>
           <label className="text-xs text-neutral-400">
             参数（JSON 数组）
-            <input className={`${inputCls} mt-1 font-mono`} value={args} onChange={(e) => setArgs(e.target.value)} placeholder='["-y","@modelcontextprotocol/server-filesystem"]' />
+            <input className={`${inputCls} mt-1 font-mono`} value={args} onChange={(e) => { setArgs(e.target.value); setArgsErr(""); }} placeholder='["-y","@modelcontextprotocol/server-filesystem"]' />
+            {argsErr && <span className="mt-1 block text-[11px] text-red-400">{argsErr}</span>}
           </label>
         </>
       ) : (
