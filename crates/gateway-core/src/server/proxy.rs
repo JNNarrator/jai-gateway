@@ -625,6 +625,12 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
         }
         _ => (None, model.clone()),
     };
+    // 限定名 `供应商/模型` 只用于 JAI 路由；发给上游时必须换回真实模型名。
+    let body = if provider_filter.is_some() {
+        rewrite_body_model(&body, &model_key)
+    } else {
+        body
+    };
     let mut candidates = {
         let db = ctx.db.clone();
         let model_key2 = model_key.clone();
@@ -647,6 +653,9 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
     if let Some(provider_name) = &provider_filter {
         candidates.retain(|c| c.provider_name == *provider_name);
     }
+    // Responses 入站优先走同协议族直通（openai_responses），
+    // 避免同名模型被 openai_compat 转换渠道按优先级截胡导致 400。
+    candidates.sort_by_key(|c| c.family != wire.family());
 
     if candidates.is_empty() {
         let msg = format!("模型 {model:?} 不存在或其渠道未启用");
@@ -796,6 +805,19 @@ fn forward_inbound_headers(
         }
     }
     req
+}
+
+/// 把请求体里的 `model` 字段替换为上游真实模型名（去掉 `供应商/` 前缀）。
+/// 仅用于限定 ID；解析失败时原样返回，避免破坏透传。
+fn rewrite_body_model(body: &Bytes, new_model: &str) -> Bytes {
+    let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
+        return body.clone();
+    };
+    v["model"] = Value::String(new_model.to_string());
+    match serde_json::to_vec(&v) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(_) => body.clone(),
+    }
 }
 
 /// 尝试单渠道（同族直通）。失败已按 router 分类，只返回「可转移」失败。
@@ -1139,7 +1161,7 @@ async fn try_converted_candidate(
             };
             let url = url_join(&cand.base_url, "/v1/messages");
             // 鉴权：x-api-key + anthropic-version（代理调用上游）
-            let out = ctx.http.post(&url).header("x-api-key", "");
+            let out = ctx.http.post(&url);
             (url, (out, body))
         }
         "gemini" => {
@@ -1171,7 +1193,7 @@ async fn try_converted_candidate(
                 url.push_str("?alt=sse");
             }
             // 鉴权：x-goog-api-key
-            let out = ctx.http.post(&url).header("x-goog-api-key", "");
+            let out = ctx.http.post(&url);
             (url, (out, body))
         }
         "openai_compat" => {
@@ -1188,7 +1210,7 @@ async fn try_converted_candidate(
                 }
             };
             let url = url_join(&cand.base_url, "/chat/completions");
-            let out = ctx.http.post(&url).bearer_auth("");
+            let out = ctx.http.post(&url);
             (url, (out, body))
         }
         other => {

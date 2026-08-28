@@ -19,6 +19,21 @@
     2. 顺带修复直通转发丢失 `Content-Type`/`Accept`/`User-Agent` 等头的问题；
     3. ✅ 已用 `dsh --profile headless "直接回复：JAI链路正常"` 实测通过，返回 `JAI链路正常`，退出码 0。
 
+- [x] 3. dsh 多供应商后 400（ALB / 模型不可用）
+  - 现象：
+    ```
+    OpenAI API error (400): <html>...<center>alb</center>...
+    OpenAI API error (400): {"code":"MODEL_NOT_AVAILABLE","message":"模型不可用：基元律动/glm-5",...}
+    ```
+  - 根因：
+    1. 跨族转换路径给上游发了两个 `Authorization` 头（一个空占位、一个真实 Key），被 ALB 拒 400；
+    2. 限定模型名 `供应商/模型` 被原样转发给上游，上游不认 `基元律动/glm-5`。
+  - 已解决：
+    1. 转换路径去掉空占位鉴权头，只发一个真实 Authorization；
+    2. 路由前把 `供应商/模型` 重写为真实模型名 `glm-5` 再转发；
+    3. Responses 入站优先同协议族直通，避免被跨族渠道截胡。
+  - ✅ 已用 `dsh --profile headless` 实测退出码 0。
+
 ## 2. 优化清单
 
 - [x] 1. 创建供应商弹框应该有按钮可以测试能不能获取到模型。
