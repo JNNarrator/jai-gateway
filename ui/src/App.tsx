@@ -2005,6 +2005,11 @@ function SettingsTab() {
       setPortMsg("端口需为 1–65535 的整数");
       return;
     }
+    if (await api.portInUse(n)) {
+      if (!confirm(`端口 ${n} 当前被占用，保存后网关会自动顺延到可用端口。继续？`)) {
+        return;
+      }
+    }
     await api.settingsSetPort(n);
     setPortMsg("已保存：重启网关后生效（端口占用自动顺延）");
     toast("端口已保存");

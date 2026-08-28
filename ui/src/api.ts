@@ -146,5 +146,6 @@ export const api = {
   settingsSetRetention: (days: number, rowCap: number) =>
     invoke<void>("settings_set_retention", { days, rowCap }),
   readEnvVar: (name: string) => invoke<string>("read_env_var", { name }),
+  portInUse: (port: number) => invoke<boolean>("port_in_use", { port }),
   families: () => invoke<string[]>("families"),
 };

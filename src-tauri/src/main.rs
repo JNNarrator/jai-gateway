@@ -1185,6 +1185,12 @@ fn read_env_var(name: String) -> Result<String, String> {
     std::env::var(&name).map_err(|e| format!("读取环境变量 {name} 失败: {e}"))
 }
 
+/// 检查端口是否被占用（用于设置页保存前提示）。
+#[tauri::command]
+fn port_in_use(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
+
 // ---------------------------------------------------------------- helpers
 
 fn join_err(e: tokio::task::JoinError) -> String {
@@ -1564,6 +1570,7 @@ fn main() {
             settings_set_logs_enabled,
             settings_set_retention,
             read_env_var,
+            port_in_use,
             families,
         ])
         .run(tauri::generate_context!())
