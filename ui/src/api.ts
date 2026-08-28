@@ -11,6 +11,7 @@ import type {
   ProviderDto,
   SettingsDto,
   SkillRow,
+  UsageStatRow,
   WebDavConfigDto,
 } from "./types";
 
@@ -78,6 +79,7 @@ export const api = {
 
   // 日志 / 导出 / 设置 / WebDAV
   logsRecent: (limit = 100) => invoke<LogRowView[]>("logs_recent", { limit }),
+  statsUsage: (days = 7) => invoke<UsageStatRow[]>("stats_usage", { days }),
   exportConfigJson: () => invoke<string>("export_config_json"),
   exportConfigToFile: () => invoke<string>("export_config_to_file"),
   revealInFolder: (path: string) => invoke<void>("reveal_in_folder", { path }),

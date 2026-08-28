@@ -613,6 +613,17 @@ async fn logs_recent(
         .map_err(join_err)?
 }
 
+#[tauri::command]
+async fn stats_usage(
+    core: State<'_, AppCore>,
+    days: i64,
+) -> Result<Vec<logs::UsageStatRow>, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || logs::usage_stats(&db, days).map_err(|e| e.to_string()))
+        .await
+        .map_err(join_err)?
+}
+
 /// 导出 JSON（storage §8 语义：meta+providers+models，零敏感字段——
 /// 构建逻辑在 gateway-core::store::export，保证单测覆盖「全文无敏感串」）。
 #[tauri::command]
@@ -1661,6 +1672,7 @@ fn main() {
             gateway_key_reveal,
             gateway_key_regenerate,
             logs_recent,
+            stats_usage,
             export_config_json,
             export_config_to_file,
             reveal_in_folder,

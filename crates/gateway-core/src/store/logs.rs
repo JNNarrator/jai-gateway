@@ -240,6 +240,49 @@ pub fn logs_recent(db: &super::Db, limit: i64) -> Result<Vec<LogRowView>, StoreE
     })
 }
 
+/// 用量统计行：按天聚合请求数 / token 用量。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageStatRow {
+    /// 自 Unix epoch 起的天序号（UTC）
+    pub day: i64,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+}
+
+/// 最近 N 天用量聚合（数据源：request_logs 已落库的 usage 元数据）。
+pub fn usage_stats(db: &super::Db, days: i64) -> Result<Vec<UsageStatRow>, StoreError> {
+    let days = days.clamp(1, 365);
+    let since = super::now_ms() - days * 86_400_000;
+    db.with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT (ts / 86400000) AS day,
+                    COUNT(*),
+                    COALESCE(SUM(usage_input), 0),
+                    COALESCE(SUM(usage_output), 0),
+                    COALESCE(SUM(usage_cache_read), 0)
+             FROM request_logs
+             WHERE ts >= ?1
+             GROUP BY day
+             ORDER BY day ASC",
+        )?;
+        let rows = stmt
+            .query_map([since], |r| {
+                Ok(UsageStatRow {
+                    day: r.get(0)?,
+                    requests: r.get(1)?,
+                    input_tokens: r.get(2)?,
+                    output_tokens: r.get(3)?,
+                    cache_read_tokens: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +308,40 @@ mod tests {
             error_kind: None,
             error_summary: None,
         }
+    }
+
+    #[test]
+    fn usage_stats_aggregates_by_day() {
+        let db = Db::in_memory().unwrap();
+        let now = crate::store::now_ms();
+        db.with(|c| {
+            for i in 0..2i64 {
+                c.execute(
+                    "INSERT INTO request_logs(ts,inbound_family,route_mode,model_name,http_status,usage_input,usage_output,duration_ms,is_stream,tool_calls)                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    rusqlite::params![
+                        now,
+                        "openai",
+                        "passthrough",
+                        "gpt-4o",
+                        200,
+                        10 + i,
+                        5 + i,
+                        100,
+                        1,
+                        0
+                    ],
+                )
+                .unwrap();
+            }
+            Ok::<_, StoreError>(())
+        })
+        .unwrap();
+
+        let rows = usage_stats(&db, 7).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requests, 2);
+        assert_eq!(rows[0].input_tokens, 21);
+        assert_eq!(rows[0].output_tokens, 11);
     }
 
     #[tokio::test(flavor = "multi_thread")]

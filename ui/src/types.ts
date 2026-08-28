@@ -41,6 +41,14 @@ export interface GatewayKeyInfo {
   key: string;
 }
 
+export interface UsageStatRow {
+  day: number;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
+
 export interface LogRowView {
   id: number;
   ts: number;
