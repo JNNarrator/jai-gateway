@@ -934,13 +934,20 @@ function SkillsTab() {
         </div>
       )}
       {showNew && (
-        <SkillForm
-          onCancel={() => setShowNew(false)}
-          onDone={() => {
-            setShowNew(false);
-            refresh();
-          }}
-        />
+        <div
+          className="fixed inset-0 z-40 flex items-start justify-center bg-black/60 p-6 pt-16"
+          onClick={() => setShowNew(false)}
+        >
+          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+            <SkillForm
+              onCancel={() => setShowNew(false)}
+              onDone={() => {
+                setShowNew(false);
+                refresh();
+              }}
+            />
+          </div>
+        </div>
       )}
       <div className="space-y-3">
         {list.map((s) => (
