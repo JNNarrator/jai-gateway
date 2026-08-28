@@ -636,7 +636,7 @@ function McpTab() {
         {list.length === 0 && !showNew && (
           <Card title="还没有 MCP Server">
             <p className="text-sm text-neutral-500">
-              添加 stdio / SSE / HTTP 类型的 MCP Server 配置，当前版本先做管理与启停。
+              点击上方按钮添加一个 stdio / SSE / HTTP 类型的服务。
             </p>
           </Card>
         )}
@@ -683,7 +683,7 @@ function McpForm({
   }
 
   return (
-    <div className="mt-3 grid grid-cols-2 gap-3 rounded border-t border-neutral-800 pt-4">
+    <div className="mt-3 grid grid-cols-1 gap-3 rounded border-t border-neutral-800 pt-4 md:grid-cols-2">
       <label className="text-xs text-neutral-400">
         名称
         <input className={`${inputCls} mt-1`} value={name} onChange={(e) => setName(e.target.value)} />
@@ -921,7 +921,7 @@ function SkillForm({
   }
 
   return (
-    <div className="mt-3 grid grid-cols-2 gap-3 rounded border-t border-neutral-800 pt-4">
+    <div className="mt-3 grid grid-cols-1 gap-3 rounded border-t border-neutral-800 pt-4 md:grid-cols-2">
       <label className="text-xs text-neutral-400">
         名称
         <input className={`${inputCls} mt-1`} value={name} onChange={(e) => setName(e.target.value)} />
