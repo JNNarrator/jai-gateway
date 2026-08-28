@@ -601,6 +601,17 @@ function McpTab() {
                 className={btnGhost}
                 onClick={() =>
                   act(async () => {
+                    await api.mcpToolsList(m.id);
+                    toast(`MCP「${m.name}」连接正常`);
+                  })
+                }
+              >
+                测试连接
+              </button>
+              <button
+                className={btnGhost}
+                onClick={() =>
+                  act(async () => {
                     const tools = await api.mcpToolsList(m.id);
                     setMsg(
                       tools.length
@@ -1974,14 +1985,18 @@ function SettingsTab() {
         <p className="mb-2 text-xs text-neutral-500">
           当前凭据存储：{" "}
           <span className={vaultKind === "file" ? "text-amber-400" : "text-emerald-400"}>
-            {vaultKind === "keyring" ? "系统钥匙串" : vaultKind === "file" ? "文件降级（0600）" : vaultKind}
+            {vaultKind === "keyring"
+              ? "🔑 系统钥匙串"
+              : vaultKind === "file"
+                ? "📁 文件降级（0600）"
+                : vaultKind}
           </span>
         </p>
         <ul className="list-disc space-y-1.5 pl-5 text-xs leading-relaxed text-neutral-500">
-          <li>上游 API Key：优先保存在 macOS 钥匙串 / Windows 凭据管理器，数据库只存引用。</li>
-          <li>若系统凭据存储不可用（如沙箱/CI 权限受限），自动降级为数据目录下的 vault_fallback.json（Unix 0600）。</li>
-          <li>网关 Key sk-jai-*：按设计决策明文存放本地 SQLite（非敏感级别），前缀展示、轮换采用吊销+新建保留审计痕迹、永不导出。</li>
-          <li>删除供应商会同时清除对应凭据。</li>
+          <li>🔑 上游 API Key：优先保存在 macOS 钥匙串 / Windows 凭据管理器，数据库只存引用。</li>
+          <li>📁 若系统凭据存储不可用（如沙箱/CI 权限受限），自动降级为数据目录下的 vault_fallback.json（Unix 0600）。</li>
+          <li>🔐 网关 Key sk-jai-*：按设计决策明文存放本地 SQLite（非敏感级别），前缀展示、轮换采用吊销+新建保留审计痕迹、永不导出。</li>
+          <li>🗑 删除供应商会同时清除对应凭据。</li>
         </ul>
       </Card>
 
