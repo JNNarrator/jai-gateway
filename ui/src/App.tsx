@@ -1693,9 +1693,10 @@ function LogsTab() {
   const [intervalMs, setIntervalMs] = useState(3000);
   const [modelFilter, setModelFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  const [limit, setLimit] = useState(500);
 
   async function refresh() {
-    setRows(await api.logsRecent(500));
+    setRows(await api.logsRecent(limit));
   }
 
   useEffect(() => {
@@ -1703,7 +1704,7 @@ function LogsTab() {
     if (!auto) return;
     const t = setInterval(refresh, intervalMs);
     return () => clearInterval(t);
-  }, [auto, intervalMs]);
+  }, [auto, intervalMs, limit]);
 
   const filtered = rows.filter((r) => {
     if (modelFilter && !r.modelName.toLowerCase().includes(modelFilter.toLowerCase()))
@@ -1832,6 +1833,13 @@ function LogsTab() {
         {filtered.length === 0 && (
           <div className="px-4 py-10 text-center text-sm text-neutral-500">
             没有匹配的日志。用任意 OpenAI 兼容客户端打一发试试。
+          </div>
+        )}
+        {filtered.length > 0 && (
+          <div className="flex justify-center border-t border-neutral-800/70 py-2">
+            <button className={btnGhost} onClick={() => setLimit(limit + 500)}>
+              加载更多（当前显示 {rows.length} 条）
+            </button>
           </div>
         )}
       </div>
