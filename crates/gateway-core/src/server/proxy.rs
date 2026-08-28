@@ -58,13 +58,13 @@ pub enum InboundWire {
 }
 
 impl InboundWire {
-    /// 要求的渠道协议族（providers.family 值）。Responses 线返回哨兵值，
-    /// 使其永远走跨族转换路径（Responses 不是上游 chat 直通形状）。
+    /// 要求的渠道协议族（providers.family 值）。Responses 线对应新增的
+    /// `openai_responses` 上游族；若渠道是 openai_compat 则走跨族转换。
     pub fn family(&self) -> &'static str {
         match self {
             InboundWire::OpenAi => "openai_compat",
             InboundWire::Anthropic => "anthropic",
-            InboundWire::Responses => "responses",
+            InboundWire::Responses => "openai_responses",
         }
     }
 

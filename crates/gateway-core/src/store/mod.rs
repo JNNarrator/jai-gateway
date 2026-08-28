@@ -44,19 +44,25 @@ pub fn open_and_migrate(path: &str) -> Result<Connection, StoreError> {
 
 /// 在既有连接上执行迁移（供测试注入内存库）。
 pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
-    let mut current: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    for (idx, (name, sql)) in migrations::MIGRATIONS.iter().enumerate() {
-        let version = (idx + 1) as u32;
-        if version <= current {
-            continue;
+    // 0003 需要重建 providers 表；迁移期临时关闭外键，跑完恢复
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = (|| -> Result<(), StoreError> {
+        let mut current: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        for (idx, (name, sql)) in migrations::MIGRATIONS.iter().enumerate() {
+            let version = (idx + 1) as u32;
+            if version <= current {
+                continue;
+            }
+            conn.execute_batch(&format!(
+                "BEGIN;\n{sql}\nPRAGMA user_version = {version};\nCOMMIT;"
+            ))?;
+            current = version;
+            eprintln!("[store] migration applied: {name}");
         }
-        conn.execute_batch(&format!(
-            "BEGIN;\n{sql}\nPRAGMA user_version = {version};\nCOMMIT;"
-        ))?;
-        current = version;
-        eprintln!("[store] migration applied: {name}");
-    }
-    Ok(())
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    result
 }
 
 // ================================================================ 共享句柄

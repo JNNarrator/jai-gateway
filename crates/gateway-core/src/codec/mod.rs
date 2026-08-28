@@ -22,6 +22,7 @@ pub mod responses;
 #[serde(rename_all = "snake_case")]
 pub enum Family {
     OpenAiCompat,
+    OpenAiResponses,
     Anthropic,
     Gemini,
 }
@@ -31,6 +32,7 @@ impl Family {
     pub fn as_db_str(&self) -> &'static str {
         match self {
             Family::OpenAiCompat => "openai_compat",
+            Family::OpenAiResponses => "openai_responses",
             Family::Anthropic => "anthropic",
             Family::Gemini => "gemini",
         }
@@ -39,6 +41,7 @@ impl Family {
     pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "openai_compat" => Some(Family::OpenAiCompat),
+            "openai_responses" => Some(Family::OpenAiResponses),
             "anthropic" => Some(Family::Anthropic),
             "gemini" => Some(Family::Gemini),
             _ => None,
@@ -52,7 +55,12 @@ mod tests {
 
     #[test]
     fn family_roundtrip_db_str() {
-        for f in [Family::OpenAiCompat, Family::Anthropic, Family::Gemini] {
+        for f in [
+            Family::OpenAiCompat,
+            Family::OpenAiResponses,
+            Family::Anthropic,
+            Family::Gemini,
+        ] {
             assert_eq!(Family::from_db_str(f.as_db_str()), Some(f));
         }
         assert_eq!(Family::from_db_str("bogus"), None);

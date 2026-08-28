@@ -808,6 +808,7 @@ function SkillForm({
 
 const FAMILY_LABEL: Record<string, string> = {
   openai_compat: "OpenAI 兼容",
+  openai_responses: "OpenAI Responses",
   anthropic: "Anthropic",
   gemini: "Gemini",
 };
@@ -1086,7 +1087,8 @@ function NewProviderForm({
         <label className="col-span-1 text-xs text-neutral-400">
           协议族
           <select className={`${inputCls} mt-1`} value={family} onChange={(e) => setFamily(e.target.value)}>
-            <option value="openai_compat">OpenAI 兼容</option>
+            <option value="openai_compat">OpenAI 兼容（chat/completions）</option>
+            <option value="openai_responses">OpenAI Responses（/responses）</option>
             <option value="anthropic">Anthropic</option>
             <option value="gemini">Gemini</option>
           </select>

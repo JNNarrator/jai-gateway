@@ -13,7 +13,11 @@
     ```
     OpenAI API error (400): {"code":null,"message":"<html>... <title>400 Bad Request</title> ... cloudflare ...","type":"invalid_request_error"}
     ```
-  - 已解决：直通转发原来只带鉴权头和 extra_headers，丢失了下游的 `Content-Type`、`Accept`、`User-Agent` 等头，被 Cloudflare 侧 400 拒绝。现已把安全请求头透传给上游（排除 Authorization / x-api-key，避免泄漏网关 Key）；**待真机 dsh 复测确认**。
+  - 根因：dsh 走 OpenAI Responses API（`/v1/responses`），one-model 也是 Responses 上游；但 JAI 把该渠道按 `openai_compat` 转成 `/chat/completions`，被上游 Cloudflare 拒 400。
+  - 已解决：
+    1. 新增 `openai_responses` 协议族 + 迁移 0003，Responses 入站遇到该协议族直接字节透传到 `/responses`；
+    2. 顺带修复直通转发丢失 `Content-Type`/`Accept`/`User-Agent` 等头的问题；
+    3. ✅ 已用 `dsh --profile headless "直接回复：JAI链路正常"` 实测通过，返回 `JAI链路正常`，退出码 0。
 
 ## 2. 优化清单
 

@@ -1033,7 +1033,12 @@ async fn cors_allow_set(core: State<'_, AppCore>, list: Vec<String>) -> Result<(
 
 #[tauri::command]
 fn families() -> Vec<&'static str> {
-    vec!["openai_compat", "anthropic", "gemini"]
+    vec![
+        "openai_compat",
+        "openai_responses",
+        "anthropic",
+        "gemini",
+    ]
 }
 
 /// 当前凭据存储方式：`keyring` 或 `file`（降级）。
