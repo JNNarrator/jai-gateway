@@ -22,6 +22,10 @@ function copyText(text: string) {
   );
 }
 
+function goTab(tab: string) {
+  window.dispatchEvent(new CustomEvent("jai-goto-tab", { detail: { tab } }));
+}
+
 // ---------------------------------------------------------------- 通用小组件
 
 function Card({
@@ -84,8 +88,16 @@ export default function App() {
       setToastMsg({ msg: detail.msg, kind: detail.kind ?? "ok" });
       window.setTimeout(() => setToastMsg(null), 2500);
     };
+    const onGoto = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { tab: string };
+      setTab(detail.tab as Tab);
+    };
     window.addEventListener("jai-toast", onToast);
-    return () => window.removeEventListener("jai-toast", onToast);
+    window.addEventListener("jai-goto-tab", onGoto);
+    return () => {
+      window.removeEventListener("jai-toast", onToast);
+      window.removeEventListener("jai-goto-tab", onGoto);
+    };
   }, []);
 
   return (
@@ -453,13 +465,16 @@ function SyncTab() {
           onChange={(e) => setImportText(e.target.value)}
           placeholder="粘贴从另一台设备导出的 jai-export JSON…"
         />
-        <div className="mt-3 flex gap-2">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           <button className={btnPrimary} onClick={doImport}>
             导入
           </button>
           <span className="text-xs text-neutral-500">
             导出入口仍在「网关」页。
           </span>
+          <button className={btnGhost} onClick={() => goTab("gateway")}>
+            前往网关页 →
+          </button>
         </div>
       </Card>
 
@@ -2024,6 +2039,9 @@ function SettingsTab() {
           <li>🔐 网关 Key sk-jai-*：按设计决策明文存放本地 SQLite（非敏感级别），前缀展示、轮换采用吊销+新建保留审计痕迹、永不导出。</li>
           <li>🗑 删除供应商会同时清除对应凭据。</li>
         </ul>
+        <button className={`${btnGhost} mt-3`} onClick={() => goTab("providers")}>
+          前往供应商页补录/查看凭据 →
+        </button>
       </Card>
 
       <Card title="数据位置">
