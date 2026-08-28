@@ -7,8 +7,10 @@
 //! 说明：这是轻量客户端，覆盖 Codex/Claude 类 tool calling 需要的
 //! `initialize`、`tools/list`、`tools/call` 子集，不承载完整 MCP 生命周期。
 
+use std::collections::HashMap;
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -27,6 +29,38 @@ pub struct McpTool {
 pub struct McpServerTool {
     pub server: McpServerRow,
     pub tool: McpTool,
+}
+
+/// MCP 工具列表缓存 TTL：避免每个请求都去 spawn/请求一次 MCP Server。
+const MCP_TOOL_CACHE_TTL: Duration = Duration::from_secs(30);
+
+struct CachedTools {
+    at: Instant,
+    tools: Vec<McpTool>,
+}
+
+static TOOL_CACHE: OnceLock<Mutex<HashMap<String, CachedTools>>> = OnceLock::new();
+
+fn tool_cache_get(server_id: &str) -> Option<Vec<McpTool>> {
+    let cache = TOOL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = guard.get(server_id)?;
+    if entry.at.elapsed() > MCP_TOOL_CACHE_TTL {
+        return None;
+    }
+    Some(entry.tools.clone())
+}
+
+fn tool_cache_put(server_id: &str, tools: Vec<McpTool>) {
+    let cache = TOOL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    guard.insert(
+        server_id.to_string(),
+        CachedTools {
+            at: Instant::now(),
+            tools,
+        },
+    );
 }
 
 /// 收集所有启用 MCP Server 的工具列表。
@@ -53,8 +87,20 @@ pub async fn collect_enabled_tools(db: &crate::store::Db) -> Vec<McpServerTool> 
 
     let mut out = Vec::new();
     for server in servers.into_iter().filter(|s| s.enabled) {
+        // 缓存命中：直接用上次成功拉到的工具列表，避免每个请求都启动 MCP 子进程/网络请求
+        if let Some(tools) = tool_cache_get(&server.id) {
+            for tool in tools {
+                out.push(McpServerTool {
+                    server: server.clone(),
+                    tool,
+                });
+            }
+            continue;
+        }
+
         match tokio::time::timeout(Duration::from_secs(10), list_tools(&server)).await {
             Ok(Ok(tools)) => {
+                tool_cache_put(&server.id, tools.clone());
                 for tool in tools {
                     out.push(McpServerTool {
                         server: server.clone(),
@@ -275,6 +321,21 @@ async fn run_http_jsonrpc(url: &str, method: &str, params: &Value) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_cache_returns_recent_tools() {
+        tool_cache_put(
+            "server-1",
+            vec![McpTool {
+                name: "cached_tool".into(),
+                description: Some("desc".into()),
+                input_schema: json!({"type":"object"}),
+            }],
+        );
+        let tools = tool_cache_get("server-1").expect("缓存应命中");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "cached_tool");
+    }
 
     #[test]
     fn parse_tools_list_extracts_tools() {
