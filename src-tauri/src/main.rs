@@ -614,7 +614,7 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
             .arg(&path)
             .spawn()
             .map_err(|e| format!("打开 Finder 失败: {e}"))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "windows")]
     {
@@ -623,7 +623,7 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
             .arg(&path)
             .spawn()
             .map_err(|e| format!("打开资源管理器失败: {e}"))?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

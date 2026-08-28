@@ -27,7 +27,7 @@ pub async fn discover_models(
     secret: Option<&str>,
 ) -> Result<Vec<DiscoveredModel>, String> {
     match family {
-        "openai_compat" => {
+        "openai_compat" | "openai_responses" => {
             let url = crate::codec::openai::url_join(base_url, "/models");
             let mut req = client.get(&url).timeout(DISCOVERY_TIMEOUT);
             if let Some(k) = secret {
