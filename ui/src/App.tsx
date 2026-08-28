@@ -735,6 +735,7 @@ function SkillsTab() {
   const [msg, setMsg] = useState("");
   const [showNew, setShowNew] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function refresh() {
@@ -754,10 +755,11 @@ function SkillsTab() {
     }
   }
 
-  async function importZip(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    e.target.value = "";
-    if (!file) return;
+  async function importFile(file: File) {
+    if (!file.name.toLowerCase().endsWith(".zip")) {
+      setErr("请选择 ZIP 文件");
+      return;
+    }
     setImporting(true);
     setErr("");
     setMsg("");
@@ -765,7 +767,7 @@ function SkillsTab() {
       const buf = await file.arrayBuffer();
       const data = Array.from(new Uint8Array(buf));
       const n = await api.skillImportZip(data);
-      setMsg(`已从 ${file.name} 导入 ${n} 个技能`);
+      setMsg(`已从 ${file.name}（${(file.size / 1024).toFixed(1)} KB）导入 ${n} 个技能`);
       await refresh();
     } catch (e2) {
       setErr(String(e2));
@@ -774,8 +776,37 @@ function SkillsTab() {
     }
   }
 
+  async function importZip(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (file) await importFile(file);
+  }
+
+  async function createExample() {
+    await api.skillCreate({
+      name: "代码审查",
+      description: "一个示例技能：按提交变更做代码评审",
+      content: "请按以下步骤进行代码审查：\n1. 阅读 diff\n2. 指出风险\n3. 给出修改建议",
+    });
+    toast("示例技能已创建");
+    await refresh();
+  }
+
   return (
-    <div className="mx-auto max-w-3xl space-y-4">
+    <div
+      className={`mx-auto max-w-3xl space-y-4 ${dragOver ? "opacity-80" : ""}`}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const file = e.dataTransfer.files?.[0];
+        if (file) importFile(file);
+      }}
+    >
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">技能（Skill）管理</h1>
         <div className="flex gap-2">
@@ -855,8 +886,11 @@ function SkillsTab() {
         {list.length === 0 && !showNew && (
           <Card title="还没有技能">
             <p className="text-sm text-neutral-500">
-              技能即一组可复用的指令/提示词/工作流定义；当前版本先做管理与启停。
+              技能是一组可复用的指令/提示词/工作流定义，点击添加或导入 ZIP 开始。
             </p>
+            <button className={`${btnGhost} mt-3`} onClick={createExample}>
+              ✨ 创建示例技能
+            </button>
           </Card>
         )}
       </div>
