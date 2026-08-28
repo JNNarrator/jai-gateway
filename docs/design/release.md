@@ -24,7 +24,8 @@
 
 ## 3. 发布前门禁
 
-- [ ] `bash scripts/regression.sh` 全绿
+- [x] 自动化门禁脚本：`bash scripts/release_check.sh`（工作区干净、版本号、CHANGELOG、tag、全量回归）
+- [ ] `bash scripts/regression.sh` 全绿（已被 release_check.sh 覆盖）
 - [ ] 黄金夹具矩阵：M2/M3/M4/M5/M6/M7/M8 集成测试全绿
 - [ ] 真机验收：Claude Code、Codex、DeepSeek harness、zcode 各至少一例
 - [ ] 48h 本机常驻观察零崩溃

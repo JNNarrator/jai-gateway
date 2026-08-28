@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 - 用量统计：新增「统计」页，展示近 7/30/90 天请求数与 Token 用量柱状图
 - 旧版 `POST /v1/completions`：支持 openai_compat 渠道字节级直通
 - MCP 工具列表缓存：自动合并路径增加 30s TTL 缓存，避免每个请求都去 MCP Server 拉取工具
+- 发布门禁脚本 `scripts/release_check.sh`：一键检查工作区/版本/CHANGELOG/tag 并跑全量回归
 - 技能（skill）管理：`skills` 表 + CRUD IPC + UI「技能」页；跨族转换请求自动注入启用技能到 system
 
 ### Changed
