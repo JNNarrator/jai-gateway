@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -573,6 +573,8 @@ pub async fn anthropic_count_tokens(State(_ctx): State<GatewayCtx>, req: Request
 /// 直通主流程：路由候选 → 逐渠道尝试（故障转移）。
 async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response {
     let started = Instant::now();
+    // 直通路径需要把下游安全请求头带到上游（Content-Type/Accept 等）
+    let inbound_headers = req.headers().clone();
 
     let body = match to_bytes(req.into_body(), MAX_REQUEST_BODY).await {
         Ok(b) => b,
@@ -680,7 +682,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             continue;
         }
 
-        match try_candidate(&ctx, wire, &peeked, cand, &body, started).await {
+        match try_candidate(&ctx, wire, &peeked, cand, &body, &inbound_headers, started).await {
             Attempt::Delivered(resp) => return resp,
             Attempt::Failed {
                 kind,
@@ -745,6 +747,42 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
     )
 }
 
+/// 把下游安全请求头透传给上游（同族字节直通时需要保留，例如
+/// `Content-Type: application/json` 与流式用的 `Accept: text/event-stream`）。
+/// 坚决不透传 `Authorization` / `x-api-key`（避免把网关 Key 泄漏到上游）。
+fn forward_inbound_headers(
+    mut req: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    const FORWARD: [&str; 6] = [
+        "content-type",
+        "accept",
+        "accept-language",
+        "user-agent",
+        "x-request-id",
+        "x-stainless-*",
+    ];
+    for key in &FORWARD {
+        if *key == "x-stainless-*" {
+            // 部分 SDK（Anthropic/OpenAI 官方 SDK）会带多个 x-stainless-* 头，
+            // 直接按前缀透传，方便上游风控识别为官方客户端。
+            for (name, value) in headers.iter() {
+                let name_lower = name.as_str().to_ascii_lowercase();
+                if name_lower.starts_with("x-stainless-")
+                    || name_lower.starts_with("x-request-id")
+                {
+                    req = req.header(name, value);
+                }
+            }
+            continue;
+        }
+        if let Some(value) = headers.get(*key) {
+            req = req.header(*key, value);
+        }
+    }
+    req
+}
+
 /// 尝试单渠道（同族直通）。失败已按 router 分类，只返回「可转移」失败。
 async fn try_candidate(
     ctx: &GatewayCtx,
@@ -752,6 +790,7 @@ async fn try_candidate(
     peeked: &PeekRequest,
     cand: &store::RouteCandidate,
     body: &Bytes,
+    inbound_headers: &HeaderMap,
     started: Instant,
 ) -> Attempt {
     // ---- 取上游密钥 ----
@@ -834,6 +873,7 @@ async fn try_candidate(
             Err(e) => eprintln!("[proxy] extra_headers 解析失败(忽略): {e}"),
         }
     }
+    out_req = forward_inbound_headers(out_req, inbound_headers);
 
     let upstream = out_req.body(body.clone()).send().await;
     let resp = match upstream {

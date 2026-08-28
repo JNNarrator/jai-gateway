@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type {
   GatewayKeyInfo,
@@ -624,6 +624,8 @@ function SkillsTab() {
   const [err, setErr] = useState("");
   const [msg, setMsg] = useState("");
   const [showNew, setShowNew] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   async function refresh() {
     setList(await api.skillList());
@@ -642,13 +644,49 @@ function SkillsTab() {
     }
   }
 
+  async function importZip(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setImporting(true);
+    setErr("");
+    setMsg("");
+    try {
+      const buf = await file.arrayBuffer();
+      const data = Array.from(new Uint8Array(buf));
+      const n = await api.skillImportZip(data);
+      setMsg(`已从 ${file.name} 导入 ${n} 个技能`);
+      await refresh();
+    } catch (e2) {
+      setErr(String(e2));
+    } finally {
+      setImporting(false);
+    }
+  }
+
   return (
     <div className="mx-auto max-w-3xl space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">技能（Skill）管理</h1>
-        <button className={btnPrimary} onClick={() => setShowNew(true)}>
-          + 添加技能
-        </button>
+        <div className="flex gap-2">
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".zip,application/zip"
+            className="hidden"
+            onChange={importZip}
+          />
+          <button
+            className={btnGhost}
+            disabled={importing}
+            onClick={() => fileRef.current?.click()}
+          >
+            {importing ? "导入中…" : "导入 ZIP"}
+          </button>
+          <button className={btnPrimary} onClick={() => setShowNew(true)}>
+            + 添加技能
+          </button>
+        </div>
       </div>
       {err && (
         <div className="rounded border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
@@ -993,6 +1031,28 @@ function NewProviderForm({
   const [priority, setPriority] = useState(100);
   const [extraHeaders, setExtraHeaders] = useState("");
   const [err, setErr] = useState("");
+  const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [testing, setTesting] = useState(false);
+
+  async function testConnection() {
+    setErr("");
+    setTestMsg(null);
+    setTesting(true);
+    try {
+      const r = await api.providerTestDraft({ baseUrl, family, apiKey });
+      const preview = r.modelNames.slice(0, 3).join(", ");
+      setTestMsg({
+        ok: true,
+        text:
+          `连接成功 · 发现 ${r.count} 个模型` +
+          (r.count ? `：${preview}${r.count > 3 ? "…" : ""}` : ""),
+      });
+    } catch (e) {
+      setTestMsg({ ok: false, text: `连接失败：${e}` });
+    } finally {
+      setTesting(false);
+    }
+  }
 
   async function submit() {
     setErr("");
@@ -1039,7 +1099,7 @@ function NewProviderForm({
           </span>
         </label>
         <label className="col-span-2 text-xs text-neutral-400">
-          API Key（存入系统钥匙串）
+          API Key（凭据存储方式见设置页，可能因系统权限降级为文件）
           <input className={`${inputCls} mt-1`} type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
         </label>
         <label className="text-xs text-neutral-400">
@@ -1052,7 +1112,15 @@ function NewProviderForm({
         </label>
       </div>
       {err && <div className="mt-3 text-xs text-red-400">{err}</div>}
+      {testMsg && (
+        <div className={`mt-3 text-xs ${testMsg.ok ? "text-emerald-400" : "text-red-400"}`}>
+          {testMsg.text}
+        </div>
+      )}
       <div className="mt-4 flex gap-2">
+        <button className={btnGhost} disabled={testing} onClick={testConnection}>
+          {testing ? "测试中…" : "测试连接"}
+        </button>
         <button className={btnPrimary} onClick={submit}>
           创建
         </button>
@@ -1352,6 +1420,7 @@ function SettingsTab() {
   const [logRowCap, setLogRowCap] = useState(50000);
   const [portMsg, setPortMsg] = useState("");
   const [logMsg, setLogMsg] = useState("");
+  const [vaultKind, setVaultKind] = useState("…");
 
   useEffect(() => {
     api
@@ -1367,6 +1436,7 @@ function SettingsTab() {
         setLogRowCap(s.logRowCap);
       })
       .catch(() => {});
+    api.vaultStorageKind().then(setVaultKind).catch(() => setVaultKind("unknown"));
   }, []);
 
   async function save() {
@@ -1464,10 +1534,17 @@ function SettingsTab() {
       </Card>
 
       <Card title="关于密钥存储">
+        <p className="mb-2 text-xs text-neutral-500">
+          当前凭据存储：{" "}
+          <span className={vaultKind === "file" ? "text-amber-400" : "text-emerald-400"}>
+            {vaultKind === "keyring" ? "系统钥匙串" : vaultKind === "file" ? "文件降级（0600）" : vaultKind}
+          </span>
+        </p>
         <ul className="list-disc space-y-1.5 pl-5 text-xs leading-relaxed text-neutral-500">
-          <li>上游 API Key：保存在 macOS 钥匙串 / Windows 凭据管理器，数据库只存引用。</li>
+          <li>上游 API Key：优先保存在 macOS 钥匙串 / Windows 凭据管理器，数据库只存引用。</li>
+          <li>若系统凭据存储不可用（如沙箱/CI 权限受限），自动降级为数据目录下的 vault_fallback.json（Unix 0600）。</li>
           <li>网关 Key sk-jai-*：按设计决策明文存放本地 SQLite（非敏感级别），前缀展示、轮换采用吊销+新建保留审计痕迹、永不导出。</li>
-          <li>删除供应商会同时清除钥匙串中的对应条目。</li>
+          <li>删除供应商会同时清除对应凭据。</li>
         </ul>
       </Card>
 

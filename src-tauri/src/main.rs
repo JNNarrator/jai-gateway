@@ -16,6 +16,7 @@ use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{
     self, import, logs, Db, GatewayKeyRow, McpServerRow, ModelRow, ProviderRow, SkillRow,
 };
+use gateway_core::skills::SkillDraft;
 use gateway_core::sync::{self, WebDavConfig};
 use gateway_core::vault;
 use rand::Rng;
@@ -318,6 +319,51 @@ async fn provider_test(core: State<'_, AppCore>, id: String) -> Result<String, S
             Err(msg)
         }
     }
+}
+
+// ---------------------------------------------------------------- 草稿测试
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTestDraftInput {
+    pub base_url: String,
+    pub family: String,
+    pub api_key: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTestDraftResult {
+    pub ok: bool,
+    pub count: usize,
+    pub model_names: Vec<String>,
+}
+
+/// 创建供应商弹框里的“测试连接”按钮：用草稿参数直接拉一次模型列表，
+/// 不写库、不落凭据。
+#[tauri::command]
+async fn provider_test_draft(
+    core: State<'_, AppCore>,
+    input: ProviderTestDraftInput,
+) -> Result<ProviderTestDraftResult, String> {
+    let secret = if input.api_key.trim().is_empty() {
+        None
+    } else {
+        Some(input.api_key.clone())
+    };
+    let models = discover_models(
+        &core.http,
+        &input.family,
+        &normalize_base(&input.base_url),
+        secret.as_deref(),
+    )
+    .await?;
+
+    Ok(ProviderTestDraftResult {
+        ok: true,
+        count: models.len(),
+        model_names: models.into_iter().map(|m| m.id).collect(),
+    })
 }
 
 // ---------------------------------------------------------------- 模型命令
@@ -934,6 +980,38 @@ async fn skill_delete(core: State<'_, AppCore>, id: String) -> Result<(), String
     .map_err(join_err)?
 }
 
+/// 从 ZIP 导入技能：支持 skills.json 清单或 *.md/*.txt 文件包。
+#[tauri::command]
+async fn skill_import_zip(core: State<'_, AppCore>, data: Vec<u8>) -> Result<usize, String> {
+    let drafts: Vec<SkillDraft> = gateway_core::skills::parse_skills_zip(&data)?;
+    if drafts.is_empty() {
+        return Err("ZIP 中没有可导入的技能".into());
+    }
+
+    let mut imported = 0usize;
+    for d in &drafts {
+        let now = store::now_ms();
+        let row = SkillRow {
+            id: uuid::Uuid::now_v7().to_string(),
+            name: d.name.trim().to_string(),
+            description: d.description.trim().to_string(),
+            content: d.content.clone(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = core.db.clone();
+        let row2 = row.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with(|c| store::skill_insert(c, &row2)).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(join_err)??;
+        imported += 1;
+    }
+    Ok(imported)
+}
+
 #[tauri::command]
 async fn cors_allow_get(core: State<'_, AppCore>) -> Result<Vec<String>, String> {
     let raw = core
@@ -956,6 +1034,12 @@ async fn cors_allow_set(core: State<'_, AppCore>, list: Vec<String>) -> Result<(
 #[tauri::command]
 fn families() -> Vec<&'static str> {
     vec!["openai_compat", "anthropic", "gemini"]
+}
+
+/// 当前凭据存储方式：`keyring` 或 `file`（降级）。
+#[tauri::command]
+fn vault_storage_kind() -> &'static str {
+    vault::storage_kind()
 }
 
 // ---------------------------------------------------------------- 设置（M2）
@@ -1247,6 +1331,9 @@ fn main() {
             let db_path = data_dir.join("jai.db");
             let db_str = db_path.to_string_lossy().to_string();
 
+            // 密钥环不可用（沙箱/CI）时降级为文件存储，保证添加供应商可用
+            vault::init(&data_dir)?;
+
             let db = Db::open(&db_str)?;
             // 日志管道第二条连接 + 有界队列（稳定性基线 §5-3）
             let (log_handle, _log_task) = logs::spawn_logger(&db_str)?;
@@ -1380,7 +1467,9 @@ fn main() {
             provider_delete,
             provider_set_enabled,
             provider_test,
+            provider_test_draft,
             provider_discover_models,
+            vault_storage_kind,
             model_list,
             model_set_limits,
             model_toggle,
@@ -1406,6 +1495,7 @@ fn main() {
             skill_update,
             skill_set_enabled,
             skill_delete,
+            skill_import_zip,
             cors_allow_get,
             cors_allow_set,
             settings_get,

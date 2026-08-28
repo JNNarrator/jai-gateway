@@ -43,6 +43,15 @@ export const api = {
   providerSetEnabled: (id: string, enabled: boolean) =>
     invoke<void>("provider_set_enabled", { id, enabled }),
   providerTest: (id: string) => invoke<string>("provider_test", { id }),
+  providerTestDraft: (input: {
+    baseUrl: string;
+    family: string;
+    apiKey: string;
+  }) =>
+    invoke<{ ok: boolean; count: number; modelNames: string[] }>(
+      "provider_test_draft",
+      { input }
+    ),
   providerDiscoverModels: (id: string) =>
     invoke<[number, number]>("provider_discover_models", { id }),
 
@@ -118,6 +127,9 @@ export const api = {
   skillSetEnabled: (id: string, enabled: boolean) =>
     invoke<void>("skill_set_enabled", { id, enabled }),
   skillDelete: (id: string) => invoke<void>("skill_delete", { id }),
+  skillImportZip: (data: number[]) =>
+    invoke<number>("skill_import_zip", { data }),
+  vaultStorageKind: () => invoke<string>("vault_storage_kind"),
 
   corsAllowGet: () => invoke<string[]>("cors_allow_get"),
   corsAllowSet: (list: string[]) => invoke<void>("cors_allow_set", { list }),

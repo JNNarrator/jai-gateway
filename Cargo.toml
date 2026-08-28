@@ -29,6 +29,7 @@ rand = "0.8"
 sha2 = "0.10"
 futures-util = "0.3"
 bytes = "1"
+zip = "2"
 
 [profile.release]
 lto = true
