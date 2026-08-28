@@ -210,14 +210,13 @@ function GatewayTab() {
   }
 
   async function doExport() {
-    const json = await api.exportConfigJson();
-    const blob = new Blob([json], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `jai-export-${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    const path = await api.exportConfigToFile();
     toast("已导出（不含 API Key）");
+    try {
+      await api.revealInFolder(path);
+    } catch {
+      // 平台不支持打开目录时忽略
+    }
   }
 
   const snippet =

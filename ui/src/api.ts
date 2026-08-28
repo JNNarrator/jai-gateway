@@ -75,6 +75,8 @@ export const api = {
   // 日志 / 导出 / 设置 / WebDAV
   logsRecent: (limit = 100) => invoke<LogRowView[]>("logs_recent", { limit }),
   exportConfigJson: () => invoke<string>("export_config_json"),
+  exportConfigToFile: () => invoke<string>("export_config_to_file"),
+  revealInFolder: (path: string) => invoke<void>("reveal_in_folder", { path }),
   configImport: (text: string, strict?: boolean) =>
     invoke<ImportReport>("config_import", { text, strict: strict ?? false }),
   webdavConfigGet: () => invoke<WebDavConfigDto | null>("webdav_config_get"),

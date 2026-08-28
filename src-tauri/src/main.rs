@@ -593,6 +593,45 @@ async fn export_config_json(core: State<'_, AppCore>) -> Result<String, String> 
     .map_err(join_err)?
 }
 
+/// 导出到数据目录并返回文件路径（供“打开所在目录”使用）。
+#[tauri::command]
+async fn export_config_to_file(core: State<'_, AppCore>) -> Result<String, String> {
+    let json = export_config_json(core.clone()).await?;
+    let db_path = std::path::Path::new(&core.db_path);
+    let dir = db_path.parent().unwrap_or(std::path::Path::new("."));
+    let path = dir.join(format!("jai-export-{}.json", store::now_ms()));
+    std::fs::write(&path, json).map_err(|e| format!("写入导出文件失败: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// 在系统文件管理器中显示该文件（macOS Finder / Windows Explorer）。
+#[tauri::command]
+fn reveal_in_folder(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("打开 Finder 失败: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("打开资源管理器失败: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = &path;
+        Err("当前平台暂不支持打开所在目录".into())
+    }
+}
+
 // ---------------------------------------------------------------- M7：导入 + WebDAV
 
 #[derive(Serialize, Deserialize)]
@@ -1544,6 +1583,8 @@ fn main() {
             gateway_key_regenerate,
             logs_recent,
             export_config_json,
+            export_config_to_file,
+            reveal_in_folder,
             config_import,
             webdav_config_get,
             webdav_config_set,
