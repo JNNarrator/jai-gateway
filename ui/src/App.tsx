@@ -748,6 +748,7 @@ function SkillsTab() {
   const [showNew, setShowNew] = useState(false);
   const [importing, setImporting] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function refresh() {
@@ -756,6 +757,34 @@ function SkillsTab() {
   useEffect(() => {
     refresh().catch((e) => setErr(String(e)));
   }, []);
+
+  function toggleSelect(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function batchSetEnabled(enabled: boolean) {
+    for (const id of selected) {
+      await api.skillSetEnabled(id, enabled);
+    }
+    setSelected(new Set());
+    toast(enabled ? "已批量启用" : "已批量禁用");
+    await refresh();
+  }
+
+  async function batchDelete() {
+    if (!confirm(`确定删除选中的 ${selected.size} 个技能？`)) return;
+    for (const id of selected) {
+      await api.skillDelete(id);
+    }
+    setSelected(new Set());
+    toast("已批量删除");
+    await refresh();
+  }
 
   async function act(fn: () => Promise<unknown>) {
     setErr("");
@@ -851,6 +880,23 @@ function SkillsTab() {
           {msg}
         </div>
       )}
+      {selected.size > 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded border border-amber-800 bg-amber-950/30 px-3 py-2 text-sm text-amber-200">
+          已选 {selected.size} 项
+          <button className={btnGhost} onClick={() => batchSetEnabled(true)}>
+            批量启用
+          </button>
+          <button className={btnGhost} onClick={() => batchSetEnabled(false)}>
+            批量禁用
+          </button>
+          <button className={btnDanger} onClick={batchDelete}>
+            批量删除
+          </button>
+          <button className={btnGhost} onClick={() => setSelected(new Set())}>
+            取消选择
+          </button>
+        </div>
+      )}
       {showNew && (
         <SkillForm
           onCancel={() => setShowNew(false)}
@@ -866,9 +912,17 @@ function SkillsTab() {
             <div className="flex items-center gap-3">
               <input
                 type="checkbox"
+                checked={selected.has(s.id)}
+                onChange={() => toggleSelect(s.id)}
+                className="accent-amber-500"
+                title="选择用于批量操作"
+              />
+              <input
+                type="checkbox"
                 checked={s.enabled}
                 onChange={(e) => act(() => api.skillSetEnabled(s.id, e.target.checked))}
-                className="accent-amber-500"
+                className="accent-emerald-500"
+                title="启用/停用"
               />
               <div className="min-w-0 flex-1">
                 <div className="font-medium">{s.name}</div>
