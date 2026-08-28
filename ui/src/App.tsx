@@ -1698,6 +1698,7 @@ function SettingsTab() {
   const [portMsg, setPortMsg] = useState("");
   const [logMsg, setLogMsg] = useState("");
   const [vaultKind, setVaultKind] = useState("…");
+  const corsHasWildcard = raw.split("\n").some((s) => s.trim() === "*");
 
   useEffect(() => {
     api
@@ -1733,6 +1734,7 @@ function SettingsTab() {
     }
     await api.settingsSetPort(n);
     setPortMsg("已保存：重启网关后生效（端口占用自动顺延）");
+    toast("端口已保存");
   }
 
   async function toggleLogs(on: boolean) {
@@ -1767,19 +1769,21 @@ function SettingsTab() {
       <Card title="请求日志">
         <div className="flex items-center gap-3">
           <button
-            className={logsEnabled ? btnPrimary : btnGhost}
-            onClick={() => toggleLogs(true)}
+            role="switch"
+            aria-checked={logsEnabled}
+            onClick={() => toggleLogs(!logsEnabled)}
+            className={`relative h-5 w-9 rounded-full transition-colors ${
+              logsEnabled ? "bg-emerald-600" : "bg-neutral-700"
+            }`}
           >
-            记录
+            <span
+              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+                logsEnabled ? "left-[18px]" : "left-0.5"
+              }`}
+            />
           </button>
-          <button
-            className={!logsEnabled ? btnPrimary : btnGhost}
-            onClick={() => toggleLogs(false)}
-          >
-            关闭
-          </button>
-          <span className="text-xs text-neutral-500">
-            当前：{logsEnabled ? "记录中" : "已关闭"}
+          <span className="text-sm text-neutral-300">
+            日志记录：{logsEnabled ? "记录中" : "已关闭"}
           </span>
         </div>
         <p className="mt-3 text-xs leading-relaxed text-neutral-500">
@@ -1796,15 +1800,26 @@ function SettingsTab() {
           把它的 Origin 加进白名单，每行一条；通配符 * 表示放行全部（不推荐）。
           本机来源（localhost / 127.0.0.1）始终放行。
         </p>
+        {corsHasWildcard && (
+          <div className="mb-3 rounded border border-amber-800 bg-amber-950/40 px-3 py-2 text-xs text-amber-300">
+            ⚠ 通配符 * 会放行所有来源，生产环境不建议使用。
+          </div>
+        )}
         <textarea
           className={`${inputCls} h-32 font-mono`}
           value={raw}
           onChange={(e) => setRaw(e.target.value)}
           placeholder={"https://chat.example.com\nhttp://192.168.1.5:3000"}
         />
-        <div className="mt-3 flex items-center gap-2">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           <button className={btnPrimary} onClick={save}>
             保存
+          </button>
+          <button
+            className={btnGhost}
+            onClick={() => setRaw("https://chat.example.com\nhttp://192.168.1.5:3000")}
+          >
+            填入示例
           </button>
           {saved && <span className="text-xs text-emerald-400">已生效</span>}
         </div>
