@@ -409,6 +409,12 @@
 - Tauri `stats_usage` + UI「统计」页：近 7/30/90 天切换与柱状图
 - 单测覆盖聚合正确性
 
+### 旧版 /v1/completions（第二阶段抽做）—— 已完成 ✅
+
+- 新增 `POST /v1/completions` 入站，走 `openai_compat` 渠道字节级直通
+- 不做跨族转换；非 openai_compat 候选自动跳过
+- 集成测试 `tests/legacy_completions.rs` 覆盖直通链路
+
 ### 待办（下一里程碑）
 
 1. 真机验收 M1–M9 + MCP/Skill（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）

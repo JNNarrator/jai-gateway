@@ -16,6 +16,7 @@
 - 对外暴露统一网关入口（`127.0.0.1`），支持三种入站协议线：
   - OpenAI `POST /v1/chat/completions`
   - OpenAI Responses API `POST /v1/responses`（Codex CLI 原生接入）
+- OpenAI 旧版 `POST /v1/completions`（text completions 直通）
   - Anthropic `POST /v1/messages`（Claude Code 直连）
 - 同名模型多渠道路由：按优先级自动故障转移 + 健康感知排序 + 同优先级权重负载均衡
 - 模型别名/映射：每个模型可配置发给上游的真实模型 ID

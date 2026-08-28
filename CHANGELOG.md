@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 - MCP 工具自动合并 + 自动执行循环：网关把启用 MCP 工具注入请求工具定义；上游发起 MCP 工具调用时自动执行并回填结果继续生成
 - 高级路由：模型别名/映射（upstream_model_id）、同优先级权重负载均衡、基于最近成功/失败的健康感知排序
 - 用量统计：新增「统计」页，展示近 7/30/90 天请求数与 Token 用量柱状图
+- 旧版 `POST /v1/completions`：支持 openai_compat 渠道字节级直通
 - 技能（skill）管理：`skills` 表 + CRUD IPC + UI「技能」页；跨族转换请求自动注入启用技能到 system
 
 ### Changed

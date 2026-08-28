@@ -56,6 +56,7 @@ pub enum InboundWire {
     OpenAi,
     Anthropic,
     Responses,
+    Completions,
 }
 
 impl InboundWire {
@@ -63,7 +64,7 @@ impl InboundWire {
     /// `openai_responses` 上游族；若渠道是 openai_compat 则走跨族转换。
     pub fn family(&self) -> &'static str {
         match self {
-            InboundWire::OpenAi => "openai_compat",
+            InboundWire::OpenAi | InboundWire::Completions => "openai_compat",
             InboundWire::Anthropic => "anthropic",
             InboundWire::Responses => "openai_responses",
         }
@@ -72,7 +73,7 @@ impl InboundWire {
     /// 日志 inbound_family 字段值
     pub fn log_family(&self) -> &'static str {
         match self {
-            InboundWire::OpenAi => "openai",
+            InboundWire::OpenAi | InboundWire::Completions => "openai",
             InboundWire::Anthropic => "anthropic",
             InboundWire::Responses => "responses",
         }
@@ -82,6 +83,7 @@ impl InboundWire {
     pub fn upstream_path(&self) -> &'static str {
         match self {
             InboundWire::OpenAi => "/chat/completions",
+            InboundWire::Completions => "/completions",
             InboundWire::Anthropic => "/v1/messages",
             InboundWire::Responses => "/responses",
         }
@@ -94,7 +96,9 @@ impl InboundWire {
         secret: &str,
     ) -> reqwest::RequestBuilder {
         match self {
-            InboundWire::OpenAi | InboundWire::Responses => req.bearer_auth(secret),
+            InboundWire::OpenAi | InboundWire::Responses | InboundWire::Completions => {
+                req.bearer_auth(secret)
+            }
             InboundWire::Anthropic => req.header("x-api-key", secret).header(
                 "anthropic-version",
                 anthropic_codec::DEFAULT_ANTHROPIC_VERSION,
@@ -111,7 +115,7 @@ impl InboundWire {
         code: Option<&str>,
     ) -> Response {
         match self {
-            InboundWire::OpenAi => {
+            InboundWire::OpenAi | InboundWire::Completions => {
                 (status, Json(error_body(message, err_type, code))).into_response()
             }
             InboundWire::Anthropic => {
@@ -128,7 +132,9 @@ impl InboundWire {
     /// Overloaded → Anthropic 侧保留 529（roadmap M3 验收 4）
     pub fn overloaded_status(&self) -> StatusCode {
         match self {
-            InboundWire::OpenAi | InboundWire::Responses => StatusCode::SERVICE_UNAVAILABLE,
+            InboundWire::OpenAi | InboundWire::Responses | InboundWire::Completions => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             InboundWire::Anthropic => {
                 StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
             }
@@ -271,7 +277,7 @@ fn error_sse_frame(wire: InboundWire, message: &str) -> Bytes {
             let payload = anthropic_codec::error_body(message, "api_error").to_string();
             Bytes::from(format!("event: error\ndata: {payload}\n\n"))
         }
-        InboundWire::OpenAi | InboundWire::Responses => {
+        InboundWire::OpenAi | InboundWire::Responses | InboundWire::Completions => {
             let payload =
                 crate::codec::responses::error_body(message, "api_error", None).to_string();
             Bytes::from(format!("data: {payload}\n\n"))
@@ -549,6 +555,11 @@ pub async fn responses(State(ctx): State<GatewayCtx>, req: Request) -> Response 
     dispatch(InboundWire::Responses, ctx, req).await
 }
 
+/// POST /v1/completions —— 旧版 OpenAI text completions 入站（仅 openai_compat 直通）。
+pub async fn completions(State(ctx): State<GatewayCtx>, req: Request) -> Response {
+    dispatch(InboundWire::Completions, ctx, req).await
+}
+
 /// POST /v1/messages/count_tokens —— 粗估端点（M3，避免 Claude Code 降级）。
 pub async fn anthropic_count_tokens(State(_ctx): State<GatewayCtx>, req: Request) -> Response {
     let body = match to_bytes(req.into_body(), MAX_REQUEST_BODY).await {
@@ -698,6 +709,10 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
     let mut last_summary = String::from("所有渠道均失败");
     let mut last_http: Option<UpstreamError> = None;
     for cand in &candidates {
+        // 旧版 /v1/completions 只支持 OpenAI 兼容直通，不做跨族/MCP 转换。
+        if wire == InboundWire::Completions && cand.family != wire.family() {
+            continue;
+        }
         // MCP 启用时不再走字节直通，而走转换路径（同族也可注入/执行 MCP 工具）。
         if !mcp_tools.is_empty() || cand.family != wire.family() {
             match try_converted_candidate(&ctx, wire, &peeked, cand, &body, started, &mcp_tools)
@@ -1125,6 +1140,14 @@ async fn try_converted_candidate(
                 ));
             }
         },
+        InboundWire::Completions => {
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_REQUEST,
+                "旧版 /v1/completions 仅支持 openai_compat 直通，不支持跨族转换",
+                "invalid_request_error",
+                None,
+            ));
+        }
     };
     // 模型别名/映射：models.upstream_model_id 非空时，编码给上游前换为真实模型 id
     if let Some(real) = cand.upstream_model_id.as_deref() {
@@ -1972,7 +1995,9 @@ async fn run_mcp_tool_loop(
     }
 
     let rendered = match wire {
-        InboundWire::OpenAi => crate::codec::openai::render_response(&final_resp).to_string(),
+        InboundWire::OpenAi | InboundWire::Completions => {
+            crate::codec::openai::render_response(&final_resp).to_string()
+        }
         InboundWire::Anthropic => crate::codec::anthropic::render_response(&final_resp).to_string(),
         InboundWire::Responses => crate::codec::responses::render_response(&final_resp).to_string(),
     };
@@ -2043,11 +2068,13 @@ fn render_mcp_response_as_sse(
     }
 
     let mut r = match wire {
-        InboundWire::OpenAi => R::OpenAi(crate::codec::openai::RenderState {
-            id: format!("chatcmpl-jai-{}", started.elapsed().as_millis()),
-            model: peeked.model.clone(),
-            started: false,
-        }),
+        InboundWire::OpenAi | InboundWire::Completions => {
+            R::OpenAi(crate::codec::openai::RenderState {
+                id: format!("chatcmpl-jai-{}", started.elapsed().as_millis()),
+                model: peeked.model.clone(),
+                started: false,
+            })
+        }
         InboundWire::Anthropic => R::Anthropic(crate::codec::anthropic::AnthropicRenderState {
             message_id: format!("msg_jai_{}", started.elapsed().as_millis()),
             model: peeked.model.clone(),
@@ -2138,7 +2165,11 @@ fn render_mcp_response_as_sse(
                 crate::codec::anthropic::render_message_stop()
             )));
         }
-        InboundWire::OpenAi => frames.push(Bytes::from_static(b"data: [DONE]\n\n")),
+        InboundWire::OpenAi | InboundWire::Completions => frames.push(Bytes::from_static(
+            b"data: [DONE]
+
+",
+        )),
         InboundWire::Responses => {}
     }
 
@@ -2278,7 +2309,9 @@ async fn convert_plain_response(
 
     // 渲染为入站形状（OpenAI / Anthropic）
     let rendered = match wire {
-        InboundWire::OpenAi => crate::codec::openai::render_response(&resp).to_string(),
+        InboundWire::OpenAi | InboundWire::Completions => {
+            crate::codec::openai::render_response(&resp).to_string()
+        }
         InboundWire::Anthropic => crate::codec::anthropic::render_response(&resp).to_string(),
         InboundWire::Responses => crate::codec::responses::render_response(&resp).to_string(),
     };
@@ -2340,11 +2373,13 @@ async fn convert_streaming_response(
         Responses(crate::codec::responses::RenderState),
     }
     let mut renderer = match wire {
-        InboundWire::OpenAi => SseRenderer::OpenAi(crate::codec::openai::RenderState {
-            id: format!("chatcmpl-jai-{}", started.elapsed().as_millis()),
-            model: peeked.model.clone(),
-            started: false,
-        }),
+        InboundWire::OpenAi | InboundWire::Completions => {
+            SseRenderer::OpenAi(crate::codec::openai::RenderState {
+                id: format!("chatcmpl-jai-{}", started.elapsed().as_millis()),
+                model: peeked.model.clone(),
+                started: false,
+            })
+        }
         InboundWire::Anthropic => {
             SseRenderer::Anthropic(crate::codec::anthropic::AnthropicRenderState {
                 message_id: format!("msg_jai_{}", started.elapsed().as_millis()),
