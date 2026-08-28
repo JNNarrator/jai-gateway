@@ -138,5 +138,6 @@ export const api = {
     invoke<number>("settings_set_port", { port }),
   settingsSetLogsEnabled: (enabled: boolean) =>
     invoke<boolean>("settings_set_logs_enabled", { enabled }),
+  readEnvVar: (name: string) => invoke<string>("read_env_var", { name }),
   families: () => invoke<string[]>("families"),
 };

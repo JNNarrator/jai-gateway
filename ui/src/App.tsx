@@ -1353,7 +1353,25 @@ function NewProviderForm({
           <span className="mt-1 block text-[11px] text-neutral-600">{meta.hint}</span>
         </label>
         <label className="text-xs text-neutral-400 md:col-span-2">
-          API Key（凭据存储方式见设置页，可能因系统权限降级为文件）
+          <div className="flex items-center justify-between">
+            <span>API Key（凭据存储方式见设置页）</span>
+            <button
+              className={btnGhost}
+              type="button"
+              onClick={async () => {
+                const name = window.prompt("输入环境变量名，例如 DEEPSEEK_API_KEY");
+                if (!name) return;
+                try {
+                  setApiKey(await api.readEnvVar(name));
+                  toast("已从环境变量导入");
+                } catch (e) {
+                  setErr(String(e));
+                }
+              }}
+            >
+              从环境变量导入
+            </button>
+          </div>
           <input className={`${inputCls} mt-1`} type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
         </label>
         <label className="text-xs text-neutral-400">

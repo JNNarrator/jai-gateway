@@ -1130,6 +1130,12 @@ async fn settings_set_logs_enabled(
     Ok(enabled)
 }
 
+/// 读取本机环境变量（供应商表单“从环境变量导入 API Key”用）。
+#[tauri::command]
+fn read_env_var(name: String) -> Result<String, String> {
+    std::env::var(&name).map_err(|e| format!("读取环境变量 {name} 失败: {e}"))
+}
+
 // ---------------------------------------------------------------- helpers
 
 fn join_err(e: tokio::task::JoinError) -> String {
@@ -1506,6 +1512,7 @@ fn main() {
             settings_get,
             settings_set_port,
             settings_set_logs_enabled,
+            read_env_var,
             families,
         ])
         .run(tauri::generate_context!())
