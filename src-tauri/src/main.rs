@@ -1156,6 +1156,29 @@ async fn settings_set_logs_enabled(
     Ok(enabled)
 }
 
+/// 设置日志保留策略（天/行数）。由 retention 循环下次运行时读取。
+#[tauri::command]
+async fn settings_set_retention(
+    core: State<'_, AppCore>,
+    days: i64,
+    row_cap: i64,
+) -> Result<(), String> {
+    if days < 1 || row_cap < 1000 {
+        return Err("保留天数至少 1 天，行数至少 1000".into());
+    }
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| {
+            store::meta_set(c, "retention_days", &days.to_string())?;
+            store::meta_set(c, "log_row_cap", &row_cap.to_string())?;
+            Ok::<_, store::StoreError>(())
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
 /// 读取本机环境变量（供应商表单“从环境变量导入 API Key”用）。
 #[tauri::command]
 fn read_env_var(name: String) -> Result<String, String> {
@@ -1539,6 +1562,7 @@ fn main() {
             settings_get,
             settings_set_port,
             settings_set_logs_enabled,
+            settings_set_retention,
             read_env_var,
             families,
         ])

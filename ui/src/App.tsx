@@ -2063,6 +2063,27 @@ function SettingsTab() {
           保留策略：{retentionDays} 天 / 上限 {logRowCap.toLocaleString("zh-CN")} 行
           （每日自动清理）。日志仅含元数据，不含 prompt 与响应明文。
         </p>
+        <button
+          className={`${btnGhost} mt-2`}
+          onClick={async () => {
+            const daysStr = window.prompt("保留天数（至少 1）", String(retentionDays));
+            if (!daysStr) return;
+            const days = Number(daysStr);
+            const capStr = window.prompt("日志行数上限（至少 1000）", String(logRowCap));
+            if (!capStr) return;
+            const cap = Number(capStr);
+            try {
+              await api.settingsSetRetention(days, cap);
+              setRetentionDays(days);
+              setLogRowCap(cap);
+              toast("保留策略已更新");
+            } catch (e) {
+              setLogMsg(String(e));
+            }
+          }}
+        >
+          编辑保留策略
+        </button>
         {logMsg && <div className="mt-2 text-xs text-emerald-400">{logMsg}</div>}
       </Card>
 
