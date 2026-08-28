@@ -1223,8 +1223,27 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             // 1) 数据目录 + 迁移（失败即中止启动 —— storage §4 早拦截）
-            let data_dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&data_dir)?;
+            //    某些受限环境（CI/沙箱）对 ~/Library 无写权限，回退临时目录保证可演示。
+            let data_dir = match app.path().app_data_dir() {
+                Ok(dir) => {
+                    if std::fs::create_dir_all(&dir).is_ok() {
+                        dir
+                    } else {
+                        eprintln!(
+                            "[store] 默认数据目录不可写({}), 回退到临时目录",
+                            dir.display()
+                        );
+                        let fallback = std::env::temp_dir().join("jai-data");
+                        std::fs::create_dir_all(&fallback)?;
+                        fallback
+                    }
+                }
+                Err(_) => {
+                    let fallback = std::env::temp_dir().join("jai-data");
+                    std::fs::create_dir_all(&fallback)?;
+                    fallback
+                }
+            };
             let db_path = data_dir.join("jai.db");
             let db_str = db_path.to_string_lossy().to_string();
 
