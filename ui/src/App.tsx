@@ -567,6 +567,11 @@ function SyncTab() {
             {busy === "pull" ? "拉取中…" : "拉取"}
           </button>
         </div>
+        {busy && (
+          <div className="mt-3 h-1 w-full overflow-hidden rounded bg-neutral-800">
+            <div className="h-full w-1/3 animate-pulse rounded bg-amber-500" />
+          </div>
+        )}
       </Card>
     </div>
   );
