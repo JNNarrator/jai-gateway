@@ -405,8 +405,15 @@ function SyncTab() {
 
   async function saveCfg() {
     setErr("");
+    const url = cfg.url.trim();
+    if (!url) {
+      setErr("WebDAV 根地址不能为空");
+      return;
+    }
+    const normalized = url.endsWith("/") ? url : `${url}/`;
     try {
-      await api.webdavConfigSet({ ...cfg, password: pw || null });
+      await api.webdavConfigSet({ ...cfg, url: normalized, password: pw || null });
+      setCfg({ ...cfg, url: normalized });
       setPw("");
       setMsg("WebDAV 连接配置已保存");
     } catch (e) {
