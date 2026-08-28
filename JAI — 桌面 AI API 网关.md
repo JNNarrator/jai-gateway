@@ -141,21 +141,21 @@ MVP 必须支持的转换链路（含 tool/function calling 映射）：
 
 > 调度说明：多设备同步是本项目的核心动机之一，故从「二期」提前到公测（v0.1 beta）之前实现。
 
-#### 8. 高级路由
+#### 8. 高级路由 ✅ 已实现
 
-- 权重负载均衡：多供应商间按权重分发
-- 策略化故障转移：健康探测驱动的主备切换（MVP 的按序顺延是它的简化版）
-- 模型别名/映射：将 `gpt-4o` 映射为 `deepseek-chat`
+- 权重负载均衡：多供应商间按权重分发（`providers.weight`，同优先级加权随机）
+- 策略化故障转移：健康探测驱动的主备切换（基于 `last_ok_at/last_err_at` 的健康感知排序）
+- 模型别名/映射：将 `gpt-4o` 映射为 `deepseek-chat`（`models.upstream_model_id`）
 
-#### 9. 用量统计
+#### 9. 用量统计 ✅ 已实现
 
-- Token 用量统计与可视化图表（数据源：MVP 已落库的 request_logs + usage）
-- 请求日志查询与导出
+- Token 用量统计与可视化图表（数据源：MVP 已落库的 request_logs + usage；UI「统计」页）
+- 请求日志查询与导出（日志页已有查询/筛选/导出）
 
-#### 10. 更多入站协议形态
+#### 10. 更多入站协议形态 ✅ 已实现
 
-- 旧版 `POST /v1/completions`
-- （OpenAI Responses API 已因 Codex 第一梯队优先级提前至 M6，不再是二期条目）
+- 旧版 `POST /v1/completions`（openai_compat 直通）
+- OpenAI Responses API 已因 Codex 第一梯队优先级提前至 M6，不再是二期条目
 
 ### 远期规划（暂不定里程碑）
 
