@@ -426,6 +426,28 @@ function SyncTab() {
     }
   }
 
+  async function testWebdav() {
+    setErr("");
+    setMsg("");
+    const url = cfg.url.trim();
+    if (!url) {
+      setErr("WebDAV 根地址不能为空");
+      return;
+    }
+    try {
+      const result = await api.webdavTest({
+        url,
+        username: cfg.username,
+        password: pw || null,
+      });
+      setMsg(result);
+      toast("WebDAV 连接成功");
+    } catch (e) {
+      setErr(String(e));
+      toast("WebDAV 连接失败", "err");
+    }
+  }
+
   async function doPush() {
     setBusy("push");
     setErr("");
@@ -559,6 +581,9 @@ function SyncTab() {
         <div className="mt-4 flex flex-wrap gap-2">
           <button className={btnPrimary} onClick={saveCfg}>
             保存配置
+          </button>
+          <button className={btnGhost} onClick={testWebdav}>
+            测试连接
           </button>
           <button className={btnGhost} disabled={busy === "push"} onClick={doPush}>
             {busy === "push" ? "推送中…" : "推送"}

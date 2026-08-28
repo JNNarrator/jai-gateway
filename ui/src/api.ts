@@ -84,6 +84,11 @@ export const api = {
     directory: string;
     password?: string | null;
   }) => invoke<void>("webdav_config_set", { input }),
+  webdavTest: (input: {
+    url: string;
+    username: string;
+    password?: string | null;
+  }) => invoke<string>("webdav_test", { input }),
   webdavPush: () => invoke<void>("webdav_push"),
   webdavPull: () => invoke<ImportReport>("webdav_pull"),
 

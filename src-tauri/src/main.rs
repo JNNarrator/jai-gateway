@@ -677,6 +677,32 @@ async fn webdav_config_set(
 }
 
 #[tauri::command]
+async fn webdav_test(
+    core: State<'_, AppCore>,
+    input: WebDavConfigInput,
+) -> Result<String, String> {
+    let url = normalize_base(&input.url);
+    let username = input.username.trim().to_string();
+    let password = input.password.clone().unwrap_or_default();
+    let resp = core
+        .http
+        .request(reqwest::Method::OPTIONS, &url)
+        .basic_auth(&username, Some(&password))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("连接失败: {e}"))?;
+    let status = resp.status().as_u16();
+    if status == 401 || status == 403 {
+        Err(format!("连接成功但认证失败（HTTP {status}）"))
+    } else if (200..400).contains(&status) {
+        Ok("连接成功".into())
+    } else {
+        Err(format!("连接异常（HTTP {status}）"))
+    }
+}
+
+#[tauri::command]
 async fn webdav_push(core: State<'_, AppCore>) -> Result<(), String> {
     let cfg = get_webdav_config(&core).await?;
     let password = get_webdav_password().await?;
@@ -1492,6 +1518,7 @@ fn main() {
             config_import,
             webdav_config_get,
             webdav_config_set,
+            webdav_test,
             webdav_push,
             webdav_pull,
             mcp_list,
