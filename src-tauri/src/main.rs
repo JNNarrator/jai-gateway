@@ -13,10 +13,10 @@
 use gateway_core::codec::Family;
 use gateway_core::discover::discover_models;
 use gateway_core::server::{self, GatewayCtx};
+use gateway_core::skills::SkillDraft;
 use gateway_core::store::{
     self, import, logs, Db, GatewayKeyRow, McpServerRow, ModelRow, ProviderRow, SkillRow,
 };
-use gateway_core::skills::SkillDraft;
 use gateway_core::sync::{self, WebDavConfig};
 use gateway_core::vault;
 use rand::Rng;
@@ -716,10 +716,7 @@ async fn webdav_config_set(
 }
 
 #[tauri::command]
-async fn webdav_test(
-    core: State<'_, AppCore>,
-    input: WebDavConfigInput,
-) -> Result<String, String> {
+async fn webdav_test(core: State<'_, AppCore>, input: WebDavConfigInput) -> Result<String, String> {
     let url = normalize_base(&input.url);
     let username = input.username.trim().to_string();
     let password = input.password.clone().unwrap_or_default();
@@ -785,7 +782,9 @@ async fn webdav_preview(core: State<'_, AppCore>) -> Result<WebDavPreview, Strin
         local_models: lm,
         will_overwrite: changed,
         message: if changed {
-            format!("远端 {rp} 个供应商/{rm} 个模型，本地 {lp} 个供应商/{lm} 个模型，拉取将覆盖本地")
+            format!(
+                "远端 {rp} 个供应商/{rm} 个模型，本地 {lp} 个供应商/{lm} 个模型，拉取将覆盖本地"
+            )
         } else {
             "远端与本地配置一致，无需变更".into()
         },
@@ -1119,7 +1118,8 @@ async fn skill_import_zip(core: State<'_, AppCore>, data: Vec<u8>) -> Result<usi
         let db = core.db.clone();
         let row2 = row.clone();
         tokio::task::spawn_blocking(move || {
-            db.with(|c| store::skill_insert(c, &row2)).map_err(|e| e.to_string())
+            db.with(|c| store::skill_insert(c, &row2))
+                .map_err(|e| e.to_string())
         })
         .await
         .map_err(join_err)??;
@@ -1149,12 +1149,7 @@ async fn cors_allow_set(core: State<'_, AppCore>, list: Vec<String>) -> Result<(
 
 #[tauri::command]
 fn families() -> Vec<&'static str> {
-    vec![
-        "openai_compat",
-        "openai_responses",
-        "anthropic",
-        "gemini",
-    ]
+    vec!["openai_compat", "openai_responses", "anthropic", "gemini"]
 }
 
 /// 当前凭据存储方式：`keyring` 或 `file`（降级）。

@@ -385,7 +385,8 @@
 - `gateway-core::mcp`：轻量 MCP 客户端，支持 initialize / tools/list / tools/call
   （stdio 走子进程 JSON-RPC，http/sse 走 HTTP JSON-RPC）
 - Tauri IPC：`mcp_tools_list` / `mcp_tools_call`；UI「MCP」页可列出远端工具
-- 网关请求自动合并 MCP 工具/执行工具循环：列入后续迭代
+- 网关请求自动合并 MCP 工具/执行工具循环：已完成 ✅（请求注入 MCP 工具；
+  上游发起 MCP 工具调用时网关自动执行并回填结果，非流式/流式入站均支持）
 
 ### 技能（Skill）管理 —— 基础管理 + 自动注入已完成 ✅
 
@@ -397,8 +398,7 @@
 
 ### 待办（下一里程碑）
 
-1. MCP 工具自动合并到请求工具定义，并在上游发起 MCP 工具调用时自动执行/回填结果
-2. 真机验收 M1–M9 + MCP/Skill（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
+1. 真机验收 M1–M9 + MCP/Skill（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
 
 > 历史快照：M1–M9 + MCP/Skill 管理（含工具发现/调用、技能自动注入）快照已并入本节；更早的记录见 git 历史。
 

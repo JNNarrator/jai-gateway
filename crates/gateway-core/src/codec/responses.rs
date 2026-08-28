@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 
 use crate::codec::ir::{
     Block, CanonMessage, CanonicalRequest, CanonicalResponse, Role, SampleParams, StopReason,
-    StreamEvent, ToolChoice, ToolSpec,
+    StreamEvent, ToolChoice, ToolSpec, Usage,
 };
 
 /// OpenAI Responses 错误形状（protocol-ir §6 的 Responses 方言）。
@@ -333,6 +333,260 @@ pub fn render_response(r: &CanonicalResponse) -> Value {
     })
 }
 
+/// 编码 IR → OpenAI Responses API 请求体（上游侧）。
+///
+/// 与 [`decode_request`] 保持对称；主要用于 MCP 工具自动合并时
+/// Responses 入站 → Responses 同族上游的转换路径。
+pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
+    let mut body = json!({
+        "model": req.model,
+        "input": [],
+    });
+
+    if !req.system.is_empty() {
+        body["instructions"] = Value::String(req.system.join("\n\n"));
+    }
+
+    let mut input: Vec<Value> = Vec::new();
+    for m in &req.messages {
+        match m.role {
+            Role::User => {
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut tool_results: Vec<Value> = Vec::new();
+                for b in &m.blocks {
+                    match b {
+                        Block::Text { text } => text_parts.push(text.clone()),
+                        Block::Image { .. } => {
+                            // Responses 上游 v1 不支持图片内联转换，Lenient 丢弃
+                        }
+                        Block::ToolResult {
+                            call_id,
+                            content,
+                            is_error,
+                        } => {
+                            let text = content
+                                .iter()
+                                .filter_map(|c| c.as_text())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let output = if *is_error {
+                                format!("[error] {text}")
+                            } else {
+                                text
+                            };
+                            tool_results.push(json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": output,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if !text_parts.is_empty() {
+                    input.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": text_parts.iter().map(|t| json!({
+                            "type": "input_text",
+                            "text": t,
+                        })).collect::<Vec<_>>(),
+                    }));
+                }
+                input.extend(tool_results);
+            }
+            Role::Assistant => {
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut calls: Vec<Value> = Vec::new();
+                for b in &m.blocks {
+                    match b {
+                        Block::Text { text } => text_parts.push(text.clone()),
+                        Block::ToolUse { id, name, input } => {
+                            calls.push(json!({
+                                "type": "function_call",
+                                "call_id": id,
+                                "name": name,
+                                "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if !text_parts.is_empty() {
+                    input.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": text_parts.iter().map(|t| json!({
+                            "type": "output_text",
+                            "text": t,
+                        })).collect::<Vec<_>>(),
+                    }));
+                }
+                input.extend(calls);
+            }
+        }
+    }
+    body["input"] = Value::Array(input);
+
+    if !req.tools.is_empty() {
+        body["tools"] = Value::Array(
+            req.tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description.as_deref().unwrap_or(""),
+                        "parameters": t.input_schema,
+                    })
+                })
+                .collect(),
+        );
+        let choice = match &req.tool_choice {
+            ToolChoice::Auto => None,
+            ToolChoice::None => Some(json!("none")),
+            ToolChoice::Required => Some(json!("required")),
+            ToolChoice::Specific(name) => Some(json!({"type": "function", "name": name})),
+        };
+        if let Some(c) = choice {
+            body["tool_choice"] = c;
+        }
+    }
+
+    let p = &req.params;
+    if let Some(m) = p.max_output_tokens {
+        body["max_output_tokens"] = json!(m);
+    }
+    if let Some(t) = p.temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(v) = p.top_p {
+        body["top_p"] = json!(v);
+    }
+    if !p.stop_sequences.is_empty() {
+        body["stop"] = Value::Array(
+            p.stop_sequences
+                .iter()
+                .map(|s| Value::String(s.clone()))
+                .collect(),
+        );
+    }
+    if req.stream {
+        body["stream"] = json!(true);
+    }
+
+    Ok(body)
+}
+
+/// 解析 OpenAI Responses 非流式响应 → CanonicalResponse（上游侧）。
+pub fn parse_response(body: &[u8]) -> Result<CanonicalResponse, String> {
+    let v: Value =
+        serde_json::from_slice(body).map_err(|e| format!("Responses 响应 JSON 解析失败: {e}"))?;
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("上游返回错误")
+            .to_string();
+        return Err(format!("Responses 上游错误: {msg}"));
+    }
+
+    let id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let model = v
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let mut output: Vec<Block> = Vec::new();
+    let mut saw_tool_use = false;
+    if let Some(items) = v.get("output").and_then(Value::as_array) {
+        for item in items {
+            let typ = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            match typ {
+                "message" => {
+                    if let Some(content) = item.get("content").and_then(Value::as_array) {
+                        for part in content {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                if !t.is_empty() {
+                                    output.push(Block::Text {
+                                        text: t.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                "function_call" => {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let input: Value = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_else(|| json!({}));
+                    output.push(Block::ToolUse {
+                        id: call_id,
+                        name,
+                        input,
+                    });
+                    saw_tool_use = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let usage = v.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let mut parsed_usage = Usage::default();
+    if let Some(n) = usage.get("input_tokens").and_then(Value::as_u64) {
+        parsed_usage.input_tokens = n;
+    }
+    if let Some(n) = usage.get("output_tokens").and_then(Value::as_u64) {
+        parsed_usage.output_tokens = n;
+    }
+    if let Some(d) = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+    {
+        parsed_usage.cache_read_tokens = Some(d);
+    }
+
+    let status = v
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let stop_reason = if saw_tool_use {
+        StopReason::ToolUse
+    } else if status == "incomplete" {
+        StopReason::MaxTokens
+    } else {
+        StopReason::EndTurn
+    };
+
+    Ok(CanonicalResponse {
+        id,
+        model,
+        output,
+        stop_reason,
+        usage: parsed_usage,
+    })
+}
+
 /// Responses SSE 渲染状态。
 #[derive(Debug, Clone, Default)]
 pub struct RenderState {
@@ -607,6 +861,88 @@ mod tests {
         assert_eq!(v["output"][1]["type"], "function_call");
         assert_eq!(v["output"][1]["call_id"], "call_1");
         assert_eq!(v["usage"]["input_tokens"], 10);
+    }
+
+    #[test]
+    fn encode_request_roundtrips_through_decode() {
+        let req = CanonicalRequest {
+            model: "gpt-4o".into(),
+            system: vec!["Be concise.".into()],
+            messages: vec![
+                CanonMessage::text(Role::User, "hello"),
+                CanonMessage {
+                    role: Role::Assistant,
+                    blocks: vec![Block::ToolUse {
+                        id: "call_1".into(),
+                        name: "get_weather".into(),
+                        input: json!({"city":"bj"}),
+                    }],
+                },
+                CanonMessage {
+                    role: Role::User,
+                    blocks: vec![Block::ToolResult {
+                        call_id: "call_1".into(),
+                        content: vec![Block::Text {
+                            text: "sunny".into(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+            ],
+            tools: vec![ToolSpec {
+                name: "get_weather".into(),
+                description: Some("weather".into()),
+                input_schema: json!({"type":"object"}),
+            }],
+            tool_choice: ToolChoice::Auto,
+            params: SampleParams {
+                max_output_tokens: Some(128),
+                ..SampleParams::default()
+            },
+            stream: false,
+            extensions: Map::new(),
+        };
+        let encoded = encode_request(&req).unwrap();
+        let decoded = decode_request(&serde_json::to_vec(&encoded).unwrap()).unwrap();
+        assert_eq!(decoded.model, req.model);
+        assert_eq!(decoded.system, req.system);
+        assert_eq!(decoded.messages.len(), req.messages.len());
+        assert_eq!(decoded.tools.len(), req.tools.len());
+        assert!(matches!(
+            &decoded.messages[1].blocks[0],
+            Block::ToolUse { name, .. } if name == "get_weather"
+        ));
+        assert!(matches!(
+            &decoded.messages[2].blocks[0],
+            Block::ToolResult { call_id, .. } if call_id == "call_1"
+        ));
+    }
+
+    #[test]
+    fn parse_response_reads_text_and_function_call() {
+        let body = json!({
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"bj\"}"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5, "input_tokens_details": {"cached_tokens": 3}}
+        });
+        let parsed = parse_response(&serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(parsed.id, "resp_1");
+        assert_eq!(parsed.output.len(), 2);
+        assert_eq!(parsed.output[0].as_text(), Some("ok"));
+        assert!(matches!(
+            &parsed.output[1],
+            Block::ToolUse { id, name, input } if id == "call_1" && name == "get_weather" && input["city"] == "bj"
+        ));
+        assert_eq!(parsed.stop_reason, StopReason::ToolUse);
+        assert_eq!(parsed.usage.input_tokens, 10);
+        assert_eq!(parsed.usage.output_tokens, 5);
+        assert_eq!(parsed.usage.cache_read_tokens, Some(3));
     }
 
     #[test]

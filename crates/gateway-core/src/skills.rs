@@ -180,7 +180,8 @@ mod tests {
             let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
             w.start_file("my-skill.md", zip::write::SimpleFileOptions::default())
                 .unwrap();
-            w.write_all("# 我的技能\n第一行作为描述\n正文内容".as_bytes()).unwrap();
+            w.write_all("# 我的技能\n第一行作为描述\n正文内容".as_bytes())
+                .unwrap();
             w.finish().unwrap();
         }
         let drafts = parse_skills_zip(&buf).unwrap();

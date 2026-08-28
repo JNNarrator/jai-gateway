@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 - M9: 发布工程
   - CHANGELOG、发布检查单、tag 触发 CI（签名/公证需真实 secrets）
 - MCP Server 管理：`mcp_servers` 表 + CRUD IPC + UI「MCP」页；支持 tools/list、tools/call 客户端调用（stdio/http/sse）
+- MCP 工具自动合并 + 自动执行循环：网关把启用 MCP 工具注入请求工具定义；上游发起 MCP 工具调用时自动执行并回填结果继续生成
 - 技能（skill）管理：`skills` 表 + CRUD IPC + UI「技能」页；跨族转换请求自动注入启用技能到 system
 
 ### Changed

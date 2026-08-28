@@ -38,6 +38,17 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
         });
     }
 
+    // Gemini functionResponse 按函数名关联；先把 call_id 映射到最近的 ToolUse name。
+    let mut call_id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for m in &req.messages {
+        for b in &m.blocks {
+            if let Block::ToolUse { id, name, .. } = b {
+                call_id_to_name.insert(id.clone(), name.clone());
+            }
+        }
+    }
+
     // 消息 → contents[].parts[]
     let msgs = crate::codec::ir::merge_adjacent_same_role(req).messages;
     let mut contents: Vec<Value> = Vec::new();
@@ -66,11 +77,12 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                     parts.push(json!({"functionCall": {"name": name, "args": input}}));
                 }
                 Block::ToolResult {
-                    call_id: _,
+                    call_id,
                     content,
                     is_error,
                 } => {
-                    // Gemini functionResponse 按 name 关联；调用方负责把 call_id 映射为 name
+                    // Gemini functionResponse 按 name 关联；call_id 已在上面映射到 ToolUse name
+                    let name = call_id_to_name.get(call_id).cloned().unwrap_or_default();
                     let text = content
                         .iter()
                         .filter_map(|c| c.as_text())
@@ -81,7 +93,7 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                     } else {
                         json!({"result": text})
                     };
-                    parts.push(json!({"functionResponse": {"name": "", "response": response}}));
+                    parts.push(json!({"functionResponse": {"name": name, "response": response}}));
                 }
                 _ => {}
             }

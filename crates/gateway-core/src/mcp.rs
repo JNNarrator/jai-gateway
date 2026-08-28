@@ -8,6 +8,7 @@
 //! `initialize`、`tools/list`、`tools/call` 子集，不承载完整 MCP 生命周期。
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -19,6 +20,53 @@ pub struct McpTool {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
+}
+
+/// 已发现工具 + 所属 MCP Server，供网关自动合并/执行。
+#[derive(Debug, Clone)]
+pub struct McpServerTool {
+    pub server: McpServerRow,
+    pub tool: McpTool,
+}
+
+/// 收集所有启用 MCP Server 的工具列表。
+///
+/// 单个 Server 的 `tools/list` 失败不会拖垮整个请求：跳过该 Server 并打印警告。
+/// 返回的 `McpServerTool` 已按 Server 展开；同名工具去重由调用方决定。
+pub async fn collect_enabled_tools(db: &crate::store::Db) -> Vec<McpServerTool> {
+    let servers = match tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || db.with(crate::store::mcp_list).map_err(|e| e.to_string())
+    })
+    .await
+    {
+        Ok(Ok(list)) => list,
+        Ok(Err(e)) => {
+            eprintln!("[mcp] 读取 MCP Server 列表失败: {e}");
+            return Vec::new();
+        }
+        Err(e) => {
+            eprintln!("[mcp] MCP Server 列表任务失败: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for server in servers.into_iter().filter(|s| s.enabled) {
+        match tokio::time::timeout(Duration::from_secs(10), list_tools(&server)).await {
+            Ok(Ok(tools)) => {
+                for tool in tools {
+                    out.push(McpServerTool {
+                        server: server.clone(),
+                        tool,
+                    });
+                }
+            }
+            Ok(Err(e)) => eprintln!("[mcp] Server {} tools/list 失败: {e}", server.name),
+            Err(_) => eprintln!("[mcp] Server {} tools/list 超时(10s)", server.name),
+        }
+    }
+    out
 }
 
 /// 向一个 MCP Server 发起 `tools/list`。
@@ -61,15 +109,20 @@ pub async fn call_tool(
                 .unwrap_or_default();
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let result = run_stdio_jsonrpc(cmd, &args, "tools/call", &params, &tx).await?;
-            Ok(result)
+            Ok(unwrap_result(result))
         }
         "http" | "sse" => {
             let url = server.url.as_deref().ok_or("http/sse MCP 缺少 url")?;
             let result = run_http_jsonrpc(url, "tools/call", &params).await?;
-            Ok(result)
+            Ok(unwrap_result(result))
         }
         other => Err(format!("不支持的 MCP 类型: {other}")),
     }
+}
+
+/// 从 JSON-RPC 响应中取出 `result`；若没有 result（异常响应）则原样返回。
+fn unwrap_result(v: Value) -> Value {
+    v.get("result").cloned().unwrap_or(v)
 }
 
 fn parse_tools_list(v: &Value) -> Result<Vec<McpTool>, String> {

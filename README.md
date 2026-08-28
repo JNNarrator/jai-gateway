@@ -2,7 +2,7 @@
 
 > 开箱即用的本地 AI API 网关：把官方与第三方中转的杂牌 token 来源，收敛成一个稳定的本机入口，并让多设备（macOS / Windows）配置保持同步。
 
-**状态**：开发中 —— M0–M8 已完成，M9 发布工程文档/CI 已就绪；MCP Server 管理与技能（Skill）管理已提供基础管理/启停能力，真机验收与发布签名按[路线图](docs/design/roadmap.md)推进中。
+**状态**：开发中 —— M0–M8 已完成，M9 发布工程文档/CI 已就绪；MCP Server 管理、技能（Skill）管理与 MCP 工具自动执行循环已提供，真机验收与发布签名按[路线图](docs/design/roadmap.md)推进中。
 
 ## 它解决什么问题
 
@@ -19,6 +19,7 @@
   - Anthropic `POST /v1/messages`（Claude Code 直连）
 - 同名模型多渠道路由：按优先级自动故障转移
 - 跨协议转换（含 tool calling）：让任意客户端组合任意上游模型
+- MCP 工具自动合并与自动执行：把启用的 MCP Server 工具注入请求，并在上游调用时自动执行/回填
 - 请求日志（仅元数据）与用量统计基础
 
 ## 技术栈

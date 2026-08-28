@@ -10,6 +10,7 @@
 //! - Anthropic 线：x-api-key + anthropic-version 头（缺省注入默认版本）、
 //!   错误 Anthropic 化（type:error）、Overloaded→HTTP 529
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -680,6 +681,14 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
         );
     }
 
+    // ---- MCP 工具自动合并（后续迭代）----
+    // 每次请求收集一次启用 MCP Server 的工具列表；非空时强制走转换路径，
+    // 以便把 MCP 工具注入请求并在上游调用时自动执行/回填。
+    let mut mcp_tools: HashMap<String, crate::mcp::McpServerTool> = HashMap::new();
+    for mt in crate::mcp::collect_enabled_tools(&ctx.db).await {
+        mcp_tools.entry(mt.tool.name.clone()).or_insert(mt);
+    }
+
     // ---- 逐渠道尝试（按 priority, rowid 序）----
     // 故障转移：每个渠道失败时按 router 分类决定切换或停止；
     // 全部失败返回最后一个错误（roadmap M2：单轮遍历一遍即止，返回最后一个错误）。
@@ -687,9 +696,11 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
     let mut last_summary = String::from("所有渠道均失败");
     let mut last_http: Option<UpstreamError> = None;
     for cand in &candidates {
-        if cand.family != wire.family() {
-            // 跨族转换（M4）：入站 OpenAI → 上游 Anthropic / Gemini
-            match try_converted_candidate(&ctx, wire, &peeked, cand, &body, started).await {
+        // MCP 启用时不再走字节直通，而走转换路径（同族也可注入/执行 MCP 工具）。
+        if !mcp_tools.is_empty() || cand.family != wire.family() {
+            match try_converted_candidate(&ctx, wire, &peeked, cand, &body, started, &mcp_tools)
+                .await
+            {
                 Attempt::Delivered(resp) => return resp,
                 Attempt::Failed {
                     kind,
@@ -792,8 +803,7 @@ fn forward_inbound_headers(
             // 直接按前缀透传，方便上游风控识别为官方客户端。
             for (name, value) in headers.iter() {
                 let name_lower = name.as_str().to_ascii_lowercase();
-                if name_lower.starts_with("x-stainless-")
-                    || name_lower.starts_with("x-request-id")
+                if name_lower.starts_with("x-stainless-") || name_lower.starts_with("x-request-id")
                 {
                     req = req.header(name, value);
                 }
@@ -1070,6 +1080,7 @@ async fn try_converted_candidate(
     cand: &store::RouteCandidate,
     body: &Bytes,
     started: Instant,
+    mcp_tools: &HashMap<String, crate::mcp::McpServerTool>,
 ) -> Attempt {
     // 1) 解码入站（按入站线分发）
     let mut req = match wire {
@@ -1118,6 +1129,29 @@ async fn try_converted_candidate(
         Ok::<_, String>(())
     });
 
+    // MCP 工具自动合并：把启用 MCP Server 的 tools 注入请求工具定义。
+    // 客户端已声明的同名工具优先，避免覆盖/歧义。
+    let original_stream = req.stream;
+    let mut mcp_active = false;
+    if !mcp_tools.is_empty() {
+        for mt in mcp_tools.values() {
+            if req.tools.iter().any(|t| t.name == mt.tool.name) {
+                continue;
+            }
+            req.tools.push(crate::codec::ir::ToolSpec {
+                name: mt.tool.name.clone(),
+                description: mt.tool.description.clone(),
+                input_schema: mt.tool.input_schema.clone(),
+            });
+            mcp_active = true;
+        }
+        // 自动工具循环使用非流式上游多次往返；若客户端原本请求流式，
+        // 最后把最终响应合成为 SSE 回给客户端。
+        if mcp_active {
+            req.stream = false;
+        }
+    }
+
     // 2) 护栏（M4：blocks ≤ 64 / args ≤ 256KB）
     if let Err(msg) = crate::codec::ir::validate_guards(&req) {
         return Attempt::Delivered(wire.error_response(
@@ -1143,6 +1177,21 @@ async fn try_converted_candidate(
     // 2.6) 未建模字段：Lenient 丢弃 + 单条 WARN 汇总（§7）
     if let Some(note) = crate::codec::ir::extension_warn_note(&req) {
         eprintln!("[convert] {note}");
+    }
+
+    // MCP 自动执行循环：需要多次上游往返，走专门函数。
+    if mcp_active {
+        return run_mcp_tool_loop(
+            ctx,
+            wire,
+            peeked,
+            cand,
+            req,
+            mcp_tools,
+            original_stream,
+            started,
+        )
+        .await;
     }
 
     // 3) 按上游协议族编码
@@ -1213,6 +1262,23 @@ async fn try_converted_candidate(
             let out = ctx.http.post(&url);
             (url, (out, body))
         }
+        "openai_responses" => {
+            // MCP 自动合并时 Responses 入站 → Responses 同族上游（dsh/one-model）
+            let body = match crate::codec::responses::encode_request(&req) {
+                Ok(b) => b,
+                Err(msg) => {
+                    return Attempt::Delivered(wire.error_response(
+                        StatusCode::BAD_REQUEST,
+                        &msg,
+                        "invalid_request_error",
+                        None,
+                    ));
+                }
+            };
+            let url = url_join(&cand.base_url, "/responses");
+            let out = ctx.http.post(&url);
+            (url, (out, body))
+        }
         other => {
             return Attempt::Failed {
                 kind: "ProviderOther",
@@ -1259,7 +1325,7 @@ async fn try_converted_candidate(
     let mut out_req = match cand.family.as_str() {
         "anthropic" => out.header("x-api-key", &secret),
         "gemini" => out.header("x-goog-api-key", &secret),
-        "openai_compat" => out.bearer_auth(&secret),
+        "openai_compat" | "openai_responses" => out.bearer_auth(&secret),
         _ => out,
     };
     if let Some(eh_raw) = cand.extra_headers.as_deref() {
@@ -1410,6 +1476,672 @@ async fn try_converted_candidate(
     }
 }
 
+/// MCP 自动工具循环的最大上游往返次数。
+const MAX_MCP_TOOL_ROUNDS: usize = 8;
+
+/// MCP 自动循环：单次上游请求（非流式）并解析为 CanonicalResponse。
+///
+/// 与 `try_converted_candidate` 的编码/鉴权/错误处理保持一致；
+/// 专供 MCP 自动执行循环多次复用。
+async fn send_mcp_converted_once(
+    ctx: &GatewayCtx,
+    wire: InboundWire,
+    peeked: &PeekRequest,
+    cand: &store::RouteCandidate,
+    req: &crate::codec::ir::CanonicalRequest,
+    started: Instant,
+) -> Result<crate::codec::ir::CanonicalResponse, Attempt> {
+    // 1) 按上游协议族编码
+    let (url, auth_builder) = match cand.family.as_str() {
+        "anthropic" => {
+            let body = match crate::codec::anthropic::encode_request(req) {
+                Ok(b) => b,
+                Err(msg) => {
+                    return Err(Attempt::Delivered(wire.error_response(
+                        StatusCode::BAD_REQUEST,
+                        &msg,
+                        "invalid_request_error",
+                        None,
+                    )));
+                }
+            };
+            let url = url_join(&cand.base_url, "/v1/messages");
+            let out = ctx.http.post(&url);
+            (url, (out, body))
+        }
+        "gemini" => {
+            let mut req2 = req.clone();
+            if let Err(msg) = resolve_remote_images(ctx, &mut req2).await {
+                return Err(Attempt::Delivered(wire.error_response(
+                    StatusCode::BAD_REQUEST,
+                    &msg,
+                    "invalid_request_error",
+                    Some("image_fetch_failed"),
+                )));
+            }
+            let body = match crate::codec::gemini::encode_request(&req2) {
+                Ok(b) => b,
+                Err(msg) => {
+                    return Err(Attempt::Delivered(wire.error_response(
+                        StatusCode::BAD_REQUEST,
+                        &msg,
+                        "invalid_request_error",
+                        None,
+                    )));
+                }
+            };
+            let path = crate::codec::gemini::model_url(&req.model);
+            let mut url = url_join(&cand.base_url, &path);
+            if req.stream {
+                url.push_str("?alt=sse");
+            }
+            let out = ctx.http.post(&url);
+            (url, (out, body))
+        }
+        "openai_compat" => {
+            let body = match crate::codec::openai::encode_request(req) {
+                Ok(b) => b,
+                Err(msg) => {
+                    return Err(Attempt::Delivered(wire.error_response(
+                        StatusCode::BAD_REQUEST,
+                        &msg,
+                        "invalid_request_error",
+                        None,
+                    )));
+                }
+            };
+            let url = url_join(&cand.base_url, "/chat/completions");
+            let out = ctx.http.post(&url);
+            (url, (out, body))
+        }
+        "openai_responses" => {
+            let body = match crate::codec::responses::encode_request(req) {
+                Ok(b) => b,
+                Err(msg) => {
+                    return Err(Attempt::Delivered(wire.error_response(
+                        StatusCode::BAD_REQUEST,
+                        &msg,
+                        "invalid_request_error",
+                        None,
+                    )));
+                }
+            };
+            let url = url_join(&cand.base_url, "/responses");
+            let out = ctx.http.post(&url);
+            (url, (out, body))
+        }
+        other => {
+            return Err(Attempt::Failed {
+                kind: "ProviderOther",
+                summary: format!("未知上游协议族: {other}"),
+                last_http: None,
+            });
+        }
+    };
+
+    // 2) 取上游密钥并组装请求
+    let (out, body_json) = auth_builder;
+    let secret = {
+        let ref_ = cand.keyring_ref.clone();
+        match tokio::task::spawn_blocking(move || vault::get_secret(&ref_)).await {
+            Ok(Ok(Some(k))) => k,
+            Ok(Ok(None)) => {
+                let msg = "密钥环中缺少该供应商凭据，请在设置中重新录入";
+                provider_mark_fail(&ctx.db, &cand.provider_id, msg);
+                return Err(Attempt::Failed {
+                    kind: "UpstreamAuth",
+                    summary: format!("{}：{msg}", cand.provider_name),
+                    last_http: None,
+                });
+            }
+            Ok(Err(e)) => {
+                let msg = format!("keyring 读取失败: {e}");
+                provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
+                return Err(Attempt::Failed {
+                    kind: "ProviderOther",
+                    summary: format!("{}：{msg}", cand.provider_name),
+                    last_http: None,
+                });
+            }
+            Err(e) => {
+                eprintln!("[vault] join: {e}");
+                return Err(Attempt::Failed {
+                    kind: "ProviderOther",
+                    summary: format!("{}：密钥环任务失败", cand.provider_name),
+                    last_http: None,
+                });
+            }
+        }
+    };
+    let mut out_req = match cand.family.as_str() {
+        "anthropic" => out.header("x-api-key", &secret),
+        "gemini" => out.header("x-goog-api-key", &secret),
+        "openai_compat" | "openai_responses" => out.bearer_auth(&secret),
+        _ => out,
+    };
+    if let Some(eh_raw) = cand.extra_headers.as_deref() {
+        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, Value>>(eh_raw) {
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    if let (Ok(name), Ok(val)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(s),
+                    ) {
+                        out_req = out_req.header(name, val);
+                    }
+                }
+            }
+        }
+    }
+    drop(url);
+
+    // 3) 发送
+    let resp = match out_req
+        .json(&body_json)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("上游连接失败: {e}");
+            provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                None,
+                502,
+                ms_since(started),
+                false,
+                None,
+                Some("ProviderOther".into()),
+                Some(format!("[mcp] {}：{msg}", cand.provider_name)),
+            );
+            return Err(Attempt::Failed {
+                kind: "ProviderOther",
+                summary: format!("{}：{msg}", cand.provider_name),
+                last_http: None,
+            });
+        }
+    };
+
+    let up_status =
+        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if !up_status.is_success() {
+        let mut bytes = resp.bytes().await.unwrap_or_default();
+        if bytes.len() > MAX_ERROR_BODY {
+            bytes.truncate(MAX_ERROR_BODY);
+        }
+        let hint = String::from_utf8_lossy(&bytes).into_owned();
+        let snippet: String = hint.chars().take(240).collect();
+        match router::classify_status(up_status.as_u16(), &snippet) {
+            AttemptVerdict::Stop { kind } => {
+                provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
+                emit_log(
+                    &ctx.logs,
+                    wire.log_family(),
+                    Some(peeked),
+                    Some(&cand.provider_id),
+                    cand.upstream_model_id.clone(),
+                    up_status.as_u16() as i64,
+                    ms_since(started),
+                    false,
+                    None,
+                    Some(kind.into()),
+                    Some(format!("[mcp] {}：{snippet}", cand.provider_name)),
+                );
+                let (tname, code) = match kind {
+                    "ContextTooLong" => ("invalid_request_error", Some("context_length_exceeded")),
+                    _ => ("invalid_request_error", None),
+                };
+                return Err(Attempt::Delivered(
+                    wire.error_response(up_status, &snippet, tname, code),
+                ));
+            }
+            AttemptVerdict::Failover { kind } => {
+                provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
+                emit_log(
+                    &ctx.logs,
+                    wire.log_family(),
+                    Some(peeked),
+                    Some(&cand.provider_id),
+                    cand.upstream_model_id.clone(),
+                    up_status.as_u16() as i64,
+                    ms_since(started),
+                    false,
+                    None,
+                    Some(kind.into()),
+                    Some(format!(
+                        "[mcp] {}：「{kind}」即将切换渠道：{snippet}",
+                        cand.provider_name
+                    )),
+                );
+                return Err(Attempt::Failed {
+                    kind,
+                    summary: format!(
+                        "{}：上游 {kind}（HTTP {}）",
+                        cand.provider_name,
+                        up_status.as_u16()
+                    ),
+                    last_http: None,
+                });
+            }
+            AttemptVerdict::Success => unreachable!("非 2xx 不会判 Success"),
+        }
+    }
+
+    provider_mark_ok(&ctx.db, &cand.provider_id);
+
+    // 4) 读取并解析
+    let bytes = match tokio::time::timeout(NONSTREAM_READ_TIMEOUT, resp.bytes()).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            let msg = format!("上游响应读取失败: {e}");
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                None,
+                502,
+                ms_since(started),
+                false,
+                None,
+                Some("ProviderOther".into()),
+                Some(format!("[mcp] {msg}")),
+            );
+            return Err(Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_GATEWAY,
+                &msg,
+                "api_error",
+                None,
+            )));
+        }
+        Err(_) => {
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                None,
+                504,
+                ms_since(started),
+                false,
+                None,
+                Some("Overloaded".into()),
+                Some(format!(
+                    "[mcp] Overloaded read timeout (status={})",
+                    up_status.as_u16()
+                )),
+            );
+            return Err(Attempt::Delivered(wire.error_response(
+                wire.overloaded_status(),
+                "上游响应读取超时(300s)",
+                "api_error",
+                Some("upstream_read_timeout"),
+            )));
+        }
+    };
+
+    let parsed = match cand.family.as_str() {
+        "anthropic" => crate::codec::anthropic::parse_response(&bytes),
+        "gemini" => crate::codec::gemini::parse_response(&bytes),
+        "openai_compat" => crate::codec::openai::parse_response(&bytes),
+        "openai_responses" => crate::codec::responses::parse_response(&bytes),
+        other => Err(format!("未知上游协议族: {other}")),
+    };
+    parsed.map_err(|msg| {
+        emit_log(
+            &ctx.logs,
+            wire.log_family(),
+            Some(peeked),
+            Some(&cand.provider_id),
+            None,
+            502,
+            ms_since(started),
+            false,
+            None,
+            Some("ProviderOther".into()),
+            Some(format!("[mcp] 解析失败: {msg}")),
+        );
+        Attempt::Delivered(wire.error_response(StatusCode::BAD_GATEWAY, &msg, "api_error", None))
+    })
+}
+
+/// MCP 自动执行循环：把 MCP 工具注入请求后，当上游请求调用 MCP 工具时
+/// 由网关自动执行并把结果回填，继续让上游生成，直到最终答复或遇到非 MCP 工具调用。
+#[allow(clippy::too_many_arguments)]
+async fn run_mcp_tool_loop(
+    ctx: &GatewayCtx,
+    wire: InboundWire,
+    peeked: &PeekRequest,
+    cand: &store::RouteCandidate,
+    mut req: crate::codec::ir::CanonicalRequest,
+    mcp_tools: &HashMap<String, crate::mcp::McpServerTool>,
+    original_stream: bool,
+    started: Instant,
+) -> Attempt {
+    let mut final_resp: Option<crate::codec::ir::CanonicalResponse> = None;
+
+    for _round in 0..MAX_MCP_TOOL_ROUNDS {
+        let parsed = match send_mcp_converted_once(ctx, wire, peeked, cand, &req, started).await {
+            Ok(r) => r,
+            Err(a) => return a,
+        };
+
+        let tool_uses: Vec<crate::codec::ir::Block> = parsed
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                crate::codec::ir::Block::ToolUse { .. } => Some(b.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // 没有工具调用，或存在非 MCP 工具调用：停止自动循环，
+        // 把当前响应原样交给客户端（非 MCP 工具仍需客户端自行执行）。
+        if tool_uses.is_empty()
+            || tool_uses
+                .iter()
+                .any(|b| !mcp_tools.contains_key(tool_name(b)))
+        {
+            final_resp = Some(parsed);
+            break;
+        }
+
+        // 追加 assistant 工具调用，再执行 MCP 工具并追加结果
+        req.messages.push(crate::codec::ir::CanonMessage {
+            role: crate::codec::ir::Role::Assistant,
+            blocks: tool_uses.clone(),
+        });
+        let mut result_blocks = Vec::new();
+        for tu in &tool_uses {
+            let name = tool_name(tu);
+            let server = &mcp_tools[name].server;
+            let result = match tokio::time::timeout(
+                Duration::from_secs(60),
+                crate::mcp::call_tool(server, name, tool_input(tu)),
+            )
+            .await
+            {
+                Ok(Ok(v)) => crate::codec::ir::Block::ToolResult {
+                    call_id: tool_id(tu).to_string(),
+                    content: vec![crate::codec::ir::Block::Text {
+                        text: if v.is_null() {
+                            "ok".into()
+                        } else {
+                            v.to_string()
+                        },
+                    }],
+                    is_error: false,
+                },
+                Ok(Err(e)) => crate::codec::ir::Block::ToolResult {
+                    call_id: tool_id(tu).to_string(),
+                    content: vec![crate::codec::ir::Block::Text { text: e }],
+                    is_error: true,
+                },
+                Err(_) => crate::codec::ir::Block::ToolResult {
+                    call_id: tool_id(tu).to_string(),
+                    content: vec![crate::codec::ir::Block::Text {
+                        text: "MCP 工具调用超时(60s)".into(),
+                    }],
+                    is_error: true,
+                },
+            };
+            result_blocks.push(result);
+        }
+        req.messages.push(crate::codec::ir::CanonMessage {
+            role: crate::codec::ir::Role::User,
+            blocks: result_blocks,
+        });
+
+        if let Err(msg) = crate::codec::ir::validate_guards(&req) {
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_REQUEST,
+                &msg,
+                "invalid_request_error",
+                None,
+            ));
+        }
+    }
+
+    let final_resp = match final_resp {
+        Some(r) => r,
+        None => {
+            let msg = format!("MCP 工具自动执行超过 {MAX_MCP_TOOL_ROUNDS} 轮上限");
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_REQUEST,
+                &msg,
+                "invalid_request_error",
+                Some("mcp_tool_loop_limit"),
+            ));
+        }
+    };
+
+    // M5：Anthropic 入站出站 tool id 先映射（含超长 tool_id_map 回落）
+    let mut final_resp = final_resp;
+    if wire == InboundWire::Anthropic {
+        for b in &mut final_resp.output {
+            if let crate::codec::ir::Block::ToolUse { id, .. } = b {
+                *id = map_anthropic_tool_id(&ctx.db, id);
+            }
+        }
+    }
+
+    let usage = &final_resp.usage;
+    let uval = json!({
+        "prompt_tokens": usage.input_tokens,
+        "completion_tokens": usage.output_tokens,
+    });
+    emit_log(
+        &ctx.logs,
+        wire.log_family(),
+        Some(peeked),
+        Some(&cand.provider_id),
+        cand.upstream_model_id.clone(),
+        200,
+        ms_since(started),
+        original_stream,
+        Some(&uval),
+        None,
+        None,
+    );
+
+    if original_stream {
+        return Attempt::Delivered(render_mcp_response_as_sse(
+            wire,
+            &final_resp,
+            peeked,
+            started,
+        ));
+    }
+
+    let rendered = match wire {
+        InboundWire::OpenAi => crate::codec::openai::render_response(&final_resp).to_string(),
+        InboundWire::Anthropic => crate::codec::anthropic::render_response(&final_resp).to_string(),
+        InboundWire::Responses => crate::codec::responses::render_response(&final_resp).to_string(),
+    };
+    Attempt::Delivered(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(rendered))
+            .unwrap_or_else(|_| empty_resp(StatusCode::OK)),
+    )
+}
+
+fn tool_name(b: &crate::codec::ir::Block) -> &str {
+    match b {
+        crate::codec::ir::Block::ToolUse { name, .. } => name,
+        _ => "",
+    }
+}
+
+fn tool_id(b: &crate::codec::ir::Block) -> &str {
+    match b {
+        crate::codec::ir::Block::ToolUse { id, .. } => id,
+        _ => "",
+    }
+}
+
+fn tool_input(b: &crate::codec::ir::Block) -> Value {
+    match b {
+        crate::codec::ir::Block::ToolUse { input, .. } => input.clone(),
+        _ => Value::Null,
+    }
+}
+
+/// 把 MCP 循环得到的最终非流式响应合成为入站 SSE（客户端原本请求 stream=true）。
+fn render_mcp_response_as_sse(
+    wire: InboundWire,
+    resp: &crate::codec::ir::CanonicalResponse,
+    peeked: &PeekRequest,
+    started: Instant,
+) -> Response {
+    use crate::codec::ir::StreamEvent as Ev;
+
+    enum R {
+        OpenAi(crate::codec::openai::RenderState),
+        Anthropic(crate::codec::anthropic::AnthropicRenderState),
+        Responses(crate::codec::responses::RenderState),
+    }
+
+    fn push_frame(r: &mut R, ev: &Ev, out: &mut Vec<Bytes>, wire: InboundWire) {
+        match r {
+            R::OpenAi(st) => {
+                if let Some(line) = crate::codec::openai::render_stream_event(ev, st) {
+                    out.push(Bytes::from(format!("data: {line}\n\n")));
+                }
+            }
+            R::Anthropic(st) => {
+                for (evt, data) in crate::codec::anthropic::render_stream_event(ev, st) {
+                    out.push(Bytes::from(format!("event: {evt}\ndata: {data}\n\n")));
+                }
+            }
+            R::Responses(st) => {
+                for payload in crate::codec::responses::render_stream_event(ev, st) {
+                    out.push(Bytes::from(format!("data: {payload}\n\n")));
+                }
+            }
+        }
+        let _ = wire;
+    }
+
+    let mut r = match wire {
+        InboundWire::OpenAi => R::OpenAi(crate::codec::openai::RenderState {
+            id: format!("chatcmpl-jai-{}", started.elapsed().as_millis()),
+            model: peeked.model.clone(),
+            started: false,
+        }),
+        InboundWire::Anthropic => R::Anthropic(crate::codec::anthropic::AnthropicRenderState {
+            message_id: format!("msg_jai_{}", started.elapsed().as_millis()),
+            model: peeked.model.clone(),
+            active_block: None,
+            text_started: false,
+            active_tool_index: None,
+            next_block_index: 0,
+            finished: false,
+        }),
+        InboundWire::Responses => R::Responses(crate::codec::responses::RenderState {
+            response_id: format!("resp_jai_{}", started.elapsed().as_millis()),
+            model: peeked.model.clone(),
+            started: false,
+            output_index: 0,
+            item_started: false,
+        }),
+    };
+
+    let mut frames = Vec::new();
+    push_frame(
+        &mut r,
+        &Ev::Start {
+            model: peeked.model.clone(),
+        },
+        &mut frames,
+        wire,
+    );
+
+    let mut tool_index = 0usize;
+    for b in &resp.output {
+        match b {
+            crate::codec::ir::Block::Text { text } => {
+                push_frame(
+                    &mut r,
+                    &Ev::TextDelta { text: text.clone() },
+                    &mut frames,
+                    wire,
+                );
+            }
+            crate::codec::ir::Block::ToolUse { id, name, input } => {
+                push_frame(
+                    &mut r,
+                    &Ev::ToolCallStart {
+                        index: tool_index,
+                        id: id.clone(),
+                        name: name.clone(),
+                    },
+                    &mut frames,
+                    wire,
+                );
+                let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
+                push_frame(
+                    &mut r,
+                    &Ev::ToolCallArgsDelta {
+                        index: tool_index,
+                        args_fragment: args,
+                    },
+                    &mut frames,
+                    wire,
+                );
+                push_frame(
+                    &mut r,
+                    &Ev::ToolCallEnd { index: tool_index },
+                    &mut frames,
+                    wire,
+                );
+                tool_index += 1;
+            }
+            _ => {}
+        }
+    }
+
+    push_frame(
+        &mut r,
+        &Ev::Finish {
+            stop_reason: resp.stop_reason.clone(),
+            usage: resp.usage.clone(),
+        },
+        &mut frames,
+        wire,
+    );
+
+    // 各家流式收尾帧
+    match wire {
+        InboundWire::Anthropic => {
+            frames.push(Bytes::from(format!(
+                "event: message_stop\ndata: {}\n\n",
+                crate::codec::anthropic::render_message_stop()
+            )));
+        }
+        InboundWire::OpenAi => frames.push(Bytes::from_static(b"data: [DONE]\n\n")),
+        InboundWire::Responses => {}
+    }
+
+    let stream = futures_util::stream::iter(frames.into_iter().map(Ok::<_, std::io::Error>));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(
+            "x-jai-provider",
+            HeaderValue::from_str("mcp").unwrap_or(HeaderValue::from_static("unknown")),
+        )
+        .header("x-jai-mode", HeaderValue::from_static("converted"))
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| empty_resp(StatusCode::OK))
+}
 /// 转换路径：非流式解析 + 渲染为入站形状。
 async fn convert_plain_response(
     ctx: GatewayCtx,
@@ -1475,6 +2207,7 @@ async fn convert_plain_response(
         "anthropic" => crate::codec::anthropic::parse_response(&bytes),
         "gemini" => crate::codec::gemini::parse_response(&bytes),
         "openai_compat" => crate::codec::openai::parse_response(&bytes),
+        "openai_responses" => crate::codec::responses::parse_response(&bytes),
         other => Err(format!("未知上游协议族: {other}")),
     };
     let mut resp = match parsed {
@@ -1701,6 +2434,12 @@ async fn convert_streaming_response(
                                         continue;
                                     }
                                 },
+                                "openai_responses" => {
+                                    // MCP 自动循环强制非流式，正常转换路径不期望 Responses SSE；
+                                    // 若上游仍返回 SSE，暂时按无法解析处理。
+                                    eprintln!("[convert] openai_responses SSE 暂不支持流式转换");
+                                    continue;
+                                }
                                 _ => continue,
                             };
                         // M5：Anthropic 入站出站 tool id 先映射（含超长 tool_id_map 回落）
