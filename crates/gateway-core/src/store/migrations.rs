@@ -15,6 +15,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0003_openai_responses_family",
         include_str!("migrations/0003_openai_responses_family.sql"),
     ),
+    (
+        "0004_advanced_routing",
+        include_str!("migrations/0004_advanced_routing.sql"),
+    ),
 ];
 
 #[cfg(test)]

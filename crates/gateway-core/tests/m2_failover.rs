@@ -103,6 +103,7 @@ async fn fixture(priority_a: i64, priority_b: i64, status_a: u16, status_b: u16)
         family: "openai_compat".into(),
         enabled: true,
         priority: prio,
+        weight: 1,
         extra_headers: None,
         keyring_ref: vault::ref_for(&format!("p-{name}")),
         last_ok_at: None,

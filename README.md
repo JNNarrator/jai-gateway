@@ -17,7 +17,8 @@
   - OpenAI `POST /v1/chat/completions`
   - OpenAI Responses API `POST /v1/responses`（Codex CLI 原生接入）
   - Anthropic `POST /v1/messages`（Claude Code 直连）
-- 同名模型多渠道路由：按优先级自动故障转移
+- 同名模型多渠道路由：按优先级自动故障转移 + 健康感知排序 + 同优先级权重负载均衡
+- 模型别名/映射：每个模型可配置发给上游的真实模型 ID
 - 跨协议转换（含 tool calling）：让任意客户端组合任意上游模型
 - MCP 工具自动合并与自动执行：把启用的 MCP Server 工具注入请求，并在上游调用时自动执行/回填
 - 请求日志（仅元数据）与用量统计基础

@@ -15,6 +15,7 @@ export interface ProviderDto {
   family: Family;
   enabled: boolean;
   priority: number;
+  weight: number;
   extraHeaders?: string | null;
   lastOkAt?: number | null;
   lastErrAt?: number | null;

@@ -158,6 +158,7 @@ async fn fixture(mode: &'static str) -> Fixture {
                 family: "openai_compat".into(),
                 enabled: true,
                 priority: 1,
+                weight: 1,
                 extra_headers: None,
                 keyring_ref: vault::ref_for("p-oai"),
                 last_ok_at: None,

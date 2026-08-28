@@ -1274,7 +1274,7 @@ function ProviderCard(props: {
               {FAMILY_LABEL[p.family] ?? p.family}
             </span>
             <span className="text-[11px] text-neutral-500">
-              优先级 {p.priority}
+              优先级 {p.priority} · 权重 {p.weight}
             </span>
             {!p.hasKey && (
               <span className="text-[11px] text-amber-500">⚠ 缺少凭据</span>
@@ -1363,6 +1363,7 @@ function NewProviderForm({
   const [family, setFamily] = useState("openai_compat");
   const [apiKey, setApiKey] = useState("");
   const [priority, setPriority] = useState(100);
+  const [weight, setWeight] = useState(1);
   const [headerRows, setHeaderRows] = useState<{ key: string; value: string }[]>([
     { key: "", value: "" },
   ]);
@@ -1434,6 +1435,7 @@ function NewProviderForm({
         baseUrl,
         family,
         priority,
+        weight,
         extraHeaders: eh,
         apiKey,
       });
@@ -1489,6 +1491,10 @@ function NewProviderForm({
         <label className="text-xs text-neutral-400">
           路由优先级（数字越小越优先）
           <input className={`${inputCls} mt-1`} type="number" value={priority} onChange={(e) => setPriority(Number(e.target.value))} />
+        </label>
+        <label className="text-xs text-neutral-400">
+          权重（同优先级按比例分发）
+          <input className={`${inputCls} mt-1`} type="number" min={1} value={weight} onChange={(e) => setWeight(Math.max(1, Number(e.target.value)))} />
         </label>
         <div className="text-xs text-neutral-400 md:col-span-2">
           <div className="mb-1">追加请求头（可选，结构化编辑）</div>
@@ -1566,6 +1572,7 @@ function EditProviderForm({
   const [name, setName] = useState(p.name);
   const [baseUrl, setBaseUrl] = useState(p.baseUrl);
   const [priority, setPriority] = useState(p.priority);
+  const [weight, setWeight] = useState(p.weight);
   const [apiKey, setApiKey] = useState("");
   const [err, setErr] = useState("");
 
@@ -1577,6 +1584,7 @@ function EditProviderForm({
         name,
         baseUrl,
         priority,
+        weight,
         apiKey: apiKey || undefined,
       });
       onDone();
@@ -1598,6 +1606,10 @@ function EditProviderForm({
       <label className="text-xs text-neutral-400">
         优先级
         <input className={`${inputCls} mt-1`} type="number" value={priority} onChange={(e) => setPriority(Number(e.target.value))} />
+      </label>
+      <label className="text-xs text-neutral-400">
+        权重（同优先级按比例分发）
+        <input className={`${inputCls} mt-1`} type="number" min={1} value={weight} onChange={(e) => setWeight(Math.max(1, Number(e.target.value)))} />
       </label>
       <label className="text-xs text-neutral-400">
         替换 API Key（留空不变）
@@ -1700,7 +1712,8 @@ function ModelsTab() {
         <table className="w-full text-sm">
           <thead className="bg-neutral-900 text-left text-xs uppercase tracking-wider text-neutral-500">
             <tr>
-              <th className="w-1/2 px-4 py-2.5">模型名</th>
+              <th className="w-1/3 px-4 py-2.5">模型名</th>
+              <th className="w-1/6 px-4 py-2.5">上游模型 ID</th>
               <th className="w-1/6 px-4 py-2.5">上下文</th>
               <th className="w-1/6 px-4 py-2.5">最大输出</th>
               <th className="w-1/6 px-4 py-2.5 text-center">启用</th>
@@ -1711,12 +1724,13 @@ function ModelsTab() {
               <ModelRowEditor
                 key={m.id}
                 m={m}
-                onSave={async (ctx, out) => {
+                onSave={async (ctx, out, alias) => {
                   await api.modelSetLimits({
                     modelId: m.id,
                     contextWindow: ctx,
                     maxOutputTokens: out,
                   });
+                  await api.modelSetAlias(m.id, alias);
                   setModels(await api.modelList(selId));
                 }}
                 onToggle={async (v) => {
@@ -1745,15 +1759,20 @@ function ModelRowEditor({
   onToggle,
 }: {
   m: ModelRow;
-  onSave: (ctx: number | null, out: number) => Promise<void>;
+  onSave: (ctx: number | null, out: number, alias: string | null) => Promise<void>;
   onToggle: (enabled: boolean) => Promise<void>;
 }) {
   const [ctx, setCtx] = useState(m.contextWindow ?? 128000);
   const [out, setOut] = useState(m.maxOutputTokens);
+  const [alias, setAlias] = useState(m.upstreamModelId ?? "");
   const [saved, setSaved] = useState(false);
 
   async function handleSave() {
-    await onSave(m.contextWindow == null && ctx === 128000 ? null : ctx, out);
+    await onSave(
+      m.contextWindow == null && ctx === 128000 ? null : ctx,
+      out,
+      alias.trim() || null
+    );
     setSaved(true);
     window.setTimeout(() => setSaved(false), 3000);
   }
@@ -1761,6 +1780,18 @@ function ModelRowEditor({
   return (
     <tr className={m.enabled ? "" : "opacity-50"}>
       <td className="px-4 py-2 font-mono text-xs">{m.modelName}</td>
+      <td className="px-4 py-2">
+        <input
+          className={`${inputCls} w-32`}
+          value={alias}
+          placeholder="同模型名"
+          title="发给上游时使用的真实模型 ID；留空表示同名"
+          onChange={(e) => {
+            setSaved(false);
+            setAlias(e.target.value);
+          }}
+        />
+      </td>
       <td className="px-4 py-2">
         <input
           className={`${inputCls} w-28`}

@@ -120,6 +120,7 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
                     Some(name),
                     Some(base_url),
                     Some(priority),
+                    None,
                     Some(extra_headers.as_deref()),
                 );
             } else {
@@ -129,6 +130,7 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
                     None,
                     None,
                     Some(priority),
+                    None,
                     Some(extra_headers.as_deref()),
                 );
             }
@@ -147,6 +149,7 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
                 family: family.clone(),
                 enabled,
                 priority,
+                weight: 1,
                 extra_headers,
                 keyring_ref: format!("jai/provider/{id}"),
                 last_ok_at: None,

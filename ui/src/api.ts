@@ -27,6 +27,7 @@ export const api = {
     baseUrl: string;
     family: string;
     priority?: number;
+    weight?: number;
     extraHeaders?: string | null;
     apiKey: string;
   }) => invoke<ProviderDto>("provider_create", { input }),
@@ -35,6 +36,7 @@ export const api = {
     name?: string;
     baseUrl?: string;
     priority?: number;
+    weight?: number;
     extraHeaders?: string | null;
     apiKey?: string;
   }) => invoke<void>("provider_update", { input }),
@@ -63,6 +65,8 @@ export const api = {
     contextWindow?: number | null;
     maxOutputTokens: number;
   }) => invoke<void>("model_set_limits", { input }),
+  modelSetAlias: (modelId: string, upstreamModelId: string | null) =>
+    invoke<void>("model_set_alias", { input: { modelId, upstreamModelId } }),
   modelToggle: (modelId: string, enabled: boolean) =>
     invoke<void>("model_toggle", { modelId, enabled }),
 

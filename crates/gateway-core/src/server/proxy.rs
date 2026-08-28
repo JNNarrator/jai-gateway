@@ -654,6 +654,8 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
     if let Some(provider_name) = &provider_filter {
         candidates.retain(|c| c.provider_name == *provider_name);
     }
+    // 高级路由：健康感知 + 同优先级权重负载均衡
+    candidates = router::order_candidates(candidates, store::now_ms());
     // Responses 入站优先走同协议族直通（openai_responses），
     // 避免同名模型被 openai_compat 转换渠道按优先级截胡导致 400。
     candidates.sort_by_key(|c| c.family != wire.family());
@@ -900,6 +902,12 @@ async fn try_candidate(
         }
     };
 
+    // 模型别名/映射：models.upstream_model_id 非空时，发给上游的 model 换为真实模型 id
+    let body = match cand.upstream_model_id.as_deref() {
+        Some(real) => rewrite_body_model(body, real),
+        None => body.clone(),
+    };
+
     // ---- 组装上游请求（body 原样字节）----
     let url = url_join(&cand.base_url, wire.upstream_path());
     let mut out_req = wire.apply_auth(ctx.http.post(&url), &secret);
@@ -1118,6 +1126,11 @@ async fn try_converted_candidate(
             }
         },
     };
+    // 模型别名/映射：models.upstream_model_id 非空时，编码给上游前换为真实模型 id
+    if let Some(real) = cand.upstream_model_id.as_deref() {
+        req.model = real.to_string();
+    }
+
     // M5：Anthropic 入站历史 tool id 反解（含 tool_id_map 超长回落）
     if wire == InboundWire::Anthropic {
         resolve_anthropic_inbound_tool_ids(&ctx.db, &mut req);

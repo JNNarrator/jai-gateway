@@ -118,6 +118,7 @@ async fn fixture(upstream_status: u16) -> Fixture {
                 family: "anthropic".into(),
                 enabled: true,
                 priority: 1,
+                weight: 1,
                 extra_headers: None,
                 keyring_ref: vault::ref_for("p-claude"),
                 last_ok_at: None,

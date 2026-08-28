@@ -108,6 +108,7 @@ pub struct ProviderRow {
     pub family: String,
     pub enabled: bool,
     pub priority: i64,
+    pub weight: i64,
     pub extra_headers: Option<String>,
     /// keyring 引用：服务端内部使用；序列化到 UI 的 DTO 必须剔除
     #[serde(skip_serializing)]
@@ -133,7 +134,7 @@ pub struct ModelRow {
 
 // ================================================================ providers
 
-const PROVIDER_COLS: &str = "id,name,base_url,family,enabled,priority,extra_headers,keyring_ref,last_ok_at,last_err_at,last_err_msg,created_at,updated_at";
+const PROVIDER_COLS: &str = "id,name,base_url,family,enabled,priority,weight,extra_headers,keyring_ref,last_ok_at,last_err_at,last_err_msg,created_at,updated_at";
 
 fn row_to_provider(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
     Ok(ProviderRow {
@@ -143,13 +144,14 @@ fn row_to_provider(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
         family: r.get(3)?,
         enabled: r.get::<_, i64>(4)? != 0,
         priority: r.get(5)?,
-        extra_headers: r.get(6)?,
-        keyring_ref: r.get(7)?,
-        last_ok_at: r.get(8)?,
-        last_err_at: r.get(9)?,
-        last_err_msg: r.get(10)?,
-        created_at: r.get(11)?,
-        updated_at: r.get(12)?,
+        weight: r.get(6)?,
+        extra_headers: r.get(7)?,
+        keyring_ref: r.get(8)?,
+        last_ok_at: r.get(9)?,
+        last_err_at: r.get(10)?,
+        last_err_msg: r.get(11)?,
+        created_at: r.get(12)?,
+        updated_at: r.get(13)?,
     })
 }
 
@@ -168,7 +170,7 @@ fn row_to_model(r: &rusqlite::Row) -> rusqlite::Result<ModelRow> {
 pub fn provider_insert(c: &Connection, p: &ProviderRow) -> Result<(), StoreError> {
     c.execute(
         &format!(
-            "INSERT INTO providers({PROVIDER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+            "INSERT INTO providers({PROVIDER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
         ),
         params![
             p.id,
@@ -177,6 +179,7 @@ pub fn provider_insert(c: &Connection, p: &ProviderRow) -> Result<(), StoreError
             p.family,
             p.enabled as i64,
             p.priority,
+            p.weight,
             p.extra_headers,
             p.keyring_ref,
             p.last_ok_at,
@@ -223,6 +226,7 @@ pub fn provider_update_fields(
     name: Option<&str>,
     base_url: Option<&str>,
     priority: Option<i64>,
+    weight: Option<i64>,
     extra_headers: Option<Option<&str>>,
 ) -> Result<(), StoreError> {
     let now = now_ms();
@@ -242,6 +246,12 @@ pub fn provider_update_fields(
         c.execute(
             "UPDATE providers SET priority=?1, updated_at=?2 WHERE id=?3",
             params![pr, now, id],
+        )?;
+    }
+    if let Some(w) = weight {
+        c.execute(
+            "UPDATE providers SET weight=?1, updated_at=?2 WHERE id=?3",
+            params![w, now, id],
         )?;
     }
     if let Some(eh) = extra_headers {
@@ -363,25 +373,46 @@ pub fn model_toggle(c: &Connection, model_id: &str, enabled: bool) -> Result<(),
     Ok(())
 }
 
+/// 模型别名/映射：设置该模型发给上游时使用的真实模型 id。
+/// `None` 表示清空映射（上游使用同名模型）。
+pub fn model_set_upstream(
+    c: &Connection,
+    model_id: &str,
+    upstream_model_id: Option<&str>,
+) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE models SET upstream_model_id=?1 WHERE id=?2",
+        params![upstream_model_id, model_id],
+    )?;
+    Ok(())
+}
+
 /// 路由候选查询 —— storage §3 定案 SQL。按 (priority, rowid) 序逐渠道尝试。
 #[derive(Debug, Clone)]
 pub struct RouteCandidate {
     pub provider_id: String,
     pub provider_name: String,
+    pub priority: i64,
     pub base_url: String,
     pub family: String,
     pub extra_headers: Option<String>,
     pub keyring_ref: String,
     pub upstream_model_id: Option<String>,
     pub max_output_tokens: i64,
+    /// 高级路由：供应商权重（同 priority 内加权随机打散）
+    pub weight: i64,
+    /// 健康信息：用于健康感知排序（最近失败/最近成功）
+    pub last_ok_at: Option<i64>,
+    pub last_err_at: Option<i64>,
 }
 
 pub fn route_candidates(
     c: &Connection,
     model_name: &str,
 ) -> Result<Vec<RouteCandidate>, StoreError> {
-    let sql = "SELECT p.id, p.name, p.base_url, p.family, p.extra_headers, p.keyring_ref,
-                m.upstream_model_id, m.max_output_tokens
+    let sql = "SELECT p.id, p.name, p.priority, p.base_url, p.family, p.extra_headers,
+                p.keyring_ref, m.upstream_model_id, m.max_output_tokens, p.weight,
+                p.last_ok_at, p.last_err_at
          FROM models m JOIN providers p ON p.id = m.provider_id
          WHERE m.model_name = ?1 AND m.enabled = 1 AND p.enabled = 1
          ORDER BY p.priority ASC, m.rowid ASC";
@@ -391,12 +422,16 @@ pub fn route_candidates(
             Ok(RouteCandidate {
                 provider_id: r.get(0)?,
                 provider_name: r.get(1)?,
-                base_url: r.get(2)?,
-                family: r.get(3)?,
-                extra_headers: r.get(4)?,
-                keyring_ref: r.get(5)?,
-                upstream_model_id: r.get(6)?,
-                max_output_tokens: r.get(7)?,
+                priority: r.get(2)?,
+                base_url: r.get(3)?,
+                family: r.get(4)?,
+                extra_headers: r.get(5)?,
+                keyring_ref: r.get(6)?,
+                upstream_model_id: r.get(7)?,
+                max_output_tokens: r.get(8)?,
+                weight: r.get(9)?,
+                last_ok_at: r.get(10)?,
+                last_err_at: r.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

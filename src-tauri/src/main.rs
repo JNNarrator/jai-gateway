@@ -86,6 +86,7 @@ pub struct ProviderDto {
     pub family: String,
     pub enabled: bool,
     pub priority: i64,
+    pub weight: i64,
     pub extra_headers: Option<String>,
     pub last_ok_at: Option<i64>,
     pub last_err_at: Option<i64>,
@@ -101,6 +102,7 @@ fn to_dto(p: ProviderRow, has_key: bool) -> ProviderDto {
         family: p.family,
         enabled: p.enabled,
         priority: p.priority,
+        weight: p.weight,
         extra_headers: p.extra_headers,
         last_ok_at: p.last_ok_at,
         last_err_at: p.last_err_at,
@@ -143,6 +145,8 @@ pub struct NewProvider {
     pub family: String,
     #[serde(default = "default_priority")]
     pub priority: i64,
+    #[serde(default = "default_weight")]
+    pub weight: i64,
     #[serde(default)]
     pub extra_headers: Option<String>,
     pub api_key: String,
@@ -150,6 +154,10 @@ pub struct NewProvider {
 
 fn default_priority() -> i64 {
     100
+}
+
+fn default_weight() -> i64 {
+    1
 }
 
 #[tauri::command]
@@ -183,6 +191,7 @@ async fn provider_create(
         family: input.family,
         enabled: true,
         priority: input.priority,
+        weight: input.weight,
         extra_headers: input.extra_headers.filter(|s| !s.trim().is_empty()),
         keyring_ref,
         last_ok_at: None,
@@ -221,6 +230,7 @@ pub struct UpdateProviderInput {
     pub name: Option<String>,
     pub base_url: Option<String>,
     pub priority: Option<i64>,
+    pub weight: Option<i64>,
     /// 外层 Some 表示要动这个字段；内层 None 表示清空
     pub extra_headers: Option<Option<String>>,
     /// Some(非空) 覆盖密钥；Some("") 忽略
@@ -254,6 +264,7 @@ async fn provider_update(
                 input.name.as_deref(),
                 normalized.as_deref(),
                 input.priority,
+                input.weight,
                 input.extra_headers.as_ref().map(|o| o.as_deref()),
             )
         })
@@ -454,6 +465,27 @@ async fn model_set_limits(core: State<'_, AppCore>, input: ModelLimitsInput) -> 
                 input.context_window,
                 input.max_output_tokens,
             )
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAliasInput {
+    pub model_id: String,
+    /// null 表示清除映射，上游使用同名模型
+    pub upstream_model_id: Option<String>,
+}
+
+#[tauri::command]
+async fn model_set_alias(core: State<'_, AppCore>, input: ModelAliasInput) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| {
+            store::model_set_upstream(c, &input.model_id, input.upstream_model_id.as_deref())
         })
         .map_err(|e| e.to_string())
     })
@@ -1623,6 +1655,7 @@ fn main() {
             vault_storage_kind,
             model_list,
             model_set_limits,
+            model_set_alias,
             model_toggle,
             gateway_key_info,
             gateway_key_reveal,

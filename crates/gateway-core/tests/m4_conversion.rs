@@ -215,6 +215,7 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
                 family: family.into(),
                 enabled: true,
                 priority: 1,
+                weight: 1,
                 extra_headers: None,
                 keyring_ref: vault::ref_for(pid),
                 last_ok_at: None,
