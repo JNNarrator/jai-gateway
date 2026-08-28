@@ -393,6 +393,11 @@ function SyncTab() {
 
   async function doImport() {
     setErr("");
+    if (!importText.trim()) {
+      setErr("请先粘贴 JSON 内容");
+      return;
+    }
+    if (!confirm("导入会将 JSON 合并进当前本地配置，确定继续？")) return;
     try {
       const r = await api.configImport(importText, false);
       setMsg(
@@ -476,6 +481,20 @@ function SyncTab() {
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <button className={btnPrimary} onClick={doImport}>
             导入
+          </button>
+          <button
+            className={btnGhost}
+            onClick={async () => {
+              try {
+                const text = await navigator.clipboard.readText();
+                setImportText(text);
+                toast("已粘贴");
+              } catch {
+                toast("无法读取剪贴板", "err");
+              }
+            }}
+          >
+            粘贴
           </button>
           <span className="text-xs text-neutral-500">
             导出入口仍在「网关」页。
@@ -977,6 +996,9 @@ function SkillsTab() {
               <div className="min-w-0 flex-1">
                 <div className="font-medium">{s.name}</div>
                 <div className="truncate text-xs text-neutral-500">{s.description}</div>
+                <div className="mt-0.5 text-[11px] text-neutral-600">
+                  更新于 {new Date(s.updatedAt).toLocaleString()}
+                </div>
               </div>
               <button
                 className={btnDanger}
@@ -1627,10 +1649,10 @@ function ModelsTab() {
         <table className="w-full text-sm">
           <thead className="bg-neutral-900 text-left text-xs uppercase tracking-wider text-neutral-500">
             <tr>
-              <th className="px-4 py-2.5">模型名</th>
-              <th className="px-4 py-2.5">上下文</th>
-              <th className="px-4 py-2.5">最大输出</th>
-              <th className="px-4 py-2.5 text-center">启用</th>
+              <th className="w-1/2 px-4 py-2.5">模型名</th>
+              <th className="w-1/6 px-4 py-2.5">上下文</th>
+              <th className="w-1/6 px-4 py-2.5">最大输出</th>
+              <th className="w-1/6 px-4 py-2.5 text-center">启用</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-neutral-800/70">
@@ -2035,6 +2057,20 @@ function SettingsTab() {
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <button className={btnPrimary} onClick={save}>
             保存
+          </button>
+          <button
+            className={btnGhost}
+            onClick={() => {
+              const origin = window.prompt("输入允许的来源 Origin，例如 https://chat.example.com");
+              if (!origin) return;
+              const lines = raw.split("\n").map((s) => s.trim()).filter(Boolean);
+              if (!lines.includes(origin)) {
+                lines.push(origin);
+                setRaw(lines.join("\n"));
+              }
+            }}
+          >
+            + 添加域名
           </button>
           <button
             className={btnGhost}
