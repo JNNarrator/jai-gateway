@@ -91,6 +91,15 @@ export const api = {
     username: string;
     password?: string | null;
   }) => invoke<string>("webdav_test", { input }),
+  webdavPreview: () =>
+    invoke<{
+      remoteProviders: number;
+      remoteModels: number;
+      localProviders: number;
+      localModels: number;
+      willOverwrite: boolean;
+      message: string;
+    }>("webdav_preview"),
   webdavPush: () => invoke<void>("webdav_push"),
   webdavPull: () => invoke<ImportReport>("webdav_pull"),
 

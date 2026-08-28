@@ -741,6 +741,57 @@ async fn webdav_test(
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavPreview {
+    pub remote_providers: usize,
+    pub remote_models: usize,
+    pub local_providers: usize,
+    pub local_models: usize,
+    pub will_overwrite: bool,
+    pub message: String,
+}
+
+/// 预览 WebDAV 拉取将带来的变更（只读，不落库）。
+#[tauri::command]
+async fn webdav_preview(core: State<'_, AppCore>) -> Result<WebDavPreview, String> {
+    let cfg = get_webdav_config(&core).await?;
+    let password = get_webdav_password().await?;
+    let remote_text = sync::pull(&core.http, &cfg, &password).await?;
+    let local_text = export_config_json(core.clone()).await?;
+
+    let count = |text: &str| -> Result<(usize, usize), String> {
+        let v: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("配置 JSON 解析失败: {e}"))?;
+        let providers = v
+            .get("providers")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let models = v
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        Ok((providers, models))
+    };
+    let (rp, rm) = count(&remote_text)?;
+    let (lp, lm) = count(&local_text)?;
+    let changed = rp != lp || rm != lm;
+    Ok(WebDavPreview {
+        remote_providers: rp,
+        remote_models: rm,
+        local_providers: lp,
+        local_models: lm,
+        will_overwrite: changed,
+        message: if changed {
+            format!("远端 {rp} 个供应商/{rm} 个模型，本地 {lp} 个供应商/{lm} 个模型，拉取将覆盖本地")
+        } else {
+            "远端与本地配置一致，无需变更".into()
+        },
+    })
+}
+
 #[tauri::command]
 async fn webdav_push(core: State<'_, AppCore>) -> Result<(), String> {
     let cfg = get_webdav_config(&core).await?;
@@ -1589,6 +1640,7 @@ fn main() {
             webdav_config_get,
             webdav_config_set,
             webdav_test,
+            webdav_preview,
             webdav_push,
             webdav_pull,
             mcp_list,

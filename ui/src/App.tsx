@@ -447,6 +447,25 @@ function SyncTab() {
     }
   }
 
+  async function previewWebdav() {
+    setErr("");
+    setMsg("");
+    try {
+      const r = await api.webdavPreview();
+      setMsg(r.message);
+      if (r.willOverwrite && !confirm(`${r.message}。确定继续拉取吗？`)) {
+        return;
+      }
+      if (r.willOverwrite) {
+        await doPull();
+      } else {
+        toast("远端与本地一致");
+      }
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
   async function doPush() {
     setBusy("push");
     setErr("");
@@ -583,6 +602,9 @@ function SyncTab() {
           </button>
           <button className={btnGhost} onClick={testWebdav}>
             测试连接
+          </button>
+          <button className={btnGhost} onClick={previewWebdav}>
+            预览变更
           </button>
           <button className={btnGhost} disabled={busy === "push"} onClick={doPush}>
             {busy === "push" ? "推送中…" : "推送"}
