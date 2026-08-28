@@ -485,8 +485,10 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
         Ok(Ok(rows)) => {
             let mut seen = std::collections::HashSet::new();
             rows.into_iter()
-                .filter(|(id, _)| seen.insert(id.clone()))
-                .map(|(id, owner)| json!({"id": id, "object": "model", "owned_by": owner}))
+                .filter(|(id, owner)| seen.insert(format!("{owner}/{id}")))
+                .map(|(id, owner)| {
+                    json!({"id": format!("{owner}/{id}"), "object": "model", "owned_by": owner})
+                })
                 .collect::<Vec<_>>()
         }
         Ok(Err(e)) => {
@@ -615,11 +617,21 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
 
     // ---- 路由候选 ----
     let model = peeked.model.clone();
-    let candidates = {
+    // 支持 `供应商名/模型名` 限定 ID（多供应商模型列表用），
+    // 也兼容裸模型名（沿用 priority 路由）。
+    let (provider_filter, model_key) = match model.split_once('/') {
+        Some((p, m)) if !p.trim().is_empty() && !m.trim().is_empty() => {
+            (Some(p.trim().to_string()), m.trim().to_string())
+        }
+        _ => (None, model.clone()),
+    };
+    let mut candidates = {
         let db = ctx.db.clone();
-        let model2 = model.clone();
-        match tokio::task::spawn_blocking(move || db.with(|c| store::route_candidates(c, &model2)))
-            .await
+        let model_key2 = model_key.clone();
+        match tokio::task::spawn_blocking(move || {
+            db.with(|c| store::route_candidates(c, &model_key2))
+        })
+        .await
         {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
@@ -632,6 +644,9 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             }
         }
     };
+    if let Some(provider_name) = &provider_filter {
+        candidates.retain(|c| c.provider_name == *provider_name);
+    }
 
     if candidates.is_empty() {
         let msg = format!("模型 {model:?} 不存在或其渠道未启用");

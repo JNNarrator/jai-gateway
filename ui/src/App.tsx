@@ -1174,7 +1174,9 @@ function NewProviderForm({
   const [family, setFamily] = useState("openai_compat");
   const [apiKey, setApiKey] = useState("");
   const [priority, setPriority] = useState(100);
-  const [extraHeaders, setExtraHeaders] = useState("");
+  const [headerRows, setHeaderRows] = useState<{ key: string; value: string }[]>([
+    { key: "", value: "" },
+  ]);
   const [err, setErr] = useState("");
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [testing, setTesting] = useState(false);
@@ -1228,11 +1230,16 @@ function NewProviderForm({
   async function submit() {
     setErr("");
     try {
-      let eh: string | null = null;
-      if (extraHeaders.trim()) {
-        JSON.parse(extraHeaders); // 校验合法
-        eh = extraHeaders;
+      const headersObj: Record<string, string> = {};
+      for (const row of headerRows) {
+        const k = row.key.trim();
+        const v = row.value.trim();
+        if (k || v) {
+          if (!k) throw new Error("请求头名称不能为空");
+          headersObj[k] = v;
+        }
       }
+      const eh = Object.keys(headersObj).length ? JSON.stringify(headersObj) : null;
       await api.providerCreate({
         name,
         baseUrl,
@@ -1276,10 +1283,48 @@ function NewProviderForm({
           路由优先级（数字越小越优先）
           <input className={`${inputCls} mt-1`} type="number" value={priority} onChange={(e) => setPriority(Number(e.target.value))} />
         </label>
-        <label className="text-xs text-neutral-400">
-          追加请求头（可选，JSON 对象）
-          <input className={`${inputCls} mt-1`} value={extraHeaders} onChange={(e) => setExtraHeaders(e.target.value)} placeholder='{"HTTP-Referer":"…"}' />
-        </label>
+        <div className="text-xs text-neutral-400 md:col-span-2">
+          <div className="mb-1">追加请求头（可选，结构化编辑）</div>
+          <div className="space-y-2">
+            {headerRows.map((row, i) => (
+              <div key={i} className="flex gap-2">
+                <input
+                  className={`${inputCls} flex-1`}
+                  placeholder="Header 名，如 HTTP-Referer"
+                  value={row.key}
+                  onChange={(e) => {
+                    const next = [...headerRows];
+                    next[i] = { ...next[i], key: e.target.value };
+                    setHeaderRows(next);
+                  }}
+                />
+                <input
+                  className={`${inputCls} flex-1`}
+                  placeholder="值"
+                  value={row.value}
+                  onChange={(e) => {
+                    const next = [...headerRows];
+                    next[i] = { ...next[i], value: e.target.value };
+                    setHeaderRows(next);
+                  }}
+                />
+                <button
+                  className={btnGhost}
+                  onClick={() => setHeaderRows(headerRows.filter((_, idx) => idx !== i))}
+                  title="删除此行"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+          <button
+            className={`${btnGhost} mt-2`}
+            onClick={() => setHeaderRows([...headerRows, { key: "", value: "" }])}
+          >
+            + 添加请求头
+          </button>
+        </div>
       </div>
       {err && <div className="mt-3 text-xs text-red-400">{err}</div>}
       {testMsg && (
