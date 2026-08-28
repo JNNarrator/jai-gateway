@@ -377,6 +377,7 @@ function SyncTab() {
     directory: "",
   });
   const [pw, setPw] = useState("");
+  const [showPw, setShowPw] = useState(false);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
@@ -511,10 +512,19 @@ function SyncTab() {
             />
           </label>
           <label className="text-xs text-neutral-400">
-            密码（存入钥匙串，留空保持原密码）
+            <span className="flex items-center justify-between">
+              <span>密码（存入钥匙串，留空保持原密码）</span>
+              <button
+                className={btnGhost}
+                type="button"
+                onClick={() => setShowPw(!showPw)}
+              >
+                {showPw ? "隐藏" : "显示"}
+              </button>
+            </span>
             <input
               className={`${inputCls} mt-1`}
-              type="password"
+              type={showPw ? "text" : "password"}
               value={pw}
               onChange={(e) => setPw(e.target.value)}
             />
