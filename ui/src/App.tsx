@@ -655,9 +655,23 @@ function McpTab() {
     <div className="mx-auto max-w-3xl space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">MCP Server 管理</h1>
-        <button className={btnPrimary} onClick={() => setShowNew(true)}>
-          + 添加 MCP Server
-        </button>
+        <div className="flex gap-2">
+          <button
+            className={btnGhost}
+            onClick={() =>
+              act(async () => {
+                const cfg = await api.mcpExportConfig();
+                copyText(JSON.stringify(cfg, null, 2));
+                toast("已复制客户端 MCP 配置");
+              })
+            }
+          >
+            复制客户端配置
+          </button>
+          <button className={btnPrimary} onClick={() => setShowNew(true)}>
+            + 添加 MCP Server
+          </button>
+        </div>
       </div>
       {err && (
         <div className="rounded border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
@@ -967,6 +981,18 @@ function SkillsTab() {
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">技能（Skill）管理</h1>
         <div className="flex gap-2">
+          <button
+            className={btnGhost}
+            onClick={() =>
+              act(async () => {
+                const md = await api.skillExportMarkdown();
+                copyText(md);
+                toast("已复制技能包");
+              })
+            }
+          >
+            复制技能包
+          </button>
           <input
             ref={fileRef}
             type="file"

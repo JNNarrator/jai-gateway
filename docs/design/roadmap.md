@@ -389,6 +389,7 @@
   上游发起 MCP 工具调用时网关自动执行并回填结果，非流式/流式入站均支持）
 - MCP 工具列表缓存：30s TTL，避免每个请求重复启动/请求 MCP Server
 - dsh 真机联调：Chat / Responses / MCP / Skill / 别名 / 故障转移已用本机 dsh 实测通过；Responses 合成 SSE 已按真实 API 形状修正（见 `docs/test-report-dsh.md`）
+- MCP/Skill 配置托管（CC-Switch 风格）：MCP 可导出标准 `mcpServers` JSON，Skill 可导出 Markdown，供 Agent 加载后自行调度
 
 ### 技能（Skill）管理 —— 基础管理 + 自动注入已完成 ✅
 

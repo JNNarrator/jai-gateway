@@ -1023,6 +1023,32 @@ async fn mcp_tools_call(
     gateway_core::mcp::call_tool(&row, &name, arguments).await
 }
 
+#[tauri::command]
+async fn mcp_export_config(core: State<'_, AppCore>) -> Result<serde_json::Value, String> {
+    let db = core.db.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| store::mcp_list(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    let mut servers = serde_json::Map::new();
+    for s in rows.into_iter().filter(|s| s.enabled) {
+        let args: Vec<String> = s
+            .args
+            .as_deref()
+            .map(|v| serde_json::from_str(v).unwrap_or_default())
+            .unwrap_or_default();
+        let entry = serde_json::json!({
+            "command": s.command,
+            "args": args,
+            "url": s.url,
+            "env": {},
+        });
+        servers.insert(s.name, entry);
+    }
+    Ok(serde_json::json!({ "mcpServers": servers }))
+}
+
 async fn fetch_mcp_server(db: &Db, id: &str) -> Result<McpServerRow, String> {
     let db = db.clone();
     let id = id.to_string();
@@ -1169,6 +1195,28 @@ async fn skill_import_zip(core: State<'_, AppCore>, data: Vec<u8>) -> Result<usi
         imported += 1;
     }
     Ok(imported)
+}
+
+#[tauri::command]
+async fn skill_export_markdown(core: State<'_, AppCore>) -> Result<String, String> {
+    let db = core.db.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| store::skill_list(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    let mut parts = Vec::new();
+    for s in rows.into_iter().filter(|s| s.enabled) {
+        parts.push(format!("## 技能：{}", s.name));
+        if !s.description.is_empty() {
+            parts.push(format!("描述：{}", s.description));
+        }
+        parts.push(s.content);
+        parts.push(String::new());
+    }
+    Ok(parts.join("
+
+"))
 }
 
 #[tauri::command]
@@ -1690,7 +1738,9 @@ fn main() {
             mcp_delete,
             mcp_tools_list,
             mcp_tools_call,
+            mcp_export_config,
             skill_list,
+            skill_export_markdown,
             skill_create,
             skill_update,
             skill_set_enabled,

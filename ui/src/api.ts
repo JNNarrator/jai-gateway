@@ -132,6 +132,7 @@ export const api = {
   mcpToolsList: (id: string) => invoke<McpTool[]>("mcp_tools_list", { id }),
   mcpToolsCall: (id: string, name: string, args: unknown) =>
     invoke<unknown>("mcp_tools_call", { id, name, arguments: args }),
+  mcpExportConfig: () => invoke<{ mcpServers: Record<string, unknown> }>("mcp_export_config"),
 
   // Skill 管理
   skillList: () => invoke<SkillRow[]>("skill_list"),
@@ -151,6 +152,7 @@ export const api = {
   skillDelete: (id: string) => invoke<void>("skill_delete", { id }),
   skillImportZip: (data: number[]) =>
     invoke<number>("skill_import_zip", { data }),
+  skillExportMarkdown: () => invoke<string>("skill_export_markdown"),
   vaultStorageKind: () => invoke<string>("vault_storage_kind"),
 
   corsAllowGet: () => invoke<string[]>("cors_allow_get"),

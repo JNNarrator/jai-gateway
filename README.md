@@ -38,6 +38,7 @@ JAI 优先保证 **DeepSeek Harness（dsh）** 与 **zcode** 的使用体验：
 - **dsh**：已实测打通 OpenAI Chat Completions 与 OpenAI Responses 两条链路，MCP、Skill、别名映射、故障转移均可正常工作。
 - **zcode**：协议线待真机确认后纳入同等回归保障。
 - 同族直通默认保持字节级透传；只有显式启用 MCP/Skill 等增强能力时才进入转换路径。
+- MCP/Skill 配置可一键导出给 Agent 加载：MCP 输出标准 `mcpServers` JSON，技能输出 Markdown 文本。
 
 ## 文档索引
 

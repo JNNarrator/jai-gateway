@@ -26,6 +26,8 @@ All notable changes to this project will be documented in this file.
 - Responses 流式转换也补齐真实 SSE 事件行与 done 事件，保证 dsh/zcode 经 JAI 与直连体验一致
 - 新增 `docs/test-report-dsh.md` dsh 真机测试报告
 - README 明确：优先支持国产 Agent（dsh / zcode）
+- MCP 配置托管：新增「复制客户端配置」，导出标准 `mcpServers` JSON，供 Claude Code / Continue 等 Agent 加载
+- Skill 导出：新增「复制技能包」，导出启用技能 Markdown 文本，供 Agent 加载/查看
 - 技能（skill）管理：`skills` 表 + CRUD IPC + UI「技能」页；跨族转换请求自动注入启用技能到 system
 
 ### Changed
