@@ -2108,6 +2108,7 @@ fn render_mcp_response_as_sse(
             started: false,
             output_index: 0,
             item_started: false,
+            current_text: String::new(),
         }),
     };
 
@@ -2415,6 +2416,7 @@ async fn convert_streaming_response(
             started: false,
             output_index: 0,
             item_started: false,
+            current_text: String::new(),
         }),
     };
     // 渲染单个 IR 事件 → SSE 输出帧（一个 IR 事件可能展开多个 SSE 事件）
@@ -2430,7 +2432,13 @@ async fn convert_streaming_response(
                 .collect(),
             SseRenderer::Responses(st) => crate::codec::responses::render_stream_event(ev, st)
                 .into_iter()
-                .map(|payload| format!("data: {payload}\n\n"))
+                .map(|payload| {
+                    let event = serde_json::from_str::<Value>(&payload)
+                        .ok()
+                        .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
+                        .unwrap_or_else(|| "response.output_text.delta".to_string());
+                    format!("event: {event}\ndata: {payload}\n\n")
+                })
                 .collect(),
         }
     }

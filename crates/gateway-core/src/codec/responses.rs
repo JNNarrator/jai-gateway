@@ -793,6 +793,8 @@ pub struct RenderState {
     pub output_index: usize,
     /// 当前文本 item 是否已开
     pub item_started: bool,
+    /// 当前文本 item 已累积的文本（用于 output_text.done / content_part.done）
+    pub current_text: String,
 }
 
 impl RenderState {
@@ -817,6 +819,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             st.started = true;
             st.output_index = 0;
             st.item_started = false;
+            st.current_text.clear();
             vec![
                 json!({
                     "type": "response.created",
@@ -837,6 +840,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             let mut out = Vec::new();
             if !st.item_started {
                 st.item_started = true;
+                st.current_text.clear();
                 out.push(
                     json!({
                         "type": "response.output_item.added",
@@ -862,6 +866,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                     .to_string(),
                 );
             }
+            st.current_text.push_str(text);
             out.push(
                 json!({
                     "type": "response.output_text.delta",
@@ -932,16 +937,39 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
         Ev::Finish { stop_reason, usage } => {
             let mut out = Vec::new();
             if st.item_started {
+                let item_id = format!("msg_{}", st.response_id);
+                let text = std::mem::take(&mut st.current_text);
+                out.push(
+                    json!({
+                        "type": "response.output_text.done",
+                        "item_id": item_id,
+                        "output_index": st.output_index,
+                        "content_index": 0,
+                        "text": text,
+                    })
+                    .to_string(),
+                );
+                let part = json!({"type": "output_text", "text": text, "annotations": []});
+                out.push(
+                    json!({
+                        "type": "response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": st.output_index,
+                        "content_index": 0,
+                        "part": part,
+                    })
+                    .to_string(),
+                );
                 out.push(
                     json!({
                         "type": "response.output_item.done",
                         "output_index": st.output_index,
                         "item": {
                             "type": "message",
-                            "id": format!("msg_{}", st.response_id),
+                            "id": item_id,
                             "role": "assistant",
                             "status": "completed",
-                            "content": [],
+                            "content": [part],
                         },
                     })
                     .to_string(),
@@ -1173,6 +1201,7 @@ mod tests {
         let mut st = RenderState {
             response_id: "resp_1".into(),
             model: "gpt-4o".into(),
+            current_text: String::new(),
             ..Default::default()
         };
         let start = render_stream_event(
