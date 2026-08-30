@@ -2040,6 +2040,24 @@ fn render_mcp_response_as_sse(
 ) -> Response {
     use crate::codec::ir::StreamEvent as Ev;
 
+    // Responses 入站使用完整 SSE 形状（event 行 + sequence_number + 收尾帧），
+    // 与真实 Responses API 对齐，避免 dsh/pi-ai 解析失败。
+    if wire == InboundWire::Responses {
+        let frames = crate::codec::responses::render_response_sse(resp);
+        let stream = futures_util::stream::iter(frames.into_iter().map(Ok::<_, std::io::Error>));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(
+                "x-jai-provider",
+                HeaderValue::from_str("mcp").unwrap_or(HeaderValue::from_static("unknown")),
+            )
+            .header("x-jai-mode", HeaderValue::from_static("converted"))
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| empty_resp(StatusCode::OK));
+    }
+
     enum R {
         OpenAi(crate::codec::openai::RenderState),
         Anthropic(crate::codec::anthropic::AnthropicRenderState),

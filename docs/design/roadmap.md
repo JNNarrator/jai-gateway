@@ -388,6 +388,7 @@
 - 网关请求自动合并 MCP 工具/执行工具循环：已完成 ✅（请求注入 MCP 工具；
   上游发起 MCP 工具调用时网关自动执行并回填结果，非流式/流式入站均支持）
 - MCP 工具列表缓存：30s TTL，避免每个请求重复启动/请求 MCP Server
+- dsh 真机联调：Chat / Responses / MCP / Skill / 别名 / 故障转移已用本机 dsh 实测通过；Responses 合成 SSE 已按真实 API 形状修正（见 `docs/test-report-dsh.md`）
 
 ### 技能（Skill）管理 —— 基础管理 + 自动注入已完成 ✅
 

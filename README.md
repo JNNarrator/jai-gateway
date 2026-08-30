@@ -36,6 +36,7 @@ Tauri 2.0 · Rust (Axum + Reqwest) · React + TypeScript + TailwindCSS · SQLite
 | [docs/design/protocol-ir.md](docs/design/protocol-ir.md) | 协议中间表示、逐字段映射总表、行为规范 |
 | [docs/design/storage-schema.md](docs/design/storage-schema.md) | SQLite 表结构、密钥管理、日志策略 |
 | [docs/design/roadmap.md](docs/design/roadmap.md) | M0–M9 里程碑路线图与稳定性基线 |
+| [docs/test-report-dsh.md](docs/test-report-dsh.md) | 本机 dsh 真机联调测试报告 |
 
 ## 第一梯队客户端
 

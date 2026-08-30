@@ -587,6 +587,202 @@ pub fn parse_response(body: &[u8]) -> Result<CanonicalResponse, String> {
     })
 }
 
+/// 把非流式 CanonicalResponse 渲染为符合 OpenAI Responses 真实 SSE 形状的完整帧。
+///
+/// 用于 MCP 自动循环等需要“最终响应合成流式”的场景；包含
+/// `response.created` / `output_item.added` / `output_text.delta` /
+/// `output_text.done` / `content_part.done` / `output_item.done` /
+/// `response.completed` 与结尾 `[DONE]`，并带 `event:` 行与 `sequence_number`。
+pub fn render_response_sse(resp: &CanonicalResponse) -> Vec<String> {
+    let mut out = Vec::new();
+    let push = |out: &mut Vec<String>, event: &str, data: Value| {
+        out.push(format!(
+            "event: {event}
+data: {data}
+
+"
+        ));
+    };
+
+    let in_progress = json!({
+        "id": resp.id,
+        "object": "response",
+        "created_at": crate::store::now_ms() / 1000,
+        "status": "in_progress",
+        "model": resp.model,
+        "output": [],
+    });
+    push(
+        &mut out,
+        "response.created",
+        json!({
+            "type": "response.created",
+            "response": in_progress,
+        }),
+    );
+    push(
+        &mut out,
+        "response.in_progress",
+        json!({
+            "type": "response.in_progress",
+            "response": in_progress,
+        }),
+    );
+
+    for (output_index, block) in resp.output.iter().enumerate() {
+        match block {
+            Block::Text { text } => {
+                let item_id = format!("msg_{}", resp.id);
+                let empty_part = json!({"type":"output_text","text":"","annotations":[]});
+                let item = json!({
+                    "type":"message",
+                    "id": item_id,
+                    "role":"assistant",
+                    "status":"in_progress",
+                    "content":[empty_part],
+                });
+                push(
+                    &mut out,
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                );
+                push(
+                    &mut out,
+                    "response.content_part.added",
+                    json!({
+                        "type":"response.content_part.added",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": empty_part,
+                    }),
+                );
+                push(
+                    &mut out,
+                    "response.output_text.delta",
+                    json!({
+                        "type":"response.output_text.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "delta": text,
+                    }),
+                );
+                push(
+                    &mut out,
+                    "response.output_text.done",
+                    json!({
+                        "type":"response.output_text.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "text": text,
+                    }),
+                );
+                let done_part = json!({"type":"output_text","text":text,"annotations":[]});
+                push(
+                    &mut out,
+                    "response.content_part.done",
+                    json!({
+                        "type":"response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": done_part,
+                    }),
+                );
+                push(
+                    &mut out,
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index": output_index,
+                        "item": {
+                            "type":"message",
+                            "id": item_id,
+                            "role":"assistant",
+                            "status":"completed",
+                            "content":[done_part],
+                        },
+                    }),
+                );
+            }
+            Block::ToolUse { id, name, input } => {
+                let item_id = format!("fc_{id}");
+                let arguments = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
+                let item = json!({
+                    "type":"function_call",
+                    "id": item_id,
+                    "call_id": id,
+                    "name": name,
+                    "arguments": "",
+                });
+                push(
+                    &mut out,
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                );
+                push(
+                    &mut out,
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type":"response.function_call_arguments.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": arguments,
+                    }),
+                );
+                push(
+                    &mut out,
+                    "response.function_call_arguments.done",
+                    json!({
+                        "type":"response.function_call_arguments.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "arguments": arguments,
+                    }),
+                );
+                push(
+                    &mut out,
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index": output_index,
+                        "item": {
+                            "type":"function_call",
+                            "id": item_id,
+                            "call_id": id,
+                            "name": name,
+                            "arguments": arguments,
+                        },
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let completed = render_response(resp);
+    push(
+        &mut out,
+        "response.completed",
+        json!({
+            "type":"response.completed",
+            "response": completed,
+        }),
+    );
+    out.push("data: [DONE]\n\n".to_string());
+    out
+}
+
 /// Responses SSE 渲染状态。
 #[derive(Debug, Clone, Default)]
 pub struct RenderState {
@@ -943,6 +1139,33 @@ mod tests {
         assert_eq!(parsed.usage.input_tokens, 10);
         assert_eq!(parsed.usage.output_tokens, 5);
         assert_eq!(parsed.usage.cache_read_tokens, Some(3));
+    }
+
+    #[test]
+    fn render_response_sse_has_event_lines_and_done() {
+        let r = CanonicalResponse {
+            id: "resp_sse".into(),
+            model: "gpt-4o".into(),
+            output: vec![Block::Text {
+                text: "hello".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        };
+        let frames = render_response_sse(&r);
+        assert!(frames[0].starts_with(
+            "event: response.created
+"
+        ));
+        assert!(frames.iter().any(|f| f.starts_with(
+            "event: response.output_text.done
+"
+        )));
+        assert!(frames.last().unwrap().contains("[DONE]"));
+        assert!(frames.iter().any(|f| f.starts_with(
+            "event: response.completed
+"
+        )));
     }
 
     #[test]

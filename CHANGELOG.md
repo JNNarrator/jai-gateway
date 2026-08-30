@@ -22,6 +22,8 @@ All notable changes to this project will be documented in this file.
 - 旧版 `POST /v1/completions`：支持 openai_compat 渠道字节级直通
 - MCP 工具列表缓存：自动合并路径增加 30s TTL 缓存，避免每个请求都去 MCP Server 拉取工具
 - 发布门禁脚本 `scripts/release_check.sh`：一键检查工作区/版本/CHANGELOG/tag 并跑全量回归
+- dsh 真机联调：修复 Responses+MCP 合成 SSE 与真实 API 形状不一致的问题（event 行、output_text.done、content_part.done、[DONE]）
+- 新增 `docs/test-report-dsh.md` dsh 真机测试报告
 - 技能（skill）管理：`skills` 表 + CRUD IPC + UI「技能」页；跨族转换请求自动注入启用技能到 system
 
 ### Changed
