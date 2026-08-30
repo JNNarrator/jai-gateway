@@ -30,6 +30,15 @@
 
 Tauri 2.0 · Rust (Axum + Reqwest) · React + TypeScript + TailwindCSS · SQLite · OS Keyring · MIT
 
+## 国产 Agent 优先支持
+
+JAI 优先保证 **DeepSeek Harness（dsh）** 与 **zcode** 的使用体验：
+
+- **目标**：通过 JAI 网关访问上游时，与直连上游的体验一致——协议、流式、工具调用、错误语义都保持透明兼容。
+- **dsh**：已实测打通 OpenAI Chat Completions 与 OpenAI Responses 两条链路，MCP、Skill、别名映射、故障转移均可正常工作。
+- **zcode**：协议线待真机确认后纳入同等回归保障。
+- 同族直通默认保持字节级透传；只有显式启用 MCP/Skill 等增强能力时才进入转换路径。
+
 ## 文档索引
 
 | 文档 | 内容 |
