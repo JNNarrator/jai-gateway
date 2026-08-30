@@ -49,6 +49,7 @@ JAI 优先保证 **DeepSeek Harness（dsh）** 与 **zcode** 的使用体验：
 | [docs/design/storage-schema.md](docs/design/storage-schema.md) | SQLite 表结构、密钥管理、日志策略 |
 | [docs/design/roadmap.md](docs/design/roadmap.md) | M0–M9 里程碑路线图与稳定性基线 |
 | [docs/test-report-dsh.md](docs/test-report-dsh.md) | 本机 dsh 真机联调测试报告 |
+| [docs/zcode接入.md](docs/zcode接入.md) | zcode 接入 JAI 与 MCP/Skill 加载指南 |
 
 ## 第一梯队客户端
 

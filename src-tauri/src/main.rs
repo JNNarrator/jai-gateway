@@ -1214,9 +1214,11 @@ async fn skill_export_markdown(core: State<'_, AppCore>) -> Result<String, Strin
         parts.push(s.content);
         parts.push(String::new());
     }
-    Ok(parts.join("
+    Ok(parts.join(
+        "
 
-"))
+",
+    ))
 }
 
 #[tauri::command]

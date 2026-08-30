@@ -28,6 +28,7 @@ All notable changes to this project will be documented in this file.
 - README 明确：优先支持国产 Agent（dsh / zcode）
 - MCP 配置托管：新增「复制客户端配置」，导出标准 `mcpServers` JSON，供 Claude Code / Continue 等 Agent 加载
 - Skill 导出：新增「复制技能包」，导出启用技能 Markdown 文本，供 Agent 加载/查看
+- zcode 接入指南：`docs/zcode接入.md`，按本机 zcode 配置确认 Anthropic 协议线
 - 技能（skill）管理：`skills` 表 + CRUD IPC + UI「技能」页；跨族转换请求自动注入启用技能到 system
 
 ### Changed

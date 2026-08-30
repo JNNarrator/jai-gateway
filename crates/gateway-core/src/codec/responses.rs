@@ -1197,6 +1197,32 @@ mod tests {
     }
 
     #[test]
+    fn render_response_sse_includes_function_call_events() {
+        let r = CanonicalResponse {
+            id: "resp_tool".into(),
+            model: "gpt-4o".into(),
+            output: vec![Block::ToolUse {
+                id: "call_1".into(),
+                name: "get_weather".into(),
+                input: json!({ "city": "bj" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        };
+        let frames = render_response_sse(&r);
+        assert!(frames.iter().any(|f| f.starts_with(
+            "event: response.output_item.added
+"
+        )));
+        assert!(frames.iter().any(|f| f.starts_with(
+            "event: response.function_call_arguments.done
+"
+        )));
+        assert!(frames.iter().any(|f| f.contains("get_weather")));
+        assert!(frames.last().unwrap().contains("[DONE]"));
+    }
+
+    #[test]
     fn render_stream_events() {
         let mut st = RenderState {
             response_id: "resp_1".into(),
