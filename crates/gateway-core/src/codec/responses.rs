@@ -1248,5 +1248,9 @@ mod tests {
             &mut st,
         );
         assert!(fin.iter().any(|s| s.contains("response.completed")));
+        assert!(
+            fin.iter().any(|s| s.contains("response.output_text.done")),
+            "Finish 应补齐 output_text.done"
+        );
     }
 }
