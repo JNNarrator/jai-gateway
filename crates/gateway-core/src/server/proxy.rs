@@ -1860,6 +1860,8 @@ async fn run_mcp_tool_loop(
     started: Instant,
 ) -> Attempt {
     let mut final_resp: Option<crate::codec::ir::CanonicalResponse> = None;
+    // 中间轮次产生的非 MCP 工具调用（客户端自行执行），循环结束后合并进最终响应
+    let mut pending_client_uses: Vec<crate::codec::ir::Block> = Vec::new();
 
     for _round in 0..MAX_MCP_TOOL_ROUNDS {
         let parsed = match send_mcp_converted_once(ctx, wire, peeked, cand, &req, started).await {
@@ -1876,24 +1878,40 @@ async fn run_mcp_tool_loop(
             })
             .collect();
 
-        // 没有工具调用，或存在非 MCP 工具调用：停止自动循环，
-        // 把当前响应原样交给客户端（非 MCP 工具仍需客户端自行执行）。
-        if tool_uses.is_empty()
-            || tool_uses
-                .iter()
-                .any(|b| !mcp_tools.contains_key(tool_name(b)))
-        {
+        // 区分 MCP 工具与非 MCP 工具：MCP 工具由网关自动执行回填；
+        // 非 MCP 工具（客户端自己的工具，如 dsh 的 bash）保留在响应里交给客户端执行。
+        let (mcp_uses, client_uses): (Vec<_>, Vec<_>) = tool_uses
+            .iter()
+            .cloned()
+            .partition(|b| mcp_tools.contains_key(tool_name(b)));
+
+        // 没有 MCP 工具调用：停止自动循环，把当前响应原样交给客户端
+        //（若含非 MCP 工具调用，也一并交给客户端自行执行）。
+        if mcp_uses.is_empty() {
             final_resp = Some(parsed);
             break;
         }
 
-        // 追加 assistant 工具调用，再执行 MCP 工具并追加结果
+        // 继续循环：本轮产生的非 MCP 工具调用累积，最终一并交给客户端执行。
+        // （break 轮次的 client_uses 已包含在 final_resp.output 中，不重复累积。）
+        pending_client_uses.extend(client_uses);
+
+        // 追加 assistant 工具调用（仅 MCP 工具），再执行并追加结果。
+        // 同时保留本轮输出里的 Thinking 块（thinking 模型如 deepseek 的
+        // reasoning_content 必须原样回传，否则下一轮上游 400）。
+        let mut assistant_blocks: Vec<crate::codec::ir::Block> = parsed
+            .output
+            .iter()
+            .filter(|b| matches!(b, crate::codec::ir::Block::Thinking { .. }))
+            .cloned()
+            .collect();
+        assistant_blocks.extend(mcp_uses.clone());
         req.messages.push(crate::codec::ir::CanonMessage {
             role: crate::codec::ir::Role::Assistant,
-            blocks: tool_uses.clone(),
+            blocks: assistant_blocks,
         });
         let mut result_blocks = Vec::new();
-        for tu in &tool_uses {
+        for tu in &mcp_uses {
             let name = tool_name(tu);
             let server = &mcp_tools[name].server;
             let result = match tokio::time::timeout(
@@ -1956,8 +1974,13 @@ async fn run_mcp_tool_loop(
         }
     };
 
-    // M5：Anthropic 入站出站 tool id 先映射（含超长 tool_id_map 回落）
+    // 把中间轮次累积的非 MCP 工具调用合并进最终响应（交给客户端执行）。
     let mut final_resp = final_resp;
+    if !pending_client_uses.is_empty() {
+        final_resp.output.extend(pending_client_uses);
+    }
+
+    // M5：Anthropic 入站出站 tool id 先映射（含超长 tool_id_map 回落）
     if wire == InboundWire::Anthropic {
         for b in &mut final_resp.output {
             if let crate::codec::ir::Block::ToolUse { id, .. } = b {

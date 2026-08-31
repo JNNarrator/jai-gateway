@@ -653,9 +653,11 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
             Role::Assistant => {
                 let mut content = String::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
+                let mut reasoning = String::new();
                 for b in &m.blocks {
                     match b {
                         Block::Text { text } => content.push_str(text),
+                        Block::Thinking { text, .. } => reasoning.push_str(text),
                         Block::ToolUse { id, name, input } => {
                             tool_calls.push(json!({
                                 "id": id,
@@ -674,6 +676,9 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
                     "role":"assistant",
                     "content": if content.is_empty() { Value::Null } else { Value::String(content) },
                 });
+                if !reasoning.is_empty() {
+                    msg["reasoning_content"] = Value::String(reasoning);
+                }
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = Value::Array(tool_calls);
                 }
@@ -764,6 +769,16 @@ pub fn parse_response(body: &[u8]) -> Result<crate::codec::ir::CanonicalResponse
     if let Some(choices) = v.get("choices").and_then(Value::as_array) {
         if let Some(c) = choices.first() {
             if let Some(msg) = c.get("message") {
+                // thinking 模型（如 deepseek 系列）：reasoning_content 必须原样回传，
+                // 否则上游在后续轮次校验失败（400）。
+                if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+                    if !rc.is_empty() {
+                        output.push(Block::Thinking {
+                            signature: None,
+                            text: rc.to_string(),
+                        });
+                    }
+                }
                 if let Some(content) = msg.get("content").and_then(Value::as_str) {
                     if !content.is_empty() {
                         output.push(Block::Text {
@@ -1220,5 +1235,58 @@ mod tests {
         )
         .unwrap();
         assert!(b.contains("\"arguments\":\"{\\\"a\\\":1}\""));
+    }
+
+    #[test]
+    fn reasoning_content_roundtrip() {
+        // thinking 模型（deepseek 等）：上游返回 reasoning_content，
+        // 解析进 IR Thinking 块，编码回传时必须原样保留（否则上游 400）。
+        let body = br#"{
+            "id":"resp_1",
+            "model":"deepseek-v4-flash",
+            "choices":[{
+                "index":0,
+                "message":{
+                    "role":"assistant",
+                    "reasoning_content":"thinking hard",
+                    "content":"answer",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{"name":"f","arguments":"{}"}
+                    }]
+                },
+                "finish_reason":"tool_calls"
+            }],
+            "usage":{"prompt_tokens":10,"completion_tokens":5}
+        }"#;
+        let resp = super::parse_response(body).unwrap();
+        assert!(matches!(
+            resp.output[0],
+            Block::Thinking { ref text, .. } if text == "thinking hard"
+        ));
+        assert!(matches!(resp.output[1], Block::Text { ref text, .. } if text == "answer"));
+        assert!(matches!(resp.output[2], Block::ToolUse { .. }));
+
+        // 编码回传：assistant 消息带 reasoning_content + tool_calls
+        let req = crate::codec::ir::CanonicalRequest {
+            model: "deepseek-v4-flash".into(),
+            system: vec![],
+            messages: vec![crate::codec::ir::CanonMessage {
+                role: crate::codec::ir::Role::Assistant,
+                blocks: resp.output,
+            }],
+            tools: vec![],
+            tool_choice: crate::codec::ir::ToolChoice::Auto,
+            params: crate::codec::ir::SampleParams::default(),
+            stream: false,
+            extensions: Default::default(),
+        };
+        let body = super::encode_request(&req).unwrap();
+        let m = body["messages"][0].as_object().unwrap();
+        assert_eq!(m["role"], "assistant");
+        assert_eq!(m["reasoning_content"], "thinking hard");
+        assert_eq!(m["content"], "answer");
+        assert!(m.get("tool_calls").is_some());
     }
 }

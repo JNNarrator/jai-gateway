@@ -121,6 +121,72 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                     }
                                 }
                             }
+                            // OpenAI Responses 消息内嵌形态：assistant 消息顶层
+                            // 直接带 function_call（推理模型的真实历史格式）。
+                            if role == "assistant" {
+                                // reasoning 文本保留进 IR Thinking 块：thinking 模型
+                                // （如 deepseek）要求 assistant tool_calls 消息必须
+                                // 原样回传 reasoning_content，否则上游 400。
+                                if let Some(rs) = item.get("reasoning") {
+                                    let text: String = rs
+                                        .as_array()
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|p| {
+                                                    p.get("text").and_then(Value::as_str)
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join("\n")
+                                        })
+                                        .or_else(|| rs.as_str().map(|s| s.to_string()))
+                                        .unwrap_or_default();
+                                    if !text.is_empty() {
+                                        blocks.push(Block::Thinking {
+                                            signature: None,
+                                            text,
+                                        });
+                                    }
+                                }
+                                if let Some(fc) = item.get("function_call") {
+                                    let id = fc
+                                        .get("call_id")
+                                        .or_else(|| fc.get("id"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let name = fc
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let input: Value = fc
+                                        .get("arguments")
+                                        .and_then(Value::as_str)
+                                        .and_then(|s| serde_json::from_str(s).ok())
+                                        .unwrap_or_else(|| json!({}));
+                                    blocks.push(Block::ToolUse { id, name, input });
+                                }
+                            } else if let Some(fco) = item.get("function_call_output") {
+                                let call_id = fco
+                                    .get("call_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let output = fco
+                                    .get("output")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                blocks.push(Block::ToolResult {
+                                    call_id,
+                                    content: if output.is_empty() {
+                                        vec![]
+                                    } else {
+                                        vec![Block::Text { text: output }]
+                                    },
+                                    is_error: false,
+                                });
+                            }
                             if !blocks.is_empty() {
                                 let r = if role == "assistant" {
                                     Role::Assistant
@@ -1094,6 +1160,40 @@ mod tests {
         assert!(matches!(
             &req2.messages[0].blocks[0],
             Block::ToolUse { name, .. } if name == "f"
+        ));
+    }
+
+    #[test]
+    fn decode_assistant_embedded_function_call() {
+        // OpenAI Responses 多轮历史：assistant 消息内嵌 function_call 顶层字段
+        //（reasoning 模型历史），user 消息可内嵌 function_call_output。
+        let req = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"role":"user","content":[{"type":"input_text","text":"weather?"}]},
+                    {"role":"assistant","content":[],
+                     "reasoning":[{"type":"reasoning_text","text":"think"}],
+                     "function_call":{"call_id":"call_e1","name":"get_weather","arguments":"{\"city\":\"bj\"}"}},
+                    {"role":"user","content":[],
+                     "function_call_output":{"call_id":"call_e1","output":"sunny"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(req.messages.len(), 3);
+        assert!(matches!(
+            &req.messages[1].blocks[0],
+            Block::Thinking { text, .. } if text == "think"
+        ));
+        assert!(matches!(
+            &req.messages[1].blocks[1],
+            Block::ToolUse { id, name, .. } if id == "call_e1" && name == "get_weather"
+        ));
+        assert!(matches!(
+            &req.messages[2].blocks[0],
+            Block::ToolResult { call_id, content, .. }
+                if call_id == "call_e1" && content[0].as_text() == Some("sunny")
         ));
     }
 

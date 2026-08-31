@@ -47,6 +47,28 @@
     新增单测 `decode_input_items_without_type_field` 防回归。
   - ✅ 已用 curl 复现 dsh 场景（限定模型名 + input 数组 + tools + 流式/非流式）实测通过，日志 200。
 
+- [x] 5. dsh + MCP 工具循环 400：assistant tool_calls 后缺 tool 消息 / thinking 模型 reasoning_content 未回传
+  - 现象：
+    ```
+    OpenAI API error (400): {"code":null,"message":"{\"code\":\"LITELLM_ERROR\",\"message\":\"An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. (insufficient tool messages following tool_calls message)\",...}"}
+    OpenAI API error (400): {"code":null,"message":"{\"code\":\"LITELLM_ERROR\",\"message\":\"The `reasoning_content` in the thinking mode must be passed back to the API.\",...}"}
+    ```
+  - 根因（三个独立问题）：
+    1. MCP 自动循环中，上游返回**混合工具调用**（MCP 工具 + 客户端工具）时旧代码立即停止循环，
+       把 MCP 工具也抛给客户端（dsh 不认识、不执行）→ 下轮回传历史缺该工具结果 → 上游 400。
+    2. thinking 模型（deepseek-v4-flash 等）上游返回的 `reasoning_content` 被 openai 解码器丢弃；
+       MCP 循环第二轮回填 assistant 消息时不带 reasoning → 上游要求必须回传 → 400。
+    3. Responses 入站解码不支持 assistant 消息**内嵌** `function_call` / `reasoning` 顶层字段
+       （推理模型历史真实格式），被当普通消息忽略 → 转换后结构残缺 → 400。
+  - 已解决：
+    1. MCP 循环拆分工具：MCP 工具由网关执行回填、继续循环；非 MCP 工具累积到
+       `pending_client_uses` 最终合并进响应交给客户端；
+    2. openai `parse_response` 捕获 `reasoning_content` → IR Thinking 块；`encode_request`
+       assistant 分支原样回传 `reasoning_content`；MCP 循环回填 assistant 时保留 Thinking 块；
+    3. Responses 解码 is_message 分支支持顶层 `function_call` / `function_call_output` / `reasoning`。
+  - 新增单测：`reasoning_content_roundtrip`、`decode_assistant_embedded_function_call`。
+  - ✅ curl 实测：纯 MCP 循环（thinking 模型）成功、内嵌格式 + reasoning 回传成功、日志 200。
+
 
 ## 2. 优化清单
 
