@@ -289,14 +289,25 @@ async fn run_stdio_jsonrpc(
         .map_err(|e| format!("写入 MCP 请求失败: {e}"))?;
     stdin.flush().await.map_err(|e| e.to_string())?;
 
-    let mut resp_line = String::new();
-    let bytes = stdout
-        .read_line(&mut resp_line)
-        .await
-        .map_err(|e| format!("读取 MCP 响应失败: {e}"))?;
-    if bytes == 0 {
-        return Err("MCP 工具请求无响应".into());
-    }
+    // 服务端可能先吐出通知行（如 logging 的 notifications/message），
+    // 只认携带 id 的响应帧，通知行跳过继续读
+    let resp_line = loop {
+        let mut line = String::new();
+        let bytes = stdout
+            .read_line(&mut line)
+            .await
+            .map_err(|e| format!("读取 MCP 响应失败: {e}"))?;
+        if bytes == 0 {
+            return Err("MCP 工具请求无响应".into());
+        }
+        let frame: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue, // 非 JSON 行（横幅/噪音）忽略
+        };
+        if frame.get("id").is_some() {
+            break line;
+        }
+    };
     let _ = child.kill().await;
     let resp: Value =
         serde_json::from_str(&resp_line).map_err(|e| format!("MCP 响应 JSON 失败: {e}"))?;
