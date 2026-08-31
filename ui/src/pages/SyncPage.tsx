@@ -1,8 +1,21 @@
 import { useEffect, useState } from "react";
+import { ArrowLeftRight, ClipboardPaste, CloudUpload, Download } from "lucide-react";
 import { api } from "../api";
 import { toast } from "../lib/toast";
 import { goTab } from "../lib/nav";
-import { Card, inputCls, btnPrimary, btnGhost } from "../components/common/legacy";
+import { PageHeader } from "@/components/common/PageHeader";
+import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { FormField } from "@/components/common/FormField";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 
 export function SyncPage() {
   const [importText, setImportText] = useState("");
@@ -16,6 +29,8 @@ export function SyncPage() {
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
+  const [confirmImport, setConfirmImport] = useState(false);
+  const [overwriteInfo, setOverwriteInfo] = useState("");
 
   useEffect(() => {
     api
@@ -28,11 +43,7 @@ export function SyncPage() {
 
   async function doImport() {
     setErr("");
-    if (!importText.trim()) {
-      setErr("请先粘贴 JSON 内容");
-      return;
-    }
-    if (!confirm("导入会将 JSON 合并进当前本地配置，确定继续？")) return;
+    setConfirmImport(false);
     try {
       const r = await api.configImport(importText, false);
       setMsg(
@@ -88,15 +99,12 @@ export function SyncPage() {
     setMsg("");
     try {
       const r = await api.webdavPreview();
-      setMsg(r.message);
-      if (r.willOverwrite && !confirm(`${r.message}。确定继续拉取吗？`)) {
-        return;
-      }
       if (r.willOverwrite) {
-        await doPull();
-      } else {
-        toast("远端与本地一致");
+        setOverwriteInfo(`${r.message}。拉取将用远端配置覆盖本机。`);
+        return; // 由 ConfirmDialog 决定是否拉取
       }
+      setMsg(r.message);
+      toast("远端与本地一致");
     } catch (e) {
       setErr(String(e));
     }
@@ -118,6 +126,7 @@ export function SyncPage() {
   async function doPull() {
     setBusy("pull");
     setErr("");
+    setOverwriteInfo("");
     try {
       const r = await api.webdavPull();
       setMsg(
@@ -132,129 +141,170 @@ export function SyncPage() {
 
   return (
     <div className="mx-auto max-w-2xl space-y-4">
-      <h1 className="text-lg font-semibold">配置同步</h1>
+      <PageHeader
+        title="配置同步"
+        description="在设备间迁移或备份供应商与模型配置。"
+      />
+
       {err && (
-        <div className="rounded border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
           {err}
         </div>
       )}
       {msg && (
-        <div className="rounded border border-emerald-900 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
+        <div className="rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-primary">
           {msg}
         </div>
       )}
 
-      <Card title="导入导出 JSON">
-        <p className="mb-3 text-xs leading-relaxed text-neutral-500">
-          导出产物只含供应商与模型定义，不含任何 API Key。导入后请在「供应商」页逐项补录凭据。
-        </p>
-        <textarea
-          className={`${inputCls} h-32 font-mono`}
-          value={importText}
-          onChange={(e) => setImportText(e.target.value)}
-          placeholder="粘贴从另一台设备导出的 jai-export JSON…"
-        />
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button className={btnPrimary} onClick={doImport}>
-            导入
-          </button>
-          <button
-            className={btnGhost}
-            onClick={async () => {
-              try {
-                const text = await navigator.clipboard.readText();
-                setImportText(text);
-                toast("已粘贴");
-              } catch {
-                toast("无法读取剪贴板", "err");
-              }
-            }}
-          >
-            粘贴
-          </button>
-          <span className="text-xs text-neutral-500">
-            导出入口仍在「网关」页。
-          </span>
-          <button className={btnGhost} onClick={() => goTab("gateway")}>
-            前往网关页 →
-          </button>
-        </div>
+      <Card>
+        <CardHeader>
+          <CardTitle>导入导出 JSON</CardTitle>
+          <CardDescription>
+            导出产物只含供应商与模型定义，不含任何 API Key。导入后请在「供应商」页逐项补录凭据。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Textarea
+            className="h-32 font-mono text-xs"
+            value={importText}
+            onChange={(e) => setImportText(e.target.value)}
+            placeholder="粘贴从另一台设备导出的 jai-export JSON…"
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <Button onClick={() => setConfirmImport(true)} disabled={!importText.trim()}>
+              导入
+            </Button>
+            <Button
+              variant="outline"
+              onClick={async () => {
+                try {
+                  const text = await navigator.clipboard.readText();
+                  setImportText(text);
+                  toast("已粘贴");
+                } catch {
+                  toast("无法读取剪贴板", "err");
+                }
+              }}
+            >
+              <ClipboardPaste aria-hidden />
+              粘贴
+            </Button>
+            <span className="text-xs text-muted-foreground">导出入口仍在「网关」页。</span>
+            <Button variant="ghost" size="sm" onClick={() => goTab("gateway")}>
+              前往网关页 →
+            </Button>
+          </div>
+        </CardContent>
       </Card>
 
-      <Card title="WebDAV 同步">
-        <p className="mb-3 text-xs leading-relaxed text-neutral-500">
-          手动推/拉：推送使用本机当前配置覆盖远端；拉取使用远端配置覆盖本机
-          （last-write-wins）。推送前会在本地留存一份快照。
-        </p>
-        <div className="grid grid-cols-2 gap-3">
-          <label className="text-xs text-neutral-400">
-            WebDAV 根地址
-            <input
-              className={`${inputCls} mt-1 font-mono`}
-              value={cfg.url}
-              onChange={(e) => setCfg({ ...cfg, url: e.target.value })}
-              placeholder="https://dav.example.com/remote.php/dav/files/u"
-            />
-          </label>
-          <label className="text-xs text-neutral-400">
-            用户名
-            <input
-              className={`${inputCls} mt-1`}
-              value={cfg.username}
-              onChange={(e) => setCfg({ ...cfg, username: e.target.value })}
-            />
-          </label>
-          <label className="text-xs text-neutral-400">
-            目录（可选）
-            <input
-              className={`${inputCls} mt-1 font-mono`}
-              value={cfg.directory}
-              onChange={(e) => setCfg({ ...cfg, directory: e.target.value })}
-              placeholder="jai/backups"
-            />
-          </label>
-          <label className="text-xs text-neutral-400">
-            <span className="flex items-center justify-between">
-              <span>密码（存入钥匙串，留空保持原密码）</span>
-              <button
-                className={btnGhost}
-                type="button"
-                onClick={() => setShowPw(!showPw)}
-              >
-                {showPw ? "隐藏" : "显示"}
-              </button>
-            </span>
-            <input
-              className={`${inputCls} mt-1`}
-              type={showPw ? "text" : "password"}
-              value={pw}
-              onChange={(e) => setPw(e.target.value)}
-            />
-          </label>
-        </div>
-        <div className="mt-4 flex flex-wrap gap-2">
-          <button className={btnPrimary} onClick={saveCfg}>
-            保存配置
-          </button>
-          <button className={btnGhost} onClick={testWebdav}>
-            测试连接
-          </button>
-          <button className={btnGhost} onClick={previewWebdav}>
-            预览变更
-          </button>
-          <button className={btnGhost} disabled={busy === "push"} onClick={doPush}>
-            {busy === "push" ? "推送中…" : "推送"}
-          </button>
-          <button className={btnGhost} disabled={busy === "pull"} onClick={doPull}>
-            {busy === "pull" ? "拉取中…" : "拉取"}
-          </button>
-        </div>
-        {busy && (
-          <div className="mt-3 h-1 w-full overflow-hidden rounded bg-neutral-800">
-            <div className="h-full w-1/3 animate-pulse rounded bg-amber-500" />
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ArrowLeftRight className="size-4" aria-hidden />
+            WebDAV 同步
+          </CardTitle>
+          <CardDescription>
+            手动推/拉：推送使用本机当前配置覆盖远端；拉取使用远端配置覆盖本机（last-write-wins）。
+            推送前会在本地留存一份快照。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <FormField label="WebDAV 根地址" htmlFor="dav-url" className="md:col-span-2">
+              <Input
+                id="dav-url"
+                className="font-mono"
+                value={cfg.url}
+                onChange={(e) => setCfg({ ...cfg, url: e.target.value })}
+                placeholder="https://dav.example.com/remote.php/dav/files/u"
+              />
+            </FormField>
+            <FormField label="用户名" htmlFor="dav-user">
+              <Input
+                id="dav-user"
+                value={cfg.username}
+                onChange={(e) => setCfg({ ...cfg, username: e.target.value })}
+              />
+            </FormField>
+            <FormField label="目录（可选）" htmlFor="dav-dir">
+              <Input
+                id="dav-dir"
+                className="font-mono"
+                value={cfg.directory}
+                onChange={(e) => setCfg({ ...cfg, directory: e.target.value })}
+                placeholder="jai/backups"
+              />
+            </FormField>
+            <FormField
+              label="密码（存入钥匙串，留空保持原密码）"
+              htmlFor="dav-pw"
+              className="md:col-span-2"
+              labelExtra={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  onClick={() => setShowPw(!showPw)}
+                >
+                  {showPw ? "隐藏" : "显示"}
+                </Button>
+              }
+            >
+              <Input
+                id="dav-pw"
+                type={showPw ? "text" : "password"}
+                value={pw}
+                onChange={(e) => setPw(e.target.value)}
+              />
+            </FormField>
           </div>
-        )}
+
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={saveCfg}>保存配置</Button>
+            <Button variant="outline" onClick={testWebdav}>
+              测试连接
+            </Button>
+            <Button variant="outline" onClick={previewWebdav}>
+              预览变更
+            </Button>
+            <Button variant="outline" disabled={busy === "push"} onClick={doPush}>
+              <CloudUpload aria-hidden />
+              {busy === "push" ? "推送中…" : "推送"}
+            </Button>
+            <Button variant="outline" disabled={busy === "pull"} onClick={doPull}>
+              <Download aria-hidden />
+              {busy === "pull" ? "拉取中…" : "拉取"}
+            </Button>
+          </div>
+          {busy && (
+            <div className="h-1 w-full overflow-hidden rounded bg-muted">
+              <div className="h-full w-1/3 animate-pulse rounded bg-primary" />
+            </div>
+          )}
+        </CardContent>
       </Card>
+
+      <ConfirmDialog
+        open={confirmImport}
+        onOpenChange={setConfirmImport}
+        title="导入配置？"
+        description="导入会将 JSON 合并进当前本地配置（同名供应商跳过）。"
+        confirmText="导入"
+        onConfirm={doImport}
+      />
+      <ConfirmDialog
+        open={!!overwriteInfo}
+        onOpenChange={(o) => !o && setOverwriteInfo("")}
+        title="拉取将覆盖本地配置"
+        description={overwriteInfo}
+        confirmText="拉取"
+        onConfirm={doPull}
+      />
     </div>
   );
 }

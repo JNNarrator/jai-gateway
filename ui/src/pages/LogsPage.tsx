@@ -1,8 +1,29 @@
 import { useEffect, useState } from "react";
+import { Download, RefreshCw, ScrollText, Search } from "lucide-react";
 import { api } from "../api";
 import type { LogRowView } from "../types";
 import { toast } from "../lib/toast";
-import { inputCls, btnGhost } from "../components/common/legacy";
+import { cn } from "@/lib/utils";
+import { PageHeader } from "@/components/common/PageHeader";
+import { EmptyState } from "@/components/common/EmptyState";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 export function LogsPage() {
   const [rows, setRows] = useState<LogRowView[]>([]);
@@ -21,6 +42,7 @@ export function LogsPage() {
     if (!auto) return;
     const t = setInterval(refresh, intervalMs);
     return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auto, intervalMs, limit]);
 
   const filtered = rows.filter((r) => {
@@ -31,10 +53,10 @@ export function LogsPage() {
   });
 
   function statusClass(s: number) {
-    if (s >= 500) return "text-red-700";
-    if (s >= 400) return "text-red-400";
-    if (s >= 200 && s < 300) return "text-emerald-400";
-    return "text-neutral-400";
+    if (s >= 500) return "text-red-600 dark:text-red-400";
+    if (s >= 400) return "text-red-500 dark:text-red-300";
+    if (s >= 200 && s < 300) return "text-emerald-600 dark:text-emerald-400";
+    return "text-muted-foreground";
   }
 
   function exportCsv() {
@@ -53,7 +75,7 @@ export function LogsPage() {
         ].join(",")
       )
       .join("\n");
-    const blob = new Blob([header + body], { type: "text/csv;charset=utf-8" });
+    const blob = new Blob(["\ufeff" + header + body], { type: "text/csv;charset=utf-8" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = `jai-logs-${Date.now()}.csv`;
@@ -76,91 +98,134 @@ export function LogsPage() {
 
   return (
     <div className="mx-auto max-w-5xl space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-lg font-semibold">请求日志</h1>
-        <div className="flex flex-wrap items-center gap-2">
-          <label className="flex items-center gap-2 text-sm text-neutral-400">
-            <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} className="accent-amber-500" />
-            自动刷新
-          </label>
-          <select
-            className={`${inputCls} w-28`}
-            value={intervalMs}
-            onChange={(e) => setIntervalMs(Number(e.target.value))}
-            disabled={!auto}
-          >
-            <option value={3000}>3s</option>
-            <option value={5000}>5s</option>
-            <option value={10000}>10s</option>
-            <option value={30000}>30s</option>
-          </select>
-          <input
-            className={`${inputCls} w-36`}
+      <PageHeader
+        title="请求日志"
+        description="网关转发的每一次请求（仅元数据，不含 prompt 与响应明文）。"
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <Switch
+              checked={auto}
+              onCheckedChange={setAuto}
+              aria-label="自动刷新"
+            />
+            <span className="text-sm text-muted-foreground">自动刷新</span>
+            <Select
+              value={String(intervalMs)}
+              onValueChange={(v) => setIntervalMs(Number(v))}
+              disabled={!auto}
+            >
+              <SelectTrigger size="sm" className="w-24">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="3000">3s</SelectItem>
+                <SelectItem value="5000">5s</SelectItem>
+                <SelectItem value="10000">10s</SelectItem>
+                <SelectItem value="30000">30s</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        }
+      />
+
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative">
+          <Search
+            className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+            aria-hidden
+          />
+          <Input
+            className="w-44 pl-8"
             placeholder="筛选模型…"
             value={modelFilter}
             onChange={(e) => setModelFilter(e.target.value)}
           />
-          <input
-            className={`${inputCls} w-24`}
-            placeholder="状态码"
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-          />
-          <button className={btnGhost} onClick={exportCsv}>导出 CSV</button>
-          <button className={btnGhost} onClick={exportJson}>导出 JSON</button>
+        </div>
+        <Input
+          className="w-24"
+          placeholder="状态码"
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+        />
+        <div className="ml-auto flex gap-2">
+          <Button variant="outline" size="sm" onClick={exportCsv}>
+            <Download aria-hidden />
+            导出 CSV
+          </Button>
+          <Button variant="outline" size="sm" onClick={exportJson}>
+            <Download aria-hidden />
+            导出 JSON
+          </Button>
         </div>
       </div>
-      <div className="overflow-x-auto rounded-lg border border-neutral-800">
-        <table className="w-full text-xs">
-          <thead className="bg-neutral-900 text-left uppercase tracking-wider text-neutral-500">
-            <tr>
-              <th className="px-3 py-2">时间</th>
-              <th className="px-3 py-2">模型</th>
-              <th className="px-3 py-2">状态</th>
-              <th className="px-3 py-2">耗时</th>
-              <th className="px-3 py-2">流式</th>
-              <th className="px-3 py-2 text-right">输入</th>
-              <th className="px-3 py-2 text-right">输出</th>
-              <th className="px-3 py-2">错误</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-neutral-800/70 font-mono">
+
+      <div className="overflow-x-auto rounded-lg border">
+        <Table>
+          <TableHeader>
+            <TableRow className="bg-muted/50 hover:bg-muted/50">
+              <TableHead>时间</TableHead>
+              <TableHead>模型</TableHead>
+              <TableHead>状态</TableHead>
+              <TableHead>耗时</TableHead>
+              <TableHead>流式</TableHead>
+              <TableHead className="text-right">输入</TableHead>
+              <TableHead className="text-right">输出</TableHead>
+              <TableHead>错误</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody className="font-mono text-xs">
             {filtered.map((r) => (
-              <tr key={r.id} className={r.httpStatus >= 400 ? "bg-red-950/20" : ""}>
-                <td className="whitespace-nowrap px-3 py-1.5 text-neutral-500">
+              <TableRow
+                key={r.id}
+                className={cn(
+                  r.httpStatus >= 400 && "bg-destructive/5",
+                )}
+              >
+                <TableCell className="whitespace-nowrap text-muted-foreground">
                   {new Date(r.ts).toLocaleTimeString()}
-                </td>
-                <td className="max-w-48 truncate px-3 py-1.5">{r.modelName}</td>
-                <td className={`px-3 py-1.5 font-semibold ${statusClass(r.httpStatus)}`}>
+                </TableCell>
+                <TableCell className="max-w-48 truncate">{r.modelName}</TableCell>
+                <TableCell className={cn("font-semibold", statusClass(r.httpStatus))}>
                   {r.httpStatus}
-                </td>
-                <td className="px-3 py-1.5 text-neutral-400">{r.durationMs}ms</td>
-                <td className="px-3 py-1.5 text-neutral-500">
+                </TableCell>
+                <TableCell className="text-muted-foreground">{r.durationMs}ms</TableCell>
+                <TableCell className="text-muted-foreground">
                   {r.isStream ? <span title="SSE 流式">⇄</span> : "—"}
-                </td>
-                <td className="px-3 py-1.5 text-right text-neutral-400">{r.usageInput ?? "·"}</td>
-                <td className="px-3 py-1.5 text-right text-neutral-400">{r.usageOutput ?? "·"}</td>
-                <td className="max-w-64 truncate px-3 py-1.5 text-red-400" title={r.errorSummary ?? ""}>
+                </TableCell>
+                <TableCell className="text-right text-muted-foreground">
+                  {r.usageInput ?? "·"}
+                </TableCell>
+                <TableCell className="text-right text-muted-foreground">
+                  {r.usageOutput ?? "·"}
+                </TableCell>
+                <TableCell
+                  className="max-w-64 truncate text-red-600 dark:text-red-400"
+                  title={r.errorSummary ?? ""}
+                >
                   {r.errorKind ?? ""}
-                </td>
-              </tr>
+                </TableCell>
+              </TableRow>
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
         {filtered.length === 0 && (
-          <div className="px-4 py-10 text-center text-sm text-neutral-500">
-            没有匹配的日志。用任意 OpenAI 兼容客户端打一发试试。
-          </div>
+          <EmptyState
+            icon={ScrollText}
+            title="没有匹配的日志"
+            description="用任意 OpenAI 兼容客户端打一发试试。"
+            className="border-0"
+          />
         )}
         {filtered.length > 0 && (
-          <div className="flex justify-center border-t border-neutral-800/70 py-2">
-            <button className={btnGhost} onClick={() => setLimit(limit + 500)}>
+          <div className="flex justify-center border-t py-2">
+            <Button variant="ghost" size="sm" onClick={() => setLimit(limit + 500)}>
+              <RefreshCw aria-hidden />
               加载更多（当前显示 {rows.length} 条）
-            </button>
+            </Button>
           </div>
         )}
       </div>
-      <p className="text-xs text-neutral-600">
+      <p className="text-xs text-muted-foreground">
         日志不含具体内容，保留 30 天或 5 万行，每日自动清理。
       </p>
     </div>
