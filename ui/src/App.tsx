@@ -1,5 +1,4 @@
-import { useEffect, useState } from "react";
-import type { Tab } from "./lib/nav";
+import { useNav, type Tab } from "./lib/nav";
 import { GatewayPage } from "./pages/GatewayPage";
 import { SyncPage } from "./pages/SyncPage";
 import { McpPage } from "./pages/McpPage";
@@ -12,23 +11,12 @@ import { SettingsPage } from "./pages/SettingsPage";
 import { ThemeToggle } from "./components/layout/ThemeToggle";
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("gateway");
+  const { tab, setTab } = useNav();
   const tabs: [Tab, string][] = [
     ["gateway", "网关"], ["sync", "同步"], ["mcp", "MCP"], ["skills", "技能"],
     ["providers", "供应商"], ["models", "模型"], ["stats", "统计"],
     ["logs", "日志"], ["settings", "设置"],
   ];
-
-  useEffect(() => {
-    const onGoto = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { tab: string };
-      setTab(detail.tab as Tab);
-    };
-    window.addEventListener("jai-goto-tab", onGoto);
-    return () => {
-      window.removeEventListener("jai-goto-tab", onGoto);
-    };
-  }, []);
 
   return (
     <div className="flex h-screen flex-col bg-neutral-950 text-neutral-200">

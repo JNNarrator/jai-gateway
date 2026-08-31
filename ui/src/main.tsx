@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { ThemeProvider } from "next-themes";
 import { Toaster } from "@/components/ui/sonner";
+import { NavProvider } from "./lib/nav";
 import App from "./App";
 import "./index.css";
 
@@ -13,7 +14,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       enableSystem
       disableTransitionOnChange
     >
-      <App />
+      <NavProvider>
+        <App />
+      </NavProvider>
     </ThemeProvider>
     <Toaster position="bottom-center" richColors />
   </React.StrictMode>,
