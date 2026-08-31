@@ -1549,6 +1549,7 @@ fn reflect_status(app: &AppHandle, st: &GatewayState) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // 1) 数据目录 + 迁移（失败即中止启动 —— storage §4 早拦截）
             //    某些受限环境（CI/沙箱）对 ~/Library 无写权限，回退临时目录保证可演示。

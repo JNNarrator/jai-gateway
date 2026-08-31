@@ -33,6 +33,15 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERBRURFNTc5QURGRjc3OTkKUldTWmQvK3RlZVh0MnVpeFhPNWs3N0NVVDZuWnQ2VFltN3ZRRitoT2t1bndXa3NBR1BnRjhIU1QK",
+      "endpoints": [
+        "https://github.com/JNNarrator/jai-gateway/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

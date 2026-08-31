@@ -369,14 +369,18 @@
 - 文档一致性：README / roadmap 随 M1–M8 同步更新
 - 资源/性能基线与 48h 本机观察：列入 M9 发布前真机验收项（本仓库无法自动完成）
 
-### M9（发布工程）—— 文档与 CI 已就绪 ✅（签名/公证需真实 secrets 执行）
+### M9（发布工程）—— 工程侧已完成 ✅（签名/公证/真机验收需真实 secrets 与发布主机执行）
 
-- `docs/design/release.md`：签名/公证/更新通道/发布流程检查单
-- `.github/workflows/release.yml`：tag 触发 macOS/Windows 构建，接入
-  Apple/Windows 签名 secrets 与 Tauri Release 草稿
-- `CHANGELOG.md`：M1–M8 变更记录
-- README 与 roadmap 同步
-- 实际签名/公证/更新 feed 发布：需要仓库 secrets 与真实证书后执行
+- `docs/design/release.md`：签名/公证/更新通道/发布流程检查单（已同步实际状态）
+- `.github/workflows/release.yml`：tag `v*` 触发 macOS/Windows 构建，
+  tauri-action 创建 release 草稿并上传产物，Updater 签名 secrets 缺失即构建失败（强制正确配置）
+- Updater 签名密钥对已生成（私钥 `~/.tauri/jai.key` + 密码文件，仅存发布主机不入库）；
+  `tauri.conf.json` 已配置 `plugins.updater.pubkey` 与 endpoints，`tauri-plugin-updater` 已装配
+- `scripts/release_check.sh`：发布前自动化门禁（工作区/版本/CHANGELOG/tag/全量回归）
+- `docs/design/antivirus.md`：杀软误报排查流程建档
+- `CHANGELOG.md`：M1–M8 + MCP/Skill/二期功能变更记录
+- 待执行：配置 CI secrets（TAURI_SIGNING_* / APPLE_* / WINDOWS_CERTIFICATE_*）→ 首次 tag 触发验证 →
+  真机验收（Claude Code / Codex / dsh / zcode / WebDAV / 48h 常驻）→ 干净 VM 验证 → tag `v0.1.0-beta` 转正式发布
 
 ### MCP（Model Context Protocol）管理 —— 基础管理 + 工具发现/调用已完成 ✅
 
@@ -420,7 +424,9 @@
 
 ### 待办（下一里程碑）
 
-1. 真机验收 M1–M9 + MCP/Skill（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
+1. 配置 CI secrets（`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，及可选 Apple/Windows 证书）并完成首次 tag 触发验证（见 release.md §3）
+2. 真机验收 M1–M9 + MCP/Skill（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
+3. 打 tag `v0.1.0-beta` 转正式发布
 
 > 历史快照：M1–M9 + MCP/Skill 管理（含工具发现/调用、技能自动注入）快照已并入本节；更早的记录见 git 历史。
 
