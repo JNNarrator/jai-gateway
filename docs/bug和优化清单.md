@@ -54,3 +54,7 @@
 - [x] 2. skill 添加应该支持 zip 导入添加。
 - [x] 3. UI/UX 优化：按 `docs/ui优化.md` 的 66 项建议逐项实施并勾选。
 - [x] 4. 多供应商时，dsh 模型列表显示“供应商名/模型名”，请求支持按该限定 ID 路由。
+- [x] 5. MCP 支持粘贴标准 `mcpServers` JSON 导入（Claude Code 格式）
+  - 说明：`{"mcpServers":{name:{command,args,env,url,type}}}` 粘贴即导，同名更新、不合法条目跳过并报告；
+    新增迁移 0005（`mcp_servers.env` 列），stdio 启动子进程时注入 env；导出客户端配置同步带 env。
+  - 验证：131 测试全绿 + 前端构建通过。

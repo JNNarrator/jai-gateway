@@ -628,11 +628,85 @@ function SyncTab() {
 
 // ---------------------------------------------------------------- MCP 管理
 
+function McpImportForm({
+  onDone,
+  onCancel,
+}: {
+  onDone: (report: { imported: number; updated: number; skipped: string[] }) => void;
+  onCancel: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [localErr, setLocalErr] = useState("");
+
+  async function submit() {
+    if (!text.trim()) {
+      setLocalErr("请粘贴 mcpServers JSON");
+      return;
+    }
+    setBusy(true);
+    setLocalErr("");
+    try {
+      const report = await api.mcpImportFromJson(text);
+      onDone(report);
+    } catch (e) {
+      setLocalErr(String(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-neutral-800 bg-neutral-900/60 p-4">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-sm font-medium">粘贴 mcpServers JSON 导入</span>
+        <button className={btnGhost} onClick={onCancel}>
+          取消
+        </button>
+      </div>
+      <p className="mb-2 text-xs text-neutral-500">
+        支持 Claude Code 格式：{`{"mcpServers": {"名称": {"command": "...", "args": [...], "env": {...}}}}`}
+        ，同名服务会被更新，不含 command/url 的条目自动跳过。
+      </p>
+      <textarea
+        className={`${inputCls} min-h-[140px] w-full resize-y font-mono text-xs`}
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+          setLocalErr("");
+        }}
+        placeholder='{"mcpServers":{"netcatty-external":{"command":"/Applications/...","args":[],"env":{"KEY":"value"}}}}'
+        spellCheck={false}
+      />
+      <div className="mt-2 flex items-center gap-2">
+        <button className={btnPrimary} onClick={submit} disabled={busy}>
+          {busy ? "导入中…" : "导入"}
+        </button>
+        <button
+          className={btnGhost}
+          onClick={() =>
+            navigator.clipboard
+              ?.readText()
+              .then((t) => {
+                setText(t);
+                setLocalErr("");
+              })
+              .catch(() => setLocalErr("读取剪贴板失败"))
+          }
+        >
+          粘贴
+        </button>
+        {localErr && <span className="text-xs text-red-400">{localErr}</span>}
+      </div>
+    </div>
+  );
+}
+
 function McpTab() {
   const [list, setList] = useState<import("./types").McpServerRow[]>([]);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [showNew, setShowNew] = useState(false);
+  const [showImport, setShowImport] = useState(false);
 
   async function refresh() {
     setList(await api.mcpList());
@@ -668,6 +742,9 @@ function McpTab() {
           >
             复制客户端配置
           </button>
+          <button className={btnGhost} onClick={() => setShowImport((v) => !v)}>
+            粘贴 JSON 导入
+          </button>
           <button className={btnPrimary} onClick={() => setShowNew(true)}>
             + 添加 MCP Server
           </button>
@@ -682,6 +759,20 @@ function McpTab() {
         <div className="rounded border border-emerald-900 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
           {msg}
         </div>
+      )}
+      {showImport && (
+        <McpImportForm
+          onDone={(report) => {
+            setMsg(
+              `导入完成：新增 ${report.imported}，更新 ${report.updated}${
+                report.skipped.length ? `，跳过 ${report.skipped.length}` : ""
+              }`,
+            );
+            setShowImport(false);
+            refresh();
+          }}
+          onCancel={() => setShowImport(false)}
+        />
       )}
       {showNew && (
         <McpForm
@@ -714,6 +805,13 @@ function McpTab() {
                   {m.kind === "stdio"
                     ? `${m.command ?? ""} ${m.args ?? ""}`
                     : m.url ?? ""}
+                  {m.env ? (
+                    <span className="text-neutral-600" title={m.env}>
+                      {" "}
+                      env:{" "}
+                      {Object.keys(JSON.parse(m.env) as Record<string, string>).join(", ")}
+                    </span>
+                  ) : null}
                 </div>
               </div>
               <button
@@ -789,6 +887,7 @@ function McpForm({
   const [command, setCommand] = useState(initial?.command ?? "");
   const [args, setArgs] = useState(initial?.args ?? "");
   const [url, setUrl] = useState(initial?.url ?? "");
+  const [env, setEnv] = useState(initial?.env ?? "");
   const [argsErr, setArgsErr] = useState("");
 
   async function submit() {
@@ -810,6 +909,7 @@ function McpForm({
         command: command || null,
         args: args || null,
         url: url || null,
+        env: env || null,
       });
     } else {
       await api.mcpCreate({
@@ -818,6 +918,7 @@ function McpForm({
         command: command || null,
         args: args || null,
         url: url || null,
+        env: env || null,
       });
     }
     onDone();
@@ -847,6 +948,10 @@ function McpForm({
             参数（JSON 数组）
             <input className={`${inputCls} mt-1 font-mono`} value={args} onChange={(e) => { setArgs(e.target.value); setArgsErr(""); }} placeholder='["-y","@modelcontextprotocol/server-filesystem"]' />
             {argsErr && <span className="mt-1 block text-[11px] text-red-400">{argsErr}</span>}
+          </label>
+          <label className="col-span-2 text-xs text-neutral-400">
+            环境变量（JSON 对象，可选）
+            <input className={`${inputCls} mt-1 font-mono`} value={env} onChange={(e) => setEnv(e.target.value)} placeholder='{"API_KEY":"xxx"}' />
           </label>
         </>
       ) : (

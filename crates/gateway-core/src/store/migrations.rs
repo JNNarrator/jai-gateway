@@ -19,6 +19,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0004_advanced_routing",
         include_str!("migrations/0004_advanced_routing.sql"),
     ),
+    ("0005_mcp_env", include_str!("migrations/0005_mcp_env.sql")),
 ];
 
 #[cfg(test)]

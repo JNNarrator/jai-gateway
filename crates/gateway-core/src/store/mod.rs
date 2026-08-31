@@ -522,6 +522,8 @@ pub struct McpServerRow {
     /// JSON 数组字符串
     pub args: Option<String>,
     pub url: Option<String>,
+    /// JSON 对象字符串（环境变量注入），如 {"KEY":"value"}
+    pub env: Option<String>,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -547,9 +549,10 @@ fn row_to_mcp_server(r: &rusqlite::Row) -> rusqlite::Result<McpServerRow> {
         command: r.get(3)?,
         args: r.get(4)?,
         url: r.get(5)?,
-        enabled: r.get::<_, i64>(6)? != 0,
-        created_at: r.get(7)?,
-        updated_at: r.get(8)?,
+        env: r.get(6)?,
+        enabled: r.get::<_, i64>(7)? != 0,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
     })
 }
 
@@ -567,7 +570,7 @@ fn row_to_skill(r: &rusqlite::Row) -> rusqlite::Result<SkillRow> {
 
 pub fn mcp_list(c: &Connection) -> Result<Vec<McpServerRow>, StoreError> {
     let mut stmt = c.prepare(
-        "SELECT id,name,kind,command,args,url,enabled,created_at,updated_at
+        "SELECT id,name,kind,command,args,url,env,enabled,created_at,updated_at
          FROM mcp_servers ORDER BY name",
     )?;
     let rows = stmt
@@ -578,8 +581,8 @@ pub fn mcp_list(c: &Connection) -> Result<Vec<McpServerRow>, StoreError> {
 
 pub fn mcp_insert(c: &Connection, row: &McpServerRow) -> Result<(), StoreError> {
     c.execute(
-        "INSERT INTO mcp_servers(id,name,kind,command,args,url,enabled,created_at,updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        "INSERT INTO mcp_servers(id,name,kind,command,args,url,env,enabled,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         params![
             row.id,
             row.name,
@@ -587,6 +590,7 @@ pub fn mcp_insert(c: &Connection, row: &McpServerRow) -> Result<(), StoreError> 
             row.command,
             row.args,
             row.url,
+            row.env,
             row.enabled as i64,
             row.created_at,
             row.updated_at,
@@ -595,6 +599,7 @@ pub fn mcp_insert(c: &Connection, row: &McpServerRow) -> Result<(), StoreError> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // MCP 更新字段较多，保持与表列一一对应
 pub fn mcp_update(
     c: &Connection,
     id: &str,
@@ -603,11 +608,12 @@ pub fn mcp_update(
     command: Option<&str>,
     args: Option<&str>,
     url: Option<&str>,
+    env: Option<&str>,
 ) -> Result<(), StoreError> {
     c.execute(
-        "UPDATE mcp_servers SET name=?1, kind=?2, command=?3, args=?4, url=?5, updated_at=?6
-         WHERE id=?7",
-        params![name, kind, command, args, url, now_ms(), id],
+        "UPDATE mcp_servers SET name=?1, kind=?2, command=?3, args=?4, url=?5, env=?6, updated_at=?7
+         WHERE id=?8",
+        params![name, kind, command, args, url, env, now_ms(), id],
     )?;
     Ok(())
 }
@@ -729,6 +735,94 @@ pub fn tool_id_get(c: &Connection, outbound_id: &str) -> Result<Option<String>, 
         |r| r.get(0),
     )
     .optional()?)
+}
+
+// ================================================================ MCP 导入解析
+
+/// 从标准 `{"mcpServers": {...}}` 配置解析出的单个 MCP Server 条目。
+/// `skip_reason` 为 Some 时表示该条目不合法，应跳过（不会写入）。
+#[derive(Debug, Clone)]
+pub struct ParsedMcpServer {
+    pub name: String,
+    pub kind: String,
+    pub command: Option<String>,
+    pub args: Option<String>,
+    pub url: Option<String>,
+    pub env: Option<String>,
+    pub skip_reason: Option<String>,
+}
+
+/// 解析 Claude Code 风格 `mcpServers` JSON。
+/// 顶层必须为 `{"mcpServers": {name: {...}}}`；每个条目支持
+/// `type`（缺省 stdio）、`command`/`args`/`env`（stdio）与 `url`（sse/http）。
+/// 返回逐条解析结果，调用方决定 upsert 语义。
+pub fn parse_mcp_servers_json(json_text: &str) -> Result<Vec<ParsedMcpServer>, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_text).map_err(|e| format!("JSON 解析失败: {e}"))?;
+    let servers = parsed
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "缺少 mcpServers 对象".to_string())?;
+    if servers.is_empty() {
+        return Err("mcpServers 为空".into());
+    }
+    let mut out = Vec::with_capacity(servers.len());
+    for (name, conf) in servers {
+        let mut kind = conf
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("stdio")
+            .to_string();
+        // 兼容旧格式：无 type 但有 url 视为 http
+        if kind == "stdio"
+            && conf
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        {
+            kind = "http".to_string();
+        }
+        if !matches!(kind.as_str(), "stdio" | "sse" | "http") {
+            let skip_reason = format!("不支持的 type={kind}");
+            out.push(ParsedMcpServer {
+                name: name.clone(),
+                kind,
+                command: None,
+                args: None,
+                url: None,
+                env: None,
+                skip_reason: Some(skip_reason),
+            });
+            continue;
+        }
+        let command = conf
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
+        let args = conf.get("args").map(|v| v.to_string());
+        let url = conf
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
+        let env = conf.get("env").map(|v| v.to_string());
+        let skip_reason = if kind == "stdio" && command.is_none() {
+            Some("stdio 类型缺少 command".to_string())
+        } else if kind != "stdio" && url.is_none() {
+            Some(format!("{kind} 类型缺少 url"))
+        } else {
+            None
+        };
+        out.push(ParsedMcpServer {
+            name: name.clone(),
+            kind,
+            command,
+            args,
+            url,
+            env,
+            skip_reason,
+        });
+    }
+    Ok(out)
 }
 
 // ================================================================ utils

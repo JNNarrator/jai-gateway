@@ -115,6 +115,15 @@ pub async fn collect_enabled_tools(db: &crate::store::Db) -> Vec<McpServerTool> 
     out
 }
 
+/// 解析 McpServerRow 中 JSON 对象字符串的 env；非法或空返回空 map。
+fn server_env(server: &McpServerRow) -> std::collections::HashMap<String, String> {
+    server
+        .env
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok())
+        .unwrap_or_default()
+}
+
 /// 向一个 MCP Server 发起 `tools/list`。
 pub async fn list_tools(server: &McpServerRow) -> Result<Vec<McpTool>, String> {
     match server.kind.as_str() {
@@ -126,7 +135,15 @@ pub async fn list_tools(server: &McpServerRow) -> Result<Vec<McpTool>, String> {
                 .map(|s| serde_json::from_str::<Vec<String>>(s).unwrap_or_default())
                 .unwrap_or_default();
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            let result = run_stdio_jsonrpc(cmd, &args, "tools/list", &json!({}), &tx).await?;
+            let result = run_stdio_jsonrpc(
+                cmd,
+                &args,
+                &server_env(server),
+                "tools/list",
+                &json!({}),
+                &tx,
+            )
+            .await?;
             parse_tools_list(&result)
         }
         "http" | "sse" => {
@@ -154,7 +171,9 @@ pub async fn call_tool(
                 .map(|s| serde_json::from_str::<Vec<String>>(s).unwrap_or_default())
                 .unwrap_or_default();
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            let result = run_stdio_jsonrpc(cmd, &args, "tools/call", &params, &tx).await?;
+            let result =
+                run_stdio_jsonrpc(cmd, &args, &server_env(server), "tools/call", &params, &tx)
+                    .await?;
             Ok(unwrap_result(result))
         }
         "http" | "sse" => {
@@ -202,17 +221,23 @@ fn parse_tools_list(v: &Value) -> Result<Vec<McpTool>, String> {
 async fn run_stdio_jsonrpc(
     cmd: &str,
     args: &[String],
+    env: &std::collections::HashMap<String, String>,
     method: &str,
     params: &Value,
     _tx: &tokio::sync::mpsc::UnboundedSender<()>,
 ) -> Result<Value, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let mut child = tokio::process::Command::new(cmd)
+    let mut command = tokio::process::Command::new(cmd);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("启动 MCP stdio 进程失败: {e}"))?;
 
@@ -349,5 +374,36 @@ mod tests {
         let tools = parse_tools_list(&v).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "read_file");
+    }
+
+    #[test]
+    fn server_env_parses_json_object() {
+        let row = McpServerRow {
+            id: "m1".into(),
+            name: "netcatty".into(),
+            kind: "stdio".into(),
+            command: Some("/bin/echo".into()),
+            args: None,
+            url: None,
+            env: Some(r#"{"NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE":"/tmp/discovery.json"}"#.into()),
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let env = server_env(&row);
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            env.get("NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE")
+                .map(String::as_str),
+            Some("/tmp/discovery.json")
+        );
+        // 非法 env 字符串回落为空 map，不 panic
+        let bad = McpServerRow {
+            env: Some("not-json".into()),
+            ..row.clone()
+        };
+        assert!(server_env(&bad).is_empty());
+        let none = McpServerRow { env: None, ..row };
+        assert!(server_env(&none).is_empty());
     }
 }

@@ -117,6 +117,7 @@ export const api = {
     command?: string | null;
     args?: string | null;
     url?: string | null;
+    env?: string | null;
   }) => invoke<McpServerRow>("mcp_create", { input }),
   mcpUpdate: (input: {
     id: string;
@@ -125,6 +126,7 @@ export const api = {
     command?: string | null;
     args?: string | null;
     url?: string | null;
+    env?: string | null;
   }) => invoke<void>("mcp_update", { input }),
   mcpSetEnabled: (id: string, enabled: boolean) =>
     invoke<void>("mcp_set_enabled", { id, enabled }),
@@ -133,6 +135,10 @@ export const api = {
   mcpToolsCall: (id: string, name: string, args: unknown) =>
     invoke<unknown>("mcp_tools_call", { id, name, arguments: args }),
   mcpExportConfig: () => invoke<{ mcpServers: Record<string, unknown> }>("mcp_export_config"),
+  mcpImportFromJson: (jsonText: string) =>
+    invoke<{ imported: number; updated: number; skipped: string[] }>("mcp_import_from_json", {
+      jsonText,
+    }),
 
   // Skill 管理
   skillList: () => invoke<SkillRow[]>("skill_list"),

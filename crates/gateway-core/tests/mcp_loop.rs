@@ -202,6 +202,7 @@ async fn fixture() -> (Fixture, Arc<Mutex<Option<Value>>>) {
                 command: None,
                 args: None,
                 url: Some(format!("http://127.0.0.1:{mcp_port}/mcp")),
+                env: None,
                 enabled: true,
                 created_at: now,
                 updated_at: now,

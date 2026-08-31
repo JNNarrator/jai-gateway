@@ -99,6 +99,7 @@ export interface McpServerRow {
   command?: string | null;
   args?: string | null;
   url?: string | null;
+  env?: string | null;
   enabled: boolean;
   createdAt: number;
   updatedAt: number;

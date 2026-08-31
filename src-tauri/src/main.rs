@@ -895,6 +895,7 @@ pub struct McpServerInput {
     pub command: Option<String>,
     pub args: Option<String>,
     pub url: Option<String>,
+    pub env: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -906,6 +907,7 @@ pub struct McpServerUpdateInput {
     pub command: Option<String>,
     pub args: Option<String>,
     pub url: Option<String>,
+    pub env: Option<String>,
 }
 
 #[tauri::command]
@@ -937,6 +939,7 @@ async fn mcp_create(
         command: input.command.filter(|s| !s.trim().is_empty()),
         args: input.args.filter(|s| !s.trim().is_empty()),
         url: input.url.filter(|s| !s.trim().is_empty()),
+        env: input.env.filter(|s| !s.trim().is_empty()),
         enabled: true,
         created_at: now,
         updated_at: now,
@@ -968,6 +971,7 @@ async fn mcp_update(core: State<'_, AppCore>, input: McpServerUpdateInput) -> Re
                 input.command.as_deref().filter(|s| !s.trim().is_empty()),
                 input.args.as_deref().filter(|s| !s.trim().is_empty()),
                 input.url.as_deref().filter(|s| !s.trim().is_empty()),
+                input.env.as_deref().filter(|s| !s.trim().is_empty()),
             )
         })
         .map_err(|e| e.to_string())
@@ -1038,15 +1042,92 @@ async fn mcp_export_config(core: State<'_, AppCore>) -> Result<serde_json::Value
             .as_deref()
             .map(|v| serde_json::from_str(v).unwrap_or_default())
             .unwrap_or_default();
-        let entry = serde_json::json!({
+        let env: serde_json::Map<String, serde_json::Value> = s
+            .env
+            .as_deref()
+            .map(|v| serde_json::from_str(v).unwrap_or_default())
+            .unwrap_or_default();
+        let mut entry = serde_json::json!({
             "command": s.command,
             "args": args,
-            "url": s.url,
-            "env": {},
+            "env": env,
         });
+        if s.kind != "stdio" {
+            entry["type"] = serde_json::json!(s.kind);
+            entry["url"] = serde_json::json!(s.url);
+        }
         servers.insert(s.name, entry);
     }
     Ok(serde_json::json!({ "mcpServers": servers }))
+}
+
+/// 导入标准 `{"mcpServers": {name: {command/args/env/url/type}}}` 配置。
+/// 按 name 去重：已存在则更新，否则新建。返回导入报告。
+#[tauri::command]
+async fn mcp_import_from_json(
+    core: State<'_, AppCore>,
+    json_text: String,
+) -> Result<serde_json::Value, String> {
+    let entries = store::parse_mcp_servers_json(&json_text)?;
+
+    let now = store::now_ms();
+    let db = core.db.clone();
+    let (imported, updated, skipped) = tokio::task::spawn_blocking(move || {
+        db.with(
+            |c| -> Result<(usize, usize, Vec<String>), store::StoreError> {
+                let existing = store::mcp_list(c)?;
+                let mut imported = 0;
+                let mut updated = 0;
+                let mut skipped = Vec::new();
+                for e in entries {
+                    if let Some(reason) = e.skip_reason {
+                        skipped.push(format!("{}: {reason}", e.name));
+                        continue;
+                    }
+                    match existing.iter().find(|r| r.name == e.name) {
+                        Some(row) => {
+                            store::mcp_update(
+                                c,
+                                &row.id,
+                                &e.name,
+                                &e.kind,
+                                e.command.as_deref(),
+                                e.args.as_deref(),
+                                e.url.as_deref(),
+                                e.env.as_deref(),
+                            )?;
+                            updated += 1;
+                        }
+                        None => {
+                            let row = McpServerRow {
+                                id: uuid::Uuid::now_v7().to_string(),
+                                name: e.name,
+                                kind: e.kind,
+                                command: e.command,
+                                args: e.args,
+                                url: e.url,
+                                env: e.env,
+                                enabled: true,
+                                created_at: now,
+                                updated_at: now,
+                            };
+                            store::mcp_insert(c, &row)?;
+                            imported += 1;
+                        }
+                    }
+                }
+                Ok((imported, updated, skipped))
+            },
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    Ok(serde_json::json!({
+        "imported": imported,
+        "updated": updated,
+        "skipped": skipped,
+    }))
 }
 
 async fn fetch_mcp_server(db: &Db, id: &str) -> Result<McpServerRow, String> {
@@ -1742,6 +1823,7 @@ fn main() {
             mcp_tools_list,
             mcp_tools_call,
             mcp_export_config,
+            mcp_import_from_json,
             skill_list,
             skill_export_markdown,
             skill_create,
