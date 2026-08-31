@@ -52,10 +52,7 @@ pub mod testing {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-        fn debug_fmt(
-            &self,
-            _f: &mut std::fmt::Formatter<'_>,
-        ) -> std::fmt::Result {
+        fn debug_fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             Ok(())
         }
     }
@@ -111,8 +108,7 @@ pub struct FileVault(pub PathBuf);
 
 impl FileVault {
     pub fn read_map(&self) -> Result<HashMap<String, String>, VaultError> {
-        let text =
-            std::fs::read_to_string(&self.0).map_err(|e| VaultError::File(e.to_string()))?;
+        let text = std::fs::read_to_string(&self.0).map_err(|e| VaultError::File(e.to_string()))?;
         serde_json::from_str(&text).map_err(|e| VaultError::File(format!("解析失败: {e}")))
     }
 
@@ -283,18 +279,14 @@ mod tests {
 
     #[test]
     fn file_vault_roundtrip_and_permissions() {
-        let dir =
-            std::env::temp_dir().join(format!("jai-vault-file-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("jai-vault-file-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vault_fallback.json");
         let v = FileVault(path.clone());
         v.write_map(&HashMap::new()).unwrap();
 
         v.set("jai/provider/x", "shh").unwrap();
-        assert_eq!(
-            v.get("jai/provider/x").unwrap().as_deref(),
-            Some("shh")
-        );
+        assert_eq!(v.get("jai/provider/x").unwrap().as_deref(), Some("shh"));
         v.delete("jai/provider/x").unwrap();
         assert_eq!(v.get("jai/provider/x").unwrap(), None);
         v.delete("jai/provider/x").unwrap(); // 幂等

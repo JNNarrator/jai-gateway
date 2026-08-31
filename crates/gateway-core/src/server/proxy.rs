@@ -792,8 +792,7 @@ fn forward_inbound_headers(
             // 直接按前缀透传，方便上游风控识别为官方客户端。
             for (name, value) in headers.iter() {
                 let name_lower = name.as_str().to_ascii_lowercase();
-                if name_lower.starts_with("x-stainless-")
-                    || name_lower.starts_with("x-request-id")
+                if name_lower.starts_with("x-stainless-") || name_lower.starts_with("x-request-id")
                 {
                     req = req.header(name, value);
                 }
