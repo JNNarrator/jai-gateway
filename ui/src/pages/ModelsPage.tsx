@@ -1,8 +1,28 @@
 import { useEffect, useState } from "react";
+import { ArrowUpDown, Boxes, Search } from "lucide-react";
 import { api } from "../api";
 import type { ModelRow, ProviderDto } from "../types";
 import { toast } from "../lib/toast";
-import { inputCls, btnGhost } from "../components/common/legacy";
+import { PageHeader } from "@/components/common/PageHeader";
+import { EmptyState } from "@/components/common/EmptyState";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 export function ModelsPage() {
   const [providers, setProviders] = useState<ProviderDto[]>([]);
@@ -44,89 +64,110 @@ export function ModelsPage() {
 
   return (
     <div className="mx-auto max-w-4xl space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-lg font-semibold">模型默认值</h1>
-        <div className="flex flex-wrap items-center gap-2">
-          <button className={btnGhost} onClick={() => setAll(true)}>
-            全部启用
-          </button>
-          <button className={btnGhost} onClick={() => setAll(false)}>
-            全部禁用
-          </button>
-        </div>
-      </div>
+      <PageHeader
+        title="模型默认值"
+        description="定义每个模型的上下文窗口、最大输出与上游映射；关闭的模型不参与路由。"
+        actions={
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => void setAll(true)}>
+              全部启用
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => void setAll(false)}>
+              全部禁用
+            </Button>
+          </div>
+        }
+      />
+
       <div className="flex flex-wrap items-center gap-2">
-        <select
-          className={`${inputCls} max-w-xs`}
-          value={selId}
-          onChange={(e) => setSelId(e.target.value)}
-        >
-          {providers.length === 0 && <option value="">先在「供应商」页添加并拉取模型</option>}
-          {providers.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
-        <input
-          className={`${inputCls} max-w-xs`}
-          placeholder="搜索模型名…"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-        />
-        <button
-          className={btnGhost}
+        <Select value={selId} onValueChange={setSelId}>
+          <SelectTrigger className="w-56">
+            <SelectValue
+              placeholder={providers.length === 0 ? "先在「供应商」页添加并拉取模型" : "选择供应商"}
+            />
+          </SelectTrigger>
+          <SelectContent>
+            {providers.map((p) => (
+              <SelectItem key={p.id} value={p.id}>
+                {p.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <div className="relative">
+          <Search
+            className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+            aria-hidden
+          />
+          <Input
+            className="w-56 pl-8"
+            placeholder="搜索模型名…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
           onClick={() => setSortAsc(!sortAsc)}
           title="按名称排序"
         >
-          名称 {sortAsc ? "↑" : "↓"}
-        </button>
-        <span className="text-xs text-neutral-500">
-          这些值是跨协议转换与调用方提示的基础；仅本机模型名对齐时直通也会透传。
-        </span>
+          <ArrowUpDown aria-hidden />
+          名称 {sortAsc ? "升序" : "降序"}
+        </Button>
       </div>
+      <p className="text-xs text-muted-foreground">
+        这些值是跨协议转换与调用方提示的基础；仅本机模型名对齐时直通也会透传。
+      </p>
 
-      <div className="overflow-hidden rounded-lg border border-neutral-800">
-        <table className="w-full text-sm">
-          <thead className="bg-neutral-900 text-left text-xs uppercase tracking-wider text-neutral-500">
-            <tr>
-              <th className="w-1/3 px-4 py-2.5">模型名</th>
-              <th className="w-1/6 px-4 py-2.5">上游模型 ID</th>
-              <th className="w-1/6 px-4 py-2.5">上下文</th>
-              <th className="w-1/6 px-4 py-2.5">最大输出</th>
-              <th className="w-1/6 px-4 py-2.5 text-center">启用</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-neutral-800/70">
-            {filtered.map((m) => (
-              <ModelRowEditor
-                key={m.id}
-                m={m}
-                onSave={async (ctx, out, alias) => {
-                  await api.modelSetLimits({
-                    modelId: m.id,
-                    contextWindow: ctx,
-                    maxOutputTokens: out,
-                  });
-                  await api.modelSetAlias(m.id, alias);
-                  setModels(await api.modelList(selId));
-                }}
-                onToggle={async (v) => {
-                  await api.modelToggle(m.id, v);
-                  setModels(await api.modelList(selId));
-                }}
-              />
-            ))}
-          </tbody>
-        </table>
-        {filtered.length === 0 && (
-          <div className="px-4 py-8 text-center text-sm text-neutral-500">
-            {models.length === 0
-              ? "该供应商还没有模型 —— 在「供应商」页点击「拉取模型」自动发现入库。"
-              : "没有匹配的模型"}
-          </div>
-        )}
-      </div>
+      {models.length === 0 && selId ? (
+        <EmptyState
+          icon={Boxes}
+          title="该供应商还没有模型"
+          description="在「供应商」页点击「拉取模型」自动发现入库，然后回到这里配置默认值。"
+        />
+      ) : (
+        <div className="rounded-lg border">
+          <Table>
+            <TableHeader>
+              <TableRow className="bg-muted/50 hover:bg-muted/50">
+                <TableHead className="w-1/4">模型名</TableHead>
+                <TableHead className="w-1/5">上游模型 ID</TableHead>
+                <TableHead className="w-1/6">上下文</TableHead>
+                <TableHead className="w-1/6">最大输出</TableHead>
+                <TableHead className="w-1/6 text-center">启用</TableHead>
+                <TableHead className="w-20 text-right">操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody className="divide-y">
+              {filtered.map((m) => (
+                <ModelRowEditor
+                  key={m.id}
+                  m={m}
+                  onSave={async (ctx, out, alias) => {
+                    await api.modelSetLimits({
+                      modelId: m.id,
+                      contextWindow: ctx,
+                      maxOutputTokens: out,
+                    });
+                    await api.modelSetAlias(m.id, alias);
+                    setModels(await api.modelList(selId));
+                  }}
+                  onToggle={async (v) => {
+                    await api.modelToggle(m.id, v);
+                    setModels(await api.modelList(selId));
+                  }}
+                />
+              ))}
+            </TableBody>
+          </Table>
+          {filtered.length === 0 && (
+            <div className="px-4 py-8 text-center text-sm text-muted-foreground">
+              没有匹配的模型
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -156,11 +197,11 @@ function ModelRowEditor({
   }
 
   return (
-    <tr className={m.enabled ? "" : "opacity-50"}>
-      <td className="px-4 py-2 font-mono text-xs">{m.modelName}</td>
-      <td className="px-4 py-2">
-        <input
-          className={`${inputCls} w-32`}
+    <TableRow className={m.enabled ? "" : "opacity-50"}>
+      <TableCell className="font-mono text-xs">{m.modelName}</TableCell>
+      <TableCell>
+        <Input
+          className="h-8 w-32 text-xs"
           value={alias}
           placeholder="同模型名"
           title="发给上游时使用的真实模型 ID；留空表示同名"
@@ -169,10 +210,10 @@ function ModelRowEditor({
             setAlias(e.target.value);
           }}
         />
-      </td>
-      <td className="px-4 py-2">
-        <input
-          className={`${inputCls} w-28`}
+      </TableCell>
+      <TableCell>
+        <Input
+          className="h-8 w-28 text-xs"
           type="number"
           step={1024}
           value={ctx}
@@ -181,10 +222,10 @@ function ModelRowEditor({
             setCtx(Number(e.target.value));
           }}
         />
-      </td>
-      <td className="px-4 py-2">
-        <input
-          className={`${inputCls} w-24`}
+      </TableCell>
+      <TableCell>
+        <Input
+          className="h-8 w-24 text-xs"
           type="number"
           step={1024}
           value={out}
@@ -193,33 +234,20 @@ function ModelRowEditor({
             setOut(Number(e.target.value));
           }}
         />
-      </td>
-      <td className="px-4 py-2">
-        <div className="flex items-center justify-center gap-3">
-          <button
-            role="switch"
-            aria-checked={m.enabled}
-            aria-label={`启用 ${m.modelName}`}
-            onClick={() => onToggle(!m.enabled)}
-            className={`relative h-5 w-9 rounded-full transition-colors ${
-              m.enabled ? "bg-emerald-600" : "bg-neutral-700"
-            }`}
-          >
-            <span
-              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
-                m.enabled ? "left-[18px]" : "left-0.5"
-              }`}
-            />
-          </button>
-          <button
-            className={btnGhost}
-            onClick={handleSave}
-            title="保存上下文/最大输出"
-          >
-            {saved ? "✓ 已保存" : "保存"}
-          </button>
-        </div>
-      </td>
-    </tr>
+      </TableCell>
+      <TableCell className="text-center">
+        <Switch
+          checked={m.enabled}
+          onCheckedChange={(v) => void onToggle(v)}
+          aria-label={`启用 ${m.modelName}`}
+          className="mx-auto"
+        />
+      </TableCell>
+      <TableCell className="text-right">
+        <Button variant="outline" size="sm" className="h-8" onClick={() => void handleSave()}>
+          {saved ? "已保存" : "保存"}
+        </Button>
+      </TableCell>
+    </TableRow>
   );
 }
