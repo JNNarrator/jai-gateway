@@ -177,7 +177,7 @@ export function SkillsPage() {
           className="fixed inset-0 z-40 flex items-start justify-center bg-black/60 p-6 pt-16"
           onClick={() => setShowNew(false)}
         >
-          <div className="w-full max-w-2xl" onClick={(e) => e.stopPropagation()}>
+          <div className="w-full max-w-2xl rounded-lg border border-neutral-800 bg-neutral-900 p-4" onClick={(e) => e.stopPropagation()}>
             <SkillForm
               onCancel={() => setShowNew(false)}
               onDone={() => {
