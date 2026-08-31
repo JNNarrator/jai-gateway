@@ -34,6 +34,20 @@
     3. Responses 入站优先同协议族直通，避免被跨族渠道截胡。
   - ✅ 已用 `dsh --profile headless` 实测退出码 0。
 
+- [x] 4. dsh Responses 请求报「messages 低于允许下限 / messages 参数非法」（400）
+  - 现象：
+    ```
+    OpenAI API error (400): {"code":null,"message":"{\"code\":\"BAD_REQUEST\",\"message\":\"messages 低于允许下限\",...}"}
+    OpenAI API error (400): {"code":null,"message":"{\"code\":\"LITELLM_ERROR\",\"message\":\"messages 参数非法。请检查文档。\",...}"}
+    ```
+  - 根因：Responses 解码器对 `input` 数组项要求显式顶层 `"type":"message"`；而 dsh（及 OpenAI 官方格式）
+    省略该字段（直接 `{"role":"user","content":[...]}`），全部落入 `_` 分支被丢弃 → IR messages 为空 →
+    转换后只有 system 消息，上游校验消息条数失败 400。
+  - 已解决：input 数组项 `type` 缺失但含 `role` 字段时按 message 解析；`function_call(_output)` 仍显式按原名解析。
+    新增单测 `decode_input_items_without_type_field` 防回归。
+  - ✅ 已用 curl 复现 dsh 场景（限定模型名 + input 数组 + tools + 流式/非流式）实测通过，日志 200。
+
+
 ## 2. 优化清单
 
 - [x] 1. 创建供应商弹框应该有按钮可以测试能不能获取到模型。

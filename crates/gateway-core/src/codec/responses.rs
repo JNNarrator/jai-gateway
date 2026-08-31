@@ -69,8 +69,12 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
             Value::Array(items) => {
                 for item in items {
                     let typ = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                    // OpenAI 官方 input item 常省略顶层 type（直接 role+content），
+                    // 此时按 message 处理；function_call(_output) 仍显式带 type。
+                    let is_message = typ == "message"
+                        || (typ.is_empty() && item.get("role").and_then(Value::as_str).is_some());
                     match typ {
-                        "message" => {
+                        _ if is_message => {
                             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                             let mut blocks = Vec::new();
                             if let Some(content) = item.get("content").and_then(Value::as_array) {
@@ -1053,6 +1057,44 @@ mod tests {
         ));
         assert_eq!(req.tools.len(), 1);
         assert_eq!(req.tool_choice, ToolChoice::Auto);
+    }
+
+    #[test]
+    fn decode_input_items_without_type_field() {
+        // dsh 与 OpenAI 官方格式：input 数组项省略顶层 type（只有 role+content）。
+        // 曾因 type 为空落入 _ 分支被丢弃，导致 messages 为空、上游 400 拒绝。
+        let req = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "instructions":"Be concise.",
+                "input":[
+                    {"role":"user","content":[{"type":"input_text","text":"hello"}]},
+                    {"role":"assistant","content":[{"type":"output_text","text":"hi there"}]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(req.system, vec!["Be concise."]);
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(req.messages[0].blocks[0].as_text(), Some("hello"));
+        assert_eq!(req.messages[1].role, Role::Assistant);
+        assert_eq!(req.messages[1].blocks[0].as_text(), Some("hi there"));
+        // 显式带 type 的 function_call 项仍按原名解析，不受影响
+        let req2 = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"type":"function_call","call_id":"call_1","name":"f","arguments":"{}"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(req2.messages.len(), 1);
+        assert!(matches!(
+            &req2.messages[0].blocks[0],
+            Block::ToolUse { name, .. } if name == "f"
+        ));
     }
 
     #[test]
