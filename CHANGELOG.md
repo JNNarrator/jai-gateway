@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- UI 2.0 界面升级（阶段 0–6，spec 见 `docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md`）
+  - 基建：Tailwind 3→4、shadcn/ui 基座、蓝紫明暗双主题（next-themes）、sonner 通知、
+    可折叠侧边栏导航、App.tsx 拆分 pages/ + components/
+  - 全部 9 页迁移语义化组件（Card/Button/Dialog/Switch/Select/Table/Tooltip），
+    移除过渡期 legacy 样式；列表加载态 Skeleton
+  - 供应商/MCP/技能表单 Dialog 化：react-hook-form + zod，校验错误就地展示；
+    window.prompt/confirm 全部替换为 Dialog/ConfirmDialog
+  - 统计页 recharts 堆叠柱状图（输入/输出分色 + 单日明细 Tooltip）
+  - 阶段 6 平台视觉：自绘标题栏（Windows/Linux 自绘窗口三键，macOS overlay 保留红绿灯）、
+    窗口毛玻璃特效（mica/acrylic/vibrancy，不支持平台实色回退）
+- 全新品牌 logo（J + AI 星火，蓝紫渐变）与应用图标全套（ico/icns/PNG/Square）、UI favicon
 - M6: OpenAI Responses API 入站（`POST /v1/responses`，Codex 原生线）
   - Responses ↔ IR 编解码、SSE 事件流、错误形状
 - M7: 配置导入 + WebDAV 同步
@@ -33,7 +44,11 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - README/roadmap 同步至 M9 + MCP/Skill 基础管理
+- README 更新：国产 Agent 优先支持说明、新 logo
 
 ### Fixed
+- MCP stdio 客户端把服务端通知行误当响应帧，导致「列出工具/工具调用」报
+  「MCP 响应缺少 result」；现跳过无 id 的通知帧与非 JSON 噪音行
+  （dsh 真机回归：server-everything 13 工具列出、echo 工具循环端到端通过）
 - 流式转换首字节含完整 SSE 流时未消费行缓冲的问题
 - Anthropic SSE 渲染缺失 `content_block_stop`、交错 tool_calls 顺序问题

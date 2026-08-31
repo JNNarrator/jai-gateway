@@ -16,6 +16,7 @@ import { toast } from "../lib/toast";
 import { fmtClock } from "../lib/format";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/common/PageHeader";
+import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { FormField } from "@/components/common/FormField";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
@@ -123,12 +124,15 @@ export function ProvidersPage() {
     { mode: "create" } | { mode: "edit"; p: ProviderDto } | null
   >(null);
   const [confirmDelete, setConfirmDelete] = useState<ProviderDto | null>(null);
+  const [loading, setLoading] = useState(true);
 
   async function refresh() {
     setList(await api.providerList());
   }
   useEffect(() => {
-    refresh().catch((e) => setMsg({ id: "", ok: false, text: String(e) }));
+    refresh()
+      .catch((e) => setMsg({ id: "", ok: false, text: String(e) }))
+      .finally(() => setLoading(false));
     const onRefresh = () => refresh().catch(() => {});
     window.addEventListener("jai-refresh-providers", onRefresh);
     return () => window.removeEventListener("jai-refresh-providers", onRefresh);
@@ -169,6 +173,10 @@ export function ProvidersPage() {
         </div>
       )}
 
+      {loading ? (
+        <SkeletonList rows={3} />
+      ) : (
+        <>
       {list.length === 0 && !dialog && (
         <EmptyState
           icon={KeyRound}
@@ -207,6 +215,8 @@ export function ProvidersPage() {
           />
         ))}
       </div>
+        </>
+      )}
 
       {dialog && (
         <ProviderDialog

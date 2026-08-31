@@ -6,6 +6,7 @@ import { toast } from "../lib/toast";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/common/PageHeader";
 import { EmptyState } from "@/components/common/EmptyState";
+import { SkeletonList } from "@/components/common/SkeletonList";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -32,13 +33,14 @@ export function LogsPage() {
   const [modelFilter, setModelFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [limit, setLimit] = useState(500);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   async function refresh() {
     setRows(await api.logsRecent(limit));
   }
 
   useEffect(() => {
-    refresh();
+    refresh().finally(() => setInitialLoading(false));
     if (!auto) return;
     const t = setInterval(refresh, intervalMs);
     return () => clearInterval(t);
@@ -159,6 +161,10 @@ export function LogsPage() {
         </div>
       </div>
 
+      {initialLoading ? (
+        <SkeletonList rows={8} itemClassName="h-8" />
+      ) : (
+        <>
       <div className="overflow-x-auto rounded-lg border">
         <Table>
           <TableHeader>
@@ -225,6 +231,8 @@ export function LogsPage() {
           </div>
         )}
       </div>
+        </>
+      )}
       <p className="text-xs text-muted-foreground">
         日志不含具体内容，保留 30 天或 5 万行，每日自动清理。
       </p>

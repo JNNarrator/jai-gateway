@@ -422,6 +422,22 @@
 - 不做跨族转换；非 openai_compat 候选自动跳过
 - 集成测试 `tests/legacy_completions.rs` 覆盖直通链路
 
+### UI 2.0 界面升级（阶段 0–6）—— 已完成 ✅（2026-08-31 ~ 09-01）
+
+> spec：`docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md`；逐阶段台账见 `.superpowers/sdd/`。
+
+- 阶段 0 基建：Tailwind 3→4、shadcn/ui 基座、蓝紫明暗双主题、sonner、App.tsx 拆分、可折叠侧边栏
+- 阶段 1–4：9 页全部迁移语义化组件（Card/Button/Dialog/Switch/Select/Table/Tooltip），
+  表单 RHF+zod（校验就地展示）、window.prompt/confirm 全部替换、统计页 recharts、
+  列表加载态 Skeleton；数据层 api.ts/types.ts 与 Rust 业务代码零改动（行为边界保持）
+- 阶段 5 打磨：legacy 过渡样式删除（零引用）、空态统一 EmptyState、系统字体栈
+- 阶段 6 平台视觉：自绘标题栏（Windows/Linux 自绘三键 + 拖拽区，macOS overlay 保留红绿灯）、
+  窗口毛玻璃（mica/acrylic/vibrancy，不支持平台实色回退）
+- 验收：每阶段 `tsc --noEmit + vite build` 零错误；dsh 真机回归（Chat/Responses/MCP/Skill）
+  贯穿验证；Windows 实测自绘标题栏与最大化/还原
+- 附带：全新品牌 logo（J + AI 星火）与应用图标全套；修复 MCP stdio 客户端通知行误读 bug
+- 待对应平台人眼确认：macOS 红绿灯避让与 vibrancy（Windows 侧已实测）
+
 ### 待办（下一里程碑）
 
 1. 配置 CI secrets（`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，及可选 Apple/Windows 证书）并完成首次 tag 触发验证（见 release.md §3）

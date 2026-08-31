@@ -6,6 +6,7 @@ import { toast } from "../lib/toast";
 import { copyText } from "../lib/clipboard";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/common/PageHeader";
+import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Badge } from "@/components/ui/badge";
@@ -36,12 +37,15 @@ export function McpPage() {
     { mode: "create" } | { mode: "edit"; row: McpServerRow } | { mode: "import" } | null
   >(null);
   const [confirmDelete, setConfirmDelete] = useState<McpServerRow | null>(null);
+  const [loading, setLoading] = useState(true);
 
   async function refresh() {
     setList(await api.mcpList());
   }
   useEffect(() => {
-    refresh().catch((e) => setErr(String(e)));
+    refresh()
+      .catch((e) => setErr(String(e)))
+      .finally(() => setLoading(false));
   }, []);
 
   async function act(fn: () => Promise<unknown>) {
@@ -105,6 +109,10 @@ export function McpPage() {
         </div>
       )}
 
+      {loading ? (
+        <SkeletonList rows={3} />
+      ) : (
+        <>
       {list.length === 0 && !dialog && (
         <EmptyState
           icon={PlugZap}
@@ -229,6 +237,8 @@ export function McpPage() {
             refresh();
           }}
         />
+      )}
+        </>
       )}
 
       <ConfirmDialog

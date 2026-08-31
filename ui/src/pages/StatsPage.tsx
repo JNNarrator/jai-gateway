@@ -14,6 +14,7 @@ import type { UsageStatRow } from "../types";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/common/PageHeader";
 import { EmptyState } from "@/components/common/EmptyState";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -32,9 +33,14 @@ function dayLabel(day: number) {
 export function StatsPage() {
   const [days, setDays] = useState<number>(7);
   const [rows, setRows] = useState<UsageStatRow[]>([]);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   useEffect(() => {
-    api.statsUsage(days).then(setRows).catch(() => {});
+    api
+      .statsUsage(days)
+      .then(setRows)
+      .catch(() => {})
+      .finally(() => setInitialLoading(false));
   }, [days]);
 
   const totalRequests = rows.reduce((s, r) => s + r.requests, 0);
@@ -77,6 +83,17 @@ export function StatsPage() {
         }
       />
 
+      {initialLoading ? (
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+            {[0, 1, 2, 3].map((i) => (
+              <Skeleton key={i} className="h-28" />
+            ))}
+          </div>
+          <Skeleton className="h-80 w-full rounded-lg" />
+        </div>
+      ) : (
+        <>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         {kpis.map(([title, value]) => (
           <Card key={title}>
@@ -150,6 +167,8 @@ export function StatsPage() {
           )}
         </CardContent>
       </Card>
+        </>
+      )}
     </div>
   );
 }

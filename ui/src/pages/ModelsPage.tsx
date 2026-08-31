@@ -5,6 +5,7 @@ import type { ModelRow, ProviderDto } from "../types";
 import { toast } from "../lib/toast";
 import { PageHeader } from "@/components/common/PageHeader";
 import { EmptyState } from "@/components/common/EmptyState";
+import { SkeletonList } from "@/components/common/SkeletonList";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -30,6 +31,7 @@ export function ModelsPage() {
   const [models, setModels] = useState<ModelRow[]>([]);
   const [q, setQ] = useState("");
   const [sortAsc, setSortAsc] = useState(true);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     api.providerList().then(setProviders).catch(() => {});
@@ -41,7 +43,12 @@ export function ModelsPage() {
 
   useEffect(() => {
     if (!selId) return;
-    api.modelList(selId).then(setModels).catch(() => {});
+    setLoading(true);
+    api
+      .modelList(selId)
+      .then(setModels)
+      .catch(() => {})
+      .finally(() => setLoading(false));
   }, [selId]);
 
   const filtered = models
@@ -120,13 +127,16 @@ export function ModelsPage() {
         这些值是跨协议转换与调用方提示的基础；仅本机模型名对齐时直通也会透传。
       </p>
 
-      {models.length === 0 && selId ? (
+      {loading ? (
+        <SkeletonList rows={6} itemClassName="h-12" />
+      ) : models.length === 0 && selId ? (
         <EmptyState
           icon={Boxes}
           title="该供应商还没有模型"
           description="在「供应商」页点击「拉取模型」自动发现入库，然后回到这里配置默认值。"
         />
       ) : (
+        <>
         <div className="rounded-lg border">
           <Table>
             <TableHeader>
@@ -167,6 +177,7 @@ export function ModelsPage() {
             </div>
           )}
         </div>
+        </>
       )}
     </div>
   );

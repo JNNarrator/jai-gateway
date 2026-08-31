@@ -5,6 +5,7 @@ import type { SkillRow } from "../types";
 import { toast } from "../lib/toast";
 import { copyText } from "../lib/clipboard";
 import { PageHeader } from "@/components/common/PageHeader";
+import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button } from "@/components/ui/button";
@@ -30,13 +31,16 @@ export function SkillsPage() {
   const [importing, setImporting] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(true);
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function refresh() {
     setList(await api.skillList());
   }
   useEffect(() => {
-    refresh().catch((e) => setErr(String(e)));
+    refresh()
+      .catch((e) => setErr(String(e)))
+      .finally(() => setLoading(false));
   }, []);
 
   function flash(text: string) {
@@ -217,6 +221,10 @@ export function SkillsPage() {
         </div>
       )}
 
+      {loading ? (
+        <SkeletonList rows={3} />
+      ) : (
+        <>
       {list.length === 0 && !dialog && (
         <EmptyState
           icon={Sparkles}
@@ -291,6 +299,8 @@ export function SkillsPage() {
             refresh();
           }}
         />
+      )}
+        </>
       )}
 
       <ConfirmDialog
