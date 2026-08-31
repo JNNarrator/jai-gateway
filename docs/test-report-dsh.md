@@ -4,7 +4,44 @@
 > 测试日期：2026-08-30
 > 环境：Windows + dsh `0.1.1-rc.2` + JAI 独立网关（`examples/jai_standalone`）
 
-## 1. 测试拓扑
+## 0. 第二轮：UI 2.0 阶段 0 后全流程回归（2026-08-31）
+
+> 环境：Windows + dsh `0.1.1-rc.2`（本机 `~/.dsh` profile + settings.yaml provider 接入）
+> + JAI 桌面应用（debug 构建，网关 127.0.0.1:1314）
+> 上游：onemodel（openai_responses，14 模型）、jiyuanlvdong（openai_compat，20 模型），
+> 出站经 Clash（127.0.0.1:7890）。
+
+| # | 场景 | 结果 | 说明 |
+|---|------|------|------|
+| 1 | `GET /healthz` | ✅ | `{"ok":true}` |
+| 2 | `GET /v1/models` | ✅ | 34 个模型，按供应商命名空间 |
+| 3 | Chat 链路：dsh → 网关 → jiyuanlvdong `glm-5`（流式） | ✅ | usage 8238/24 落库 |
+| 4 | Responses 链路：dsh → 网关 → onemodel `deepseek-v4-pro`（流式） | ✅ | usage 8369/63 落库 |
+| 5 | MCP 工具循环：dsh → 网关自动合并 MCP 工具 → 自动执行 echo | ✅ | 回复 `Echo: MCP-FLOW-OK` |
+| 6 | Skill 注入：暗号探针 | ✅ | 模型精确回答 `JAI-SKILL-OK-2026` |
+| 7 | 日志/用量落库 | ✅ | `request_logs` 含 openai/responses 两族，502 错误行亦有记录 |
+
+### 本轮发现并修复
+
+**MCP stdio 客户端把通知行误当响应（commit 26e7add）**
+
+- 现象：`server-everything` 等 MCP server 在收到 `notifications/initialized`
+  后会先输出 `notifications/message` 日志通知帧，「列出工具」报
+  「MCP 响应缺少 result」。
+- 根因：`gateway-core::mcp::run_stdio_jsonrpc` 写出请求后只 `read_line`
+  一次即视为响应；无 `id` 的通知帧被解析为响应体。
+- 修复：循环读取，跳过无 `id` 的通知行与非 JSON 噪音行，只认响应帧。
+- 回归：`cargo test -p gateway-core` 104 个单测全绿；dsh 真机工具循环通过。
+
+### 环境备注
+
+- jai.exe（reqwest）不读 Windows 系统代理；访问需代理的上游时需以
+  `HTTPS_PROXY=http://127.0.0.1:7890` 启动，否则 502 `all_providers_failed`。
+- dsh 通过 `~/.dsh/settings.yaml` 增加 `jai`（openai-completions）/`jai-responses`
+  （openai-responses）两个 provider（baseURL `http://127.0.0.1:1314/v1`，
+  apiKeyEnv `JAI_GATEWAY_KEY`）接入网关，默认模型保持 `deepseek-official` 不变。
+
+## 1. 测试拓扑（第一轮，2026-08-30）
 
 ```
 dsh (headless)
