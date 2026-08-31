@@ -194,9 +194,9 @@ OPENAI_API_KEY=${fullKey || "sk-jai-…"}`
                 <option value="curl">curl</option>
               </select>
             </div>
-            <pre className="relative mt-1 overflow-x-auto rounded bg-black/60 p-3 font-mono text-xs leading-relaxed text-neutral-300">
+            <pre className="relative mt-1 overflow-x-auto rounded bg-black/60 p-3 font-mono text-xs leading-relaxed text-zinc-300">
               <button
-                className="absolute right-2 top-2 rounded border border-neutral-700 px-2 py-0.5 text-[10px] text-neutral-400 hover:text-neutral-200"
+                className="absolute right-2 top-2 rounded border border-neutral-700 px-2 py-0.5 text-[10px] text-zinc-400 hover:text-zinc-200"
                 onClick={() => copyText(snippet)}
               >
                 复制
