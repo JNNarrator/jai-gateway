@@ -1,14 +1,32 @@
 import { useEffect, useRef, useState } from "react";
+import { Pencil, Plus, Sparkles, Trash2, Upload } from "lucide-react";
 import { api } from "../api";
+import type { SkillRow } from "../types";
 import { toast } from "../lib/toast";
 import { copyText } from "../lib/clipboard";
-import { Card, inputCls, btnGhost, btnPrimary, btnDanger } from "../components/common/legacy";
+import { PageHeader } from "@/components/common/PageHeader";
+import { EmptyState } from "@/components/common/EmptyState";
+import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 
 export function SkillsPage() {
-  const [list, setList] = useState<import("../types").SkillRow[]>([]);
+  const [list, setList] = useState<SkillRow[]>([]);
   const [err, setErr] = useState("");
   const [msg, setMsg] = useState("");
-  const [showNew, setShowNew] = useState(false);
+  const [dialog, setDialog] = useState<
+    { mode: "create" } | { mode: "edit"; row: SkillRow } | null
+  >(null);
+  const [confirmDelete, setConfirmDelete] = useState<SkillRow | "batch" | null>(null);
   const [importing, setImporting] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -20,6 +38,11 @@ export function SkillsPage() {
   useEffect(() => {
     refresh().catch((e) => setErr(String(e)));
   }, []);
+
+  function flash(text: string) {
+    setMsg(text);
+    setTimeout(() => setMsg(""), 2000);
+  }
 
   function toggleSelect(id: string) {
     setSelected((prev) => {
@@ -39,8 +62,12 @@ export function SkillsPage() {
     await refresh();
   }
 
-  async function batchDelete() {
-    if (!confirm(`确定删除选中的 ${selected.size} 个技能？`)) return;
+  function batchDelete() {
+    setConfirmDelete("batch");
+  }
+
+  async function doBatchDelete() {
+    if (!selected.size) return;
     for (const id of selected) {
       await api.skillDelete(id);
     }
@@ -111,158 +138,200 @@ export function SkillsPage() {
         if (file) importFile(file);
       }}
     >
-      <div className="flex items-center justify-between">
-        <h1 className="text-lg font-semibold">技能（Skill）管理</h1>
-        <div className="flex gap-2">
-          <button
-            className={btnGhost}
-            onClick={() =>
-              act(async () => {
-                const md = await api.skillExportMarkdown();
-                copyText(md);
-                toast("已复制技能包");
-              })
-            }
-          >
-            复制技能包
-          </button>
-          <input
-            ref={fileRef}
-            type="file"
-            accept=".zip,application/zip"
-            className="hidden"
-            onChange={importZip}
-          />
-          <button
-            className={btnGhost}
-            disabled={importing}
-            onClick={() => fileRef.current?.click()}
-          >
-            {importing ? "导入中…" : "导入 ZIP"}
-          </button>
-          <button className={btnPrimary} onClick={() => setShowNew(true)}>
-            + 添加技能
-          </button>
-        </div>
-      </div>
+      <PageHeader
+        title="技能（Skill）管理"
+        description="启用中的技能会注入系统提示词；支持 ZIP 批量导入（拖拽文件到本页即可）。"
+        actions={
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                act(async () => {
+                  const md = await api.skillExportMarkdown();
+                  copyText(md);
+                  toast("已复制技能包");
+                })
+              }
+            >
+              复制技能包
+            </Button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".zip,application/zip"
+              className="hidden"
+              onChange={importZip}
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={importing}
+              onClick={() => fileRef.current?.click()}
+            >
+              <Upload aria-hidden />
+              {importing ? "导入中…" : "导入 ZIP"}
+            </Button>
+            <Button size="sm" onClick={() => setDialog({ mode: "create" })}>
+              <Plus aria-hidden />
+              添加技能
+            </Button>
+          </div>
+        }
+      />
+
       {err && (
-        <div className="rounded border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
           {err}
         </div>
       )}
       {msg && (
-        <div className="rounded border border-emerald-900 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
+        <div className="rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-primary">
           {msg}
         </div>
       )}
+
       {selected.size > 0 && (
-        <div className="flex flex-wrap items-center gap-2 rounded border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-primary">
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-primary">
           已选 {selected.size} 项
-          <button className={btnGhost} onClick={() => batchSetEnabled(true)}>
+          <Button variant="outline" size="sm" onClick={() => void batchSetEnabled(true)}>
             批量启用
-          </button>
-          <button className={btnGhost} onClick={() => batchSetEnabled(false)}>
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => void batchSetEnabled(false)}>
             批量禁用
-          </button>
-          <button className={btnDanger} onClick={batchDelete}>
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            onClick={batchDelete}
+          >
             批量删除
-          </button>
-          <button className={btnGhost} onClick={() => setSelected(new Set())}>
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => setSelected(new Set())}>
             取消选择
-          </button>
+          </Button>
         </div>
       )}
-      {showNew && (
-        <div
-          className="fixed inset-0 z-40 flex items-start justify-center bg-black/60 p-6 pt-16"
-          onClick={() => setShowNew(false)}
+
+      {list.length === 0 && !dialog && (
+        <EmptyState
+          icon={Sparkles}
+          title="还没有技能"
+          description="技能是一组可复用的指令/提示词/工作流定义，点击添加或导入 ZIP 开始。"
+          className="py-16"
         >
-          <div className="w-full max-w-2xl rounded-lg border border-neutral-800 bg-neutral-900 p-4" onClick={(e) => e.stopPropagation()}>
-            <SkillForm
-              onCancel={() => setShowNew(false)}
-              onDone={() => {
-                setShowNew(false);
-                refresh();
-              }}
-            />
-          </div>
-        </div>
+          <Button variant="outline" size="sm" onClick={() => void createExample()}>
+            <Sparkles aria-hidden />
+            创建示例技能
+          </Button>
+        </EmptyState>
       )}
+
       <div className="space-y-3">
         {list.map((s) => (
-          <div key={s.id} className="rounded-lg border border-neutral-800 bg-neutral-900/60 p-4">
+          <div
+            key={s.id}
+            className="rounded-lg border bg-card p-4 text-card-foreground shadow-sm"
+          >
             <div className="flex items-center gap-3">
               <input
                 type="checkbox"
                 checked={selected.has(s.id)}
                 onChange={() => toggleSelect(s.id)}
-                className="accent-amber-500"
-                title="选择用于批量操作"
+                className="size-4 accent-primary"
+                aria-label={`选择 ${s.name} 用于批量操作`}
               />
-              <input
-                type="checkbox"
+              <Switch
                 checked={s.enabled}
-                onChange={(e) => act(() => api.skillSetEnabled(s.id, e.target.checked))}
-                className="accent-emerald-500"
-                title="启用/停用"
+                onCheckedChange={(v) => act(() => api.skillSetEnabled(s.id, v))}
+                aria-label={`启用/停用 ${s.name}`}
               />
               <div className="min-w-0 flex-1">
-                <div className="font-medium">{s.name}</div>
-                <div className="truncate text-xs text-neutral-500">{s.description}</div>
-                <div className="mt-0.5 text-[11px] text-neutral-600">
+                <div className="font-medium text-foreground">{s.name}</div>
+                <div className="truncate text-xs text-muted-foreground">
+                  {s.description}
+                </div>
+                <div className="mt-0.5 text-[11px] text-muted-foreground/70">
                   更新于 {new Date(s.updatedAt).toLocaleString()}
                 </div>
               </div>
-              <button
-                className={btnDanger}
-                onClick={() => {
-                  if (!confirm(`删除技能「${s.name}」？`)) return;
-                  act(() => api.skillDelete(s.id));
-                }}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setDialog({ mode: "edit", row: s })}
               >
+                <Pencil aria-hidden />
+                编辑
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                onClick={() => setConfirmDelete(s)}
+              >
+                <Trash2 aria-hidden />
                 删除
-              </button>
+              </Button>
             </div>
-            <SkillForm
-              initial={s}
-              onCancel={() => {}}
-              onDone={() => {
-                setMsg("技能已更新");
-                setTimeout(() => setMsg(""), 2000);
-                refresh();
-              }}
-            />
           </div>
         ))}
-        {list.length === 0 && !showNew && (
-          <Card title="还没有技能">
-            <p className="text-sm text-neutral-500">
-              技能是一组可复用的指令/提示词/工作流定义，点击添加或导入 ZIP 开始。
-            </p>
-            <button className={`${btnGhost} mt-3`} onClick={createExample}>
-              ✨ 创建示例技能
-            </button>
-          </Card>
-        )}
       </div>
+
+      {(dialog?.mode === "create" || dialog?.mode === "edit") && (
+        <SkillDialog
+          initial={dialog.mode === "edit" ? dialog.row : undefined}
+          onClose={() => setDialog(null)}
+          onDone={() => {
+            setDialog(null);
+            flash("技能已保存");
+            refresh();
+          }}
+        />
+      )}
+
+      <ConfirmDialog
+        open={!!confirmDelete}
+        onOpenChange={(o) => !o && setConfirmDelete(null)}
+        title={
+          confirmDelete === "batch"
+            ? `删除选中的 ${selected.size} 个技能？`
+            : `删除技能「${confirmDelete ? confirmDelete.name : ""}」？`
+        }
+        description="删除后注入会立即停止，操作不可撤销。"
+        confirmText="删除"
+        destructive
+        onConfirm={() => {
+          if (confirmDelete === "batch") void doBatchDelete();
+          else if (confirmDelete) act(() => api.skillDelete(confirmDelete.id));
+        }}
+      />
     </div>
   );
 }
 
-function SkillForm({
+function SkillDialog({
   initial,
   onDone,
-  onCancel,
+  onClose,
 }: {
-  initial?: import("../types").SkillRow;
+  initial?: SkillRow;
   onDone: () => void;
-  onCancel: () => void;
+  onClose: () => void;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [description, setDescription] = useState(initial?.description ?? "");
   const [content, setContent] = useState(initial?.content ?? "");
+  const [nameErr, setNameErr] = useState("");
 
   async function submit() {
+    if (!name.trim()) {
+      setNameErr("名称不能为空");
+      return;
+    }
     if (initial) {
       await api.skillUpdate({ id: initial.id, name, description, content });
     } else {
@@ -272,29 +341,47 @@ function SkillForm({
   }
 
   return (
-    <div className="mt-3 grid grid-cols-1 gap-3 rounded border-t border-neutral-800 pt-4 md:grid-cols-2">
-      <label className="text-xs text-neutral-400">
-        名称
-        <input className={`${inputCls} mt-1`} value={name} onChange={(e) => setName(e.target.value)} />
-      </label>
-      <label className="text-xs text-neutral-400">
-        描述
-        <input className={`${inputCls} mt-1`} value={description} onChange={(e) => setDescription(e.target.value)} />
-      </label>
-      <label className="col-span-2 text-xs text-neutral-400">
-        内容/指令
-        <textarea className={`${inputCls} mt-1 h-28 font-mono`} value={content} onChange={(e) => setContent(e.target.value)} />
-      </label>
-      <div className="col-span-2 flex gap-2">
-        <button className={btnPrimary} onClick={submit}>
-          {initial ? "保存" : "创建"}
-        </button>
-        {!initial && (
-          <button className={btnGhost} onClick={onCancel}>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{initial ? `编辑「${initial.name}」` : "添加技能"}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">名称</label>
+            <Input
+              value={name}
+              onChange={(e) => {
+                setName(e.target.value);
+                setNameErr("");
+              }}
+            />
+            {nameErr && (
+              <p className="text-xs text-destructive" role="alert">
+                {nameErr}
+              </p>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">描述</label>
+            <Input value={description} onChange={(e) => setDescription(e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">内容/指令</label>
+            <Textarea
+              className="h-32 font-mono text-xs"
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+            />
+          </div>
+        </div>
+        <DialogFooter className="gap-2">
+          <Button onClick={() => void submit()}>{initial ? "保存" : "创建"}</Button>
+          <Button variant="ghost" onClick={onClose}>
             取消
-          </button>
-        )}
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

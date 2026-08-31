@@ -1,15 +1,257 @@
 import { useEffect, useState } from "react";
+import { ClipboardPaste, Pencil, PlugZap, Plus, ListTree, Trash2 } from "lucide-react";
 import { api } from "../api";
+import type { McpServerRow } from "../types";
 import { toast } from "../lib/toast";
 import { copyText } from "../lib/clipboard";
-import { Card, inputCls, btnGhost, btnPrimary, btnDanger } from "../components/common/legacy";
+import { cn } from "@/lib/utils";
+import { PageHeader } from "@/components/common/PageHeader";
+import { EmptyState } from "@/components/common/EmptyState";
+import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 
-function McpImportForm({
+export function McpPage() {
+  const [list, setList] = useState<McpServerRow[]>([]);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [dialog, setDialog] = useState<
+    { mode: "create" } | { mode: "edit"; row: McpServerRow } | { mode: "import" } | null
+  >(null);
+  const [confirmDelete, setConfirmDelete] = useState<McpServerRow | null>(null);
+
+  async function refresh() {
+    setList(await api.mcpList());
+  }
+  useEffect(() => {
+    refresh().catch((e) => setErr(String(e)));
+  }, []);
+
+  async function act(fn: () => Promise<unknown>) {
+    setErr("");
+    try {
+      await fn();
+      await refresh();
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-4">
+      <PageHeader
+        title="MCP Server 管理"
+        description="网关会把启用中的 MCP 工具自动合并进模型请求并代为执行。"
+        actions={
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() =>
+                act(async () => {
+                  const cfg = await api.mcpExportConfig();
+                  copyText(JSON.stringify(cfg, null, 2));
+                  toast("已复制客户端 MCP 配置");
+                })
+              }
+            >
+              <ClipboardPaste aria-hidden />
+              复制客户端配置
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setDialog({ mode: "import" })}
+            >
+              <ClipboardPaste aria-hidden />
+              粘贴 JSON 导入
+            </Button>
+            <Button size="sm" onClick={() => setDialog({ mode: "create" })}>
+              <Plus aria-hidden />
+              添加 MCP Server
+            </Button>
+          </div>
+        }
+      />
+
+      {err && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          {err}
+        </div>
+      )}
+      {msg && (
+        <div className="rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm break-all text-primary">
+          {msg}
+        </div>
+      )}
+
+      {list.length === 0 && !dialog && (
+        <EmptyState
+          icon={PlugZap}
+          title="还没有 MCP Server"
+          description="点击上方按钮添加一个 stdio / SSE / HTTP 类型的服务，或直接粘贴 mcpServers JSON 导入。"
+          className="py-16"
+        />
+      )}
+
+      <div className="space-y-3">
+        {list.map((m) => (
+          <div
+            key={m.id}
+            className="rounded-lg border bg-card p-4 text-card-foreground shadow-sm"
+          >
+            <div className="flex items-center gap-3">
+              <Switch
+                checked={m.enabled}
+                onCheckedChange={(v) => act(() => api.mcpSetEnabled(m.id, v))}
+                aria-label={`启用/停用 ${m.name}`}
+              />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium text-foreground">{m.name}</span>
+                  <Badge variant="secondary" className="text-[11px] font-normal">
+                    {m.kind}
+                  </Badge>
+                  {!m.enabled && <Badge variant="outline">已停用</Badge>}
+                </div>
+                <div className="truncate font-mono text-xs text-muted-foreground">
+                  {m.kind === "stdio"
+                    ? `${m.command ?? ""} ${m.args ?? ""}`
+                    : m.url ?? ""}
+                  {m.env ? (
+                    <span
+                      className="text-muted-foreground/60"
+                      title={m.env}
+                    >
+                      {" "}
+                      env:{" "}
+                      {Object.keys(JSON.parse(m.env) as Record<string, string>).join(", ")}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    act(async () => {
+                      await api.mcpToolsList(m.id);
+                      toast(`MCP「${m.name}」连接正常`);
+                    })
+                  }
+                >
+                  <PlugZap aria-hidden />
+                  测试连接
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    act(async () => {
+                      const tools = await api.mcpToolsList(m.id);
+                      setMsg(
+                        tools.length
+                          ? `${m.name} 工具：${tools.map((t) => t.name).join("、")}`
+                          : `${m.name} 未暴露工具`,
+                      );
+                    })
+                  }
+                >
+                  <ListTree aria-hidden />
+                  列出工具
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setDialog({ mode: "edit", row: m })}
+                >
+                  <Pencil aria-hidden />
+                  编辑
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  onClick={() => setConfirmDelete(m)}
+                >
+                  <Trash2 aria-hidden />
+                  删除
+                </Button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {dialog?.mode === "import" && (
+        <McpImportDialog
+          onClose={() => setDialog(null)}
+          onDone={(report) => {
+            setDialog(null);
+            setMsg(
+              `导入完成：新增 ${report.imported}，更新 ${report.updated}${
+                report.skipped.length ? `，跳过 ${report.skipped.length}` : ""
+              }`,
+            );
+            refresh();
+          }}
+        />
+      )}
+      {(dialog?.mode === "create" || dialog?.mode === "edit") && (
+        <McpDialog
+          initial={dialog.mode === "edit" ? dialog.row : undefined}
+          onClose={() => setDialog(null)}
+          onDone={() => {
+            setDialog(null);
+            setMsg("MCP Server 已保存");
+            setTimeout(() => setMsg(""), 2000);
+            refresh();
+          }}
+        />
+      )}
+
+      <ConfirmDialog
+        open={!!confirmDelete}
+        onOpenChange={(o) => !o && setConfirmDelete(null)}
+        title={`删除 MCP Server「${confirmDelete?.name ?? ""}」？`}
+        description="删除后网关不再合并其工具，操作不可撤销。"
+        confirmText="删除"
+        destructive
+        onConfirm={() => {
+          if (confirmDelete) act(() => api.mcpDelete(confirmDelete.id));
+        }}
+      />
+    </div>
+  );
+}
+
+function McpImportDialog({
   onDone,
-  onCancel,
+  onClose,
 }: {
   onDone: (report: { imported: number; updated: number; skipped: string[] }) => void;
-  onCancel: () => void;
+  onClose: () => void;
 }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -32,231 +274,68 @@ function McpImportForm({
   }
 
   return (
-    <div className="rounded-lg border border-neutral-800 bg-neutral-900/60 p-4">
-      <div className="mb-2 flex items-center justify-between">
-        <span className="text-sm font-medium">粘贴 mcpServers JSON 导入</span>
-        <button className={btnGhost} onClick={onCancel}>
-          取消
-        </button>
-      </div>
-      <p className="mb-2 text-xs text-neutral-500">
-        支持 Claude Code 格式：{`{"mcpServers": {"名称": {"command": "...", "args": [...], "env": {...}}}}`}
-        ，同名服务会被更新，不含 command/url 的条目自动跳过。
-      </p>
-      <textarea
-        className={`${inputCls} min-h-[140px] w-full resize-y font-mono text-xs`}
-        value={text}
-        onChange={(e) => {
-          setText(e.target.value);
-          setLocalErr("");
-        }}
-        placeholder='{"mcpServers":{"netcatty-external":{"command":"/Applications/...","args":[],"env":{"KEY":"value"}}}}'
-        spellCheck={false}
-      />
-      <div className="mt-2 flex items-center gap-2">
-        <button className={btnPrimary} onClick={submit} disabled={busy}>
-          {busy ? "导入中…" : "导入"}
-        </button>
-        <button
-          className={btnGhost}
-          onClick={() =>
-            navigator.clipboard
-              ?.readText()
-              .then((t) => {
-                setText(t);
-                setLocalErr("");
-              })
-              .catch(() => setLocalErr("读取剪贴板失败"))
-          }
-        >
-          粘贴
-        </button>
-        {localErr && <span className="text-xs text-red-400">{localErr}</span>}
-      </div>
-    </div>
-  );
-}
-
-export function McpPage() {
-  const [list, setList] = useState<import("../types").McpServerRow[]>([]);
-  const [msg, setMsg] = useState("");
-  const [err, setErr] = useState("");
-  const [showNew, setShowNew] = useState(false);
-  const [showImport, setShowImport] = useState(false);
-
-  async function refresh() {
-    setList(await api.mcpList());
-  }
-  useEffect(() => {
-    refresh().catch((e) => setErr(String(e)));
-  }, []);
-
-  async function act(fn: () => Promise<unknown>) {
-    setErr("");
-    try {
-      await fn();
-      await refresh();
-    } catch (e) {
-      setErr(String(e));
-    }
-  }
-
-  return (
-    <div className="mx-auto max-w-3xl space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-lg font-semibold">MCP Server 管理</h1>
-        <div className="flex gap-2">
-          <button
-            className={btnGhost}
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>粘贴 mcpServers JSON 导入</DialogTitle>
+          <DialogDescription>
+            支持 Claude Code 格式：
+            {` {"mcpServers": {"名称": {"command": "...", "args": [...], "env": {...}}}}`}
+            ，同名服务会被更新，不含 command/url 的条目自动跳过。
+          </DialogDescription>
+        </DialogHeader>
+        <textarea
+          className="min-h-[160px] w-full resize-y rounded-md border bg-transparent px-3 py-2 font-mono text-xs text-foreground placeholder:text-muted-foreground"
+          value={text}
+          onChange={(e) => {
+            setText(e.target.value);
+            setLocalErr("");
+          }}
+          placeholder='{"mcpServers":{"my-server":{"command":"node","args":["..."],"env":{"KEY":"value"}}}}'
+          spellCheck={false}
+        />
+        {localErr && (
+          <p className="text-xs text-destructive" role="alert">
+            {localErr}
+          </p>
+        )}
+        <DialogFooter className="gap-2">
+          <Button
+            type="button"
+            variant="outline"
             onClick={() =>
-              act(async () => {
-                const cfg = await api.mcpExportConfig();
-                copyText(JSON.stringify(cfg, null, 2));
-                toast("已复制客户端 MCP 配置");
-              })
+              navigator.clipboard
+                ?.readText()
+                .then((t) => {
+                  setText(t);
+                  setLocalErr("");
+                })
+                .catch(() => setLocalErr("读取剪贴板失败"))
             }
           >
-            复制客户端配置
-          </button>
-          <button className={btnGhost} onClick={() => setShowImport((v) => !v)}>
-            粘贴 JSON 导入
-          </button>
-          <button className={btnPrimary} onClick={() => setShowNew(true)}>
-            + 添加 MCP Server
-          </button>
-        </div>
-      </div>
-      {err && (
-        <div className="rounded border border-red-900 bg-red-950/40 px-3 py-2 text-sm text-red-300">
-          {err}
-        </div>
-      )}
-      {msg && (
-        <div className="rounded border border-emerald-900 bg-emerald-950/40 px-3 py-2 text-sm text-emerald-300">
-          {msg}
-        </div>
-      )}
-      {showImport && (
-        <McpImportForm
-          onDone={(report) => {
-            setMsg(
-              `导入完成：新增 ${report.imported}，更新 ${report.updated}${
-                report.skipped.length ? `，跳过 ${report.skipped.length}` : ""
-              }`,
-            );
-            setShowImport(false);
-            refresh();
-          }}
-          onCancel={() => setShowImport(false)}
-        />
-      )}
-      {showNew && (
-        <McpForm
-          onCancel={() => setShowNew(false)}
-          onDone={() => {
-            setShowNew(false);
-            refresh();
-          }}
-        />
-      )}
-      <div className="space-y-3">
-        {list.map((m) => (
-          <div key={m.id} className="rounded-lg border border-neutral-800 bg-neutral-900/60 p-4">
-            <div className="flex items-center gap-3">
-              <input
-                type="checkbox"
-                checked={m.enabled}
-                onChange={(e) => act(() => api.mcpSetEnabled(m.id, e.target.checked))}
-                className="accent-amber-500"
-              />
-              <div className="min-w-0 flex-1">
-                <div className="flex items-baseline gap-2">
-                  <span className="font-medium">{m.name}</span>
-                  <span className="rounded bg-neutral-800 px-1.5 py-0.5 text-[11px] text-neutral-400">
-                    {m.kind}
-                  </span>
-                  {!m.enabled && <span className="text-[11px] text-neutral-500">已停用</span>}
-                </div>
-                <div className="truncate font-mono text-xs text-neutral-500">
-                  {m.kind === "stdio"
-                    ? `${m.command ?? ""} ${m.args ?? ""}`
-                    : m.url ?? ""}
-                  {m.env ? (
-                    <span className="text-neutral-600" title={m.env}>
-                      {" "}
-                      env:{" "}
-                      {Object.keys(JSON.parse(m.env) as Record<string, string>).join(", ")}
-                    </span>
-                  ) : null}
-                </div>
-              </div>
-              <button
-                className={btnGhost}
-                onClick={() =>
-                  act(async () => {
-                    await api.mcpToolsList(m.id);
-                    toast(`MCP「${m.name}」连接正常`);
-                  })
-                }
-              >
-                测试连接
-              </button>
-              <button
-                className={btnGhost}
-                onClick={() =>
-                  act(async () => {
-                    const tools = await api.mcpToolsList(m.id);
-                    setMsg(
-                      tools.length
-                        ? `${m.name} 工具：${tools.map((t) => t.name).join("、")}`
-                        : `${m.name} 未暴露工具`,
-                    );
-                  })
-                }
-              >
-                列出工具
-              </button>
-              <button
-                className={btnDanger}
-                onClick={() => {
-                  if (!confirm(`删除 MCP Server「${m.name}」？`)) return;
-                  act(() => api.mcpDelete(m.id));
-                }}
-              >
-                删除
-              </button>
-            </div>
-            <McpForm
-              initial={m}
-              onCancel={() => {}}
-              onDone={() => {
-                setMsg("MCP Server 已更新");
-                setTimeout(() => setMsg(""), 2000);
-                refresh();
-              }}
-            />
-          </div>
-        ))}
-        {list.length === 0 && !showNew && (
-          <Card title="还没有 MCP Server">
-            <p className="text-sm text-neutral-500">
-              点击上方按钮添加一个 stdio / SSE / HTTP 类型的服务。
-            </p>
-          </Card>
-        )}
-      </div>
-    </div>
+            <ClipboardPaste aria-hidden />
+            粘贴
+          </Button>
+          <Button onClick={() => void submit()} disabled={busy}>
+            {busy ? "导入中…" : "导入"}
+          </Button>
+          <Button variant="ghost" onClick={onClose}>
+            取消
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
-function McpForm({
+function McpDialog({
   initial,
   onDone,
-  onCancel,
+  onClose,
 }: {
-  initial?: import("../types").McpServerRow;
+  initial?: McpServerRow;
   onDone: () => void;
-  onCancel: () => void;
+  onClose: () => void;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [kind, setKind] = useState<string>(initial?.kind ?? "stdio");
@@ -265,15 +344,21 @@ function McpForm({
   const [url, setUrl] = useState(initial?.url ?? "");
   const [env, setEnv] = useState(initial?.env ?? "");
   const [argsErr, setArgsErr] = useState("");
+  const [nameErr, setNameErr] = useState("");
 
   async function submit() {
+    if (!name.trim()) {
+      setNameErr("名称不能为空");
+      return;
+    }
+    setNameErr("");
     if (kind === "stdio" && args.trim()) {
       try {
         const parsed = JSON.parse(args);
         if (!Array.isArray(parsed)) throw new Error("必须是数组");
         setArgsErr("");
       } catch {
-        setArgsErr("参数需为合法 JSON 数组，例如 [\"-y\",\"包名\"]");
+        setArgsErr('参数需为合法 JSON 数组，例如 ["-y","包名"]');
         return;
       }
     }
@@ -301,51 +386,94 @@ function McpForm({
   }
 
   return (
-    <div className="mt-3 grid grid-cols-1 gap-3 rounded border-t border-neutral-800 pt-4 md:grid-cols-2">
-      <label className="text-xs text-neutral-400">
-        名称
-        <input className={`${inputCls} mt-1`} value={name} onChange={(e) => setName(e.target.value)} />
-      </label>
-      <label className="text-xs text-neutral-400">
-        类型
-        <select className={`${inputCls} mt-1`} value={kind} onChange={(e) => setKind(e.target.value)}>
-          <option value="stdio">stdio</option>
-          <option value="sse">sse</option>
-          <option value="http">http</option>
-        </select>
-      </label>
-      {kind === "stdio" ? (
-        <>
-          <label className="text-xs text-neutral-400">
-            命令
-            <input className={`${inputCls} mt-1 font-mono`} value={command} onChange={(e) => setCommand(e.target.value)} placeholder="npx / node / python" />
-          </label>
-          <label className="text-xs text-neutral-400">
-            参数（JSON 数组）
-            <input className={`${inputCls} mt-1 font-mono`} value={args} onChange={(e) => { setArgs(e.target.value); setArgsErr(""); }} placeholder='["-y","@modelcontextprotocol/server-filesystem"]' />
-            {argsErr && <span className="mt-1 block text-[11px] text-red-400">{argsErr}</span>}
-          </label>
-          <label className="col-span-2 text-xs text-neutral-400">
-            环境变量（JSON 对象，可选）
-            <input className={`${inputCls} mt-1 font-mono`} value={env} onChange={(e) => setEnv(e.target.value)} placeholder='{"API_KEY":"xxx"}' />
-          </label>
-        </>
-      ) : (
-        <label className="col-span-2 text-xs text-neutral-400">
-          URL
-          <input className={`${inputCls} mt-1 font-mono`} value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://mcp.example.com/sse" />
-        </label>
-      )}
-      <div className="col-span-2 flex gap-2">
-        <button className={btnPrimary} onClick={submit}>
-          {initial ? "保存" : "创建"}
-        </button>
-        {!initial && (
-          <button className={btnGhost} onClick={onCancel}>
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{initial ? `编辑「${initial.name}」` : "添加 MCP Server"}</DialogTitle>
+          <DialogDescription>
+            stdio 类型由网关拉起子进程；sse / http 走远程 URL。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">名称</label>
+            <Input value={name} onChange={(e) => { setName(e.target.value); setNameErr(""); }} />
+            {nameErr && (
+              <p className="text-xs text-destructive" role="alert">
+                {nameErr}
+              </p>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">类型</label>
+            <Select value={kind} onValueChange={setKind}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="stdio">stdio</SelectItem>
+                <SelectItem value="sse">sse</SelectItem>
+                <SelectItem value="http">http</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          {kind === "stdio" ? (
+            <>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">命令</label>
+                <Input
+                  className="font-mono"
+                  value={command}
+                  onChange={(e) => setCommand(e.target.value)}
+                  placeholder="npx / node / python"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-sm font-medium">参数（JSON 数组）</label>
+                <Input
+                  className={cn("font-mono", argsErr && "border-destructive")}
+                  value={args}
+                  onChange={(e) => {
+                    setArgs(e.target.value);
+                    setArgsErr("");
+                  }}
+                  placeholder='["-y","@modelcontextprotocol/server-filesystem"]'
+                />
+                {argsErr && (
+                  <p className="text-xs text-destructive" role="alert">
+                    {argsErr}
+                  </p>
+                )}
+              </div>
+              <div className="space-y-1.5 md:col-span-2">
+                <label className="text-sm font-medium">环境变量（JSON 对象，可选）</label>
+                <Input
+                  className="font-mono"
+                  value={env}
+                  onChange={(e) => setEnv(e.target.value)}
+                  placeholder='{"API_KEY":"xxx"}'
+                />
+              </div>
+            </>
+          ) : (
+            <div className="space-y-1.5 md:col-span-2">
+              <label className="text-sm font-medium">URL</label>
+              <Input
+                className="font-mono"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://mcp.example.com/sse"
+              />
+            </div>
+          )}
+        </div>
+        <DialogFooter className="gap-2">
+          <Button onClick={() => void submit()}>{initial ? "保存" : "创建"}</Button>
+          <Button variant="ghost" onClick={onClose}>
             取消
-          </button>
-        )}
-      </div>
-    </div>
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
