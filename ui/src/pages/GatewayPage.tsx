@@ -108,7 +108,7 @@ OPENAI_API_KEY=${fullKey || "sk-jai-…"}`
               <span className="rounded bg-emerald-950 px-2 py-0.5 text-xs font-semibold text-emerald-400">
                 运行中
               </span>
-              <span className="font-mono text-lg font-bold text-white">
+              <span className="font-mono text-lg font-bold text-foreground">
                 127.0.0.1:{port}
               </span>
             </>

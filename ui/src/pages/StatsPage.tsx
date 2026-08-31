@@ -25,7 +25,7 @@ export function StatsPage() {
           {[7, 30, 90].map((d) => (
             <button
               key={d}
-              className={`${btnGhost} ${days === d ? "bg-neutral-800 text-white" : ""}`}
+              className={`${btnGhost} ${days === d ? "bg-neutral-800 text-foreground" : ""}`}
               onClick={() => setDays(d)}
             >
               近 {d} 天

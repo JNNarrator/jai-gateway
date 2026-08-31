@@ -143,7 +143,7 @@ export function SettingsPage() {
           本机来源（localhost / 127.0.0.1）始终放行。
         </p>
         {corsHasWildcard && (
-          <div className="mb-3 rounded border border-amber-800 bg-amber-950/40 px-3 py-2 text-xs text-amber-300">
+          <div className="mb-3 rounded border border-primary/40 bg-primary/10 px-3 py-2 text-xs text-primary">
             ⚠ 通配符 * 会放行所有来源，生产环境不建议使用。
           </div>
         )}

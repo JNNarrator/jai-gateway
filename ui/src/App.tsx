@@ -10,6 +10,7 @@ import { ModelsPage } from "./pages/ModelsPage";
 import { StatsPage } from "./pages/StatsPage";
 import { LogsPage } from "./pages/LogsPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { ThemeToggle } from "./components/layout/ThemeToggle";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("gateway");
@@ -42,12 +43,13 @@ export default function App() {
     <div className="flex h-screen flex-col bg-neutral-950 text-neutral-200">
       <header className="flex items-center gap-1 border-b border-neutral-800 px-4 py-2">
         <span className="mr-4 font-mono text-sm font-bold text-amber-500">JAI</span>
+        <ThemeToggle />
         {tabs.map(([k, label]) => (
           <button
             key={k}
             onClick={() => setTab(k)}
             className={`rounded px-3 py-1.5 text-sm ${
-              tab === k ? "bg-neutral-800 font-medium text-white" : "text-neutral-400 hover:text-neutral-200"
+              tab === k ? "bg-neutral-800 font-medium text-foreground" : "text-neutral-400 hover:text-neutral-200"
             }`}
           >
             {label}
