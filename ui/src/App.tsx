@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import type { ToastKind } from "./lib/toast";
 import type { Tab } from "./lib/nav";
 import { GatewayPage } from "./pages/GatewayPage";
 import { SyncPage } from "./pages/SyncPage";
@@ -14,7 +13,6 @@ import { ThemeToggle } from "./components/layout/ThemeToggle";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("gateway");
-  const [toastMsg, setToastMsg] = useState<{ msg: string; kind: ToastKind } | null>(null);
   const tabs: [Tab, string][] = [
     ["gateway", "网关"], ["sync", "同步"], ["mcp", "MCP"], ["skills", "技能"],
     ["providers", "供应商"], ["models", "模型"], ["stats", "统计"],
@@ -22,19 +20,12 @@ export default function App() {
   ];
 
   useEffect(() => {
-    const onToast = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { msg: string; kind: ToastKind };
-      setToastMsg({ msg: detail.msg, kind: detail.kind ?? "ok" });
-      window.setTimeout(() => setToastMsg(null), 2500);
-    };
     const onGoto = (e: Event) => {
       const detail = (e as CustomEvent).detail as { tab: string };
       setTab(detail.tab as Tab);
     };
-    window.addEventListener("jai-toast", onToast);
     window.addEventListener("jai-goto-tab", onGoto);
     return () => {
-      window.removeEventListener("jai-toast", onToast);
       window.removeEventListener("jai-goto-tab", onGoto);
     };
   }, []);
@@ -67,17 +58,6 @@ export default function App() {
         {tab === "logs" && <LogsPage />}
         {tab === "settings" && <SettingsPage />}
       </main>
-      {toastMsg && (
-        <div
-          className={`fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-lg border px-4 py-2 text-sm shadow-lg ${
-            toastMsg.kind === "err"
-              ? "border-red-800 bg-red-950 text-red-200"
-              : "border-emerald-800 bg-emerald-950 text-emerald-200"
-          }`}
-        >
-          {toastMsg.msg}
-        </div>
-      )}
     </div>
   );
 }
