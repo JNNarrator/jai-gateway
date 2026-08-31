@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useNav, type Tab } from "@/lib/nav";
+import { LogoMark } from "./LogoMark";
 import { ThemeToggle } from "./ThemeToggle";
 
 const NAV: [Tab, string, typeof Radio][] = [
@@ -50,13 +51,17 @@ export function SidebarNav() {
     >
       <div
         className={cn(
-          "flex h-12 items-center border-b border-border",
+          "flex h-12 shrink-0 items-center gap-2 border-b border-border",
           collapsed ? "justify-center" : "px-4",
         )}
       >
-        <span className="font-mono text-sm font-bold text-primary">
-          {collapsed ? "J" : "JAI"}
-        </span>
+        <LogoMark className="size-7 shrink-0 rounded-[7px]" />
+        {!collapsed && (
+          <span className="text-sm font-bold tracking-wide text-foreground">
+            JAI
+            <span className="ml-1.5 font-normal text-muted-foreground">Gateway</span>
+          </span>
+        )}
       </div>
 
       <nav className="flex-1 space-y-1 overflow-y-auto p-2">
