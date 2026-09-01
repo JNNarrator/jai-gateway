@@ -60,13 +60,17 @@ export function ModelsPage() {
     );
 
   async function setAll(enabled: boolean) {
-    for (const m of filtered) {
-      if (m.enabled !== enabled) {
-        await api.modelToggle(m.id, enabled);
+    try {
+      for (const m of filtered) {
+        if (m.enabled !== enabled) {
+          await api.modelToggle(m.id, enabled);
+        }
       }
+      if (selId) setModels(await api.modelList(selId));
+      toast(enabled ? "已全部启用" : "已全部禁用");
+    } catch (e) {
+      toast(String(e), "err");
     }
-    if (selId) setModels(await api.modelList(selId));
-    toast(enabled ? "已全部启用" : "已全部禁用");
   }
 
   return (

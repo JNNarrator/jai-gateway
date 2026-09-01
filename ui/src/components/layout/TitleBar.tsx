@@ -12,15 +12,26 @@ export function TitleBar() {
 
   useEffect(() => {
     setDarwin(navigator.userAgent.includes("Mac OS X"));
+    const win = getCurrentWindow();
     let unlisten: (() => void) | undefined;
-    appWindow.onResized((e) => {
+    let disposed = false;
+    const unlistenPromise = win.onResized(() => {
       // payload 为物理尺寸；无法直接区分最大化，改查 isMaximized
-      appWindow.isMaximized().then(setMaximized);
-      void e;
+      void win.isMaximized().then(setMaximized);
     });
-    appWindow.isMaximized().then(setMaximized);
-    return () => unlisten?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    void unlistenPromise.then((fn) => {
+      if (disposed) {
+        // cleanup 已先执行（如 StrictMode 双挂载），就地释放避免泄漏
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    void win.isMaximized().then(setMaximized);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   return (

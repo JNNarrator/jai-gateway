@@ -29,6 +29,19 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 
+/** 安全解析 env JSON 的键名列表；非法或非对象时返回占位文案，避免渲染抛错白屏 */
+function envKeySummary(env: string): string {
+  try {
+    const parsed: unknown = JSON.parse(env);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return Object.keys(parsed).join(", ");
+    }
+  } catch {
+    /* 非法 JSON，落入下方占位文案 */
+  }
+  return "(非法 JSON)";
+}
+
 export function McpPage() {
   const [list, setList] = useState<McpServerRow[]>([]);
   const [msg, setMsg] = useState("");
@@ -153,7 +166,7 @@ export function McpPage() {
                     >
                       {" "}
                       env:{" "}
-                      {Object.keys(JSON.parse(m.env) as Record<string, string>).join(", ")}
+                      {envKeySummary(m.env)}
                     </span>
                   ) : null}
                 </div>
@@ -355,6 +368,7 @@ function McpDialog({
   const [env, setEnv] = useState(initial?.env ?? "");
   const [argsErr, setArgsErr] = useState("");
   const [nameErr, setNameErr] = useState("");
+  const [envErr, setEnvErr] = useState("");
 
   async function submit() {
     if (!name.trim()) {
@@ -369,6 +383,18 @@ function McpDialog({
         setArgsErr("");
       } catch {
         setArgsErr('参数需为合法 JSON 数组，例如 ["-y","包名"]');
+        return;
+      }
+    }
+    if (env.trim()) {
+      try {
+        const parsed: unknown = JSON.parse(env);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("必须是对象");
+        }
+        setEnvErr("");
+      } catch {
+        setEnvErr('环境变量需为合法 JSON 对象，例如 {"API_KEY":"xxx"}');
         return;
       }
     }
@@ -458,11 +484,19 @@ function McpDialog({
               <div className="space-y-1.5 md:col-span-2">
                 <label className="text-sm font-medium">环境变量（JSON 对象，可选）</label>
                 <Input
-                  className="font-mono"
+                  className={cn("font-mono", envErr && "border-destructive")}
                   value={env}
-                  onChange={(e) => setEnv(e.target.value)}
+                  onChange={(e) => {
+                    setEnv(e.target.value);
+                    setEnvErr("");
+                  }}
                   placeholder='{"API_KEY":"xxx"}'
                 />
+                {envErr && (
+                  <p className="text-xs text-destructive" role="alert">
+                    {envErr}
+                  </p>
+                )}
               </div>
             </>
           ) : (

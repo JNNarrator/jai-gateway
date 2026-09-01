@@ -220,11 +220,11 @@ OPENAI_API_KEY=${fullKey || "sk-jai-…"}`
               </Select>
             </div>
             <div className="relative">
-              <pre className="overflow-x-auto rounded-md bg-neutral-950 p-3 pr-12 font-mono text-xs leading-relaxed text-zinc-300 dark:bg-black/60">
+              <pre className="overflow-x-auto rounded-md bg-zinc-950 p-3 pr-12 font-mono text-xs leading-relaxed text-zinc-300">
                 {snippet}
               </pre>
               <button
-                className="absolute right-2 top-2 rounded-md border border-neutral-700 p-1.5 text-zinc-400 hover:text-zinc-100"
+                className="absolute right-2 top-2 rounded-md border border-zinc-700 p-1.5 text-zinc-400 hover:text-zinc-100"
                 onClick={() => copyText(snippet)}
                 aria-label="复制接入示例"
               >

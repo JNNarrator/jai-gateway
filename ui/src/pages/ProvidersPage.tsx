@@ -133,9 +133,6 @@ export function ProvidersPage() {
     refresh()
       .catch((e) => setMsg({ id: "", ok: false, text: String(e) }))
       .finally(() => setLoading(false));
-    const onRefresh = () => refresh().catch(() => {});
-    window.addEventListener("jai-refresh-providers", onRefresh);
-    return () => window.removeEventListener("jai-refresh-providers", onRefresh);
   }, []);
 
   async function act(id: string, fn: () => Promise<unknown>) {
@@ -472,6 +469,8 @@ function ProviderDialog({
           baseUrl: v.baseUrl,
           priority: v.priority,
           weight: v.weight,
+          // 与新建语义一致：有行则整体覆盖为 JSON 串，全空行传 null 显式清空
+          extraHeaders: eh,
           apiKey: v.apiKey || undefined,
         });
       }
@@ -501,9 +500,15 @@ function ProviderDialog({
             <FormField label="名称" htmlFor="pf-name" error={errors.name?.message}>
               <Input id="pf-name" placeholder="官方 / 某中转…" {...register("name")} />
             </FormField>
-            <FormField label="协议族" htmlFor="pf-family" error={errors.family?.message}>
+            <FormField
+              label="协议族"
+              htmlFor="pf-family"
+              error={errors.family?.message}
+              hint={mode === "edit" ? "协议族创建后不可修改" : undefined}
+            >
               <Select
                 value={watch("family")}
+                disabled={mode === "edit"}
                 onValueChange={(v) => {
                   setValue("family", v as FormValues["family"], {
                     shouldValidate: true,

@@ -69,21 +69,6 @@
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
-
-  /* ===== 过渡期兼容映射（阶段 2–5 逐页迁移后删除）===== */
-  --color-neutral-100: var(--foreground);
-  --color-neutral-200: var(--foreground);
-  --color-neutral-300: var(--muted-foreground);
-  --color-neutral-400: var(--muted-foreground);
-  --color-neutral-500: var(--muted-foreground);
-  --color-neutral-600: var(--muted-foreground);
-  --color-neutral-700: var(--border);
-  --color-neutral-800: var(--border);
-  --color-neutral-900: var(--card);
-  --color-neutral-950: var(--background);
-  --color-amber-400: var(--primary);
-  --color-amber-500: var(--primary);
-  --color-amber-600: var(--primary);
 }
 
 @layer base {

@@ -118,13 +118,17 @@ export function SkillsPage() {
   }
 
   async function createExample() {
-    await api.skillCreate({
-      name: "代码审查",
-      description: "一个示例技能：按提交变更做代码评审",
-      content: "请按以下步骤进行代码审查：\n1. 阅读 diff\n2. 指出风险\n3. 给出修改建议",
-    });
-    toast("示例技能已创建");
-    await refresh();
+    try {
+      await api.skillCreate({
+        name: "代码审查",
+        description: "一个示例技能：按提交变更做代码评审",
+        content: "请按以下步骤进行代码审查：\n1. 阅读 diff\n2. 指出风险\n3. 给出修改建议",
+      });
+      toast("示例技能已创建");
+      await refresh();
+    } catch (e) {
+      toast(String(e), "err");
+    }
   }
 
   return (
