@@ -47,12 +47,53 @@ struct TrayHandles {
     stop_item: MenuItem<tauri::Wry>,
 }
 
+/// WebDAV 自动推送：变更/定时触发，本机为准直接覆盖远端。
+#[derive(Clone)]
+pub struct AutopushHub {
+    /// 配置变更计数器（watch 通道天然合并突发变更）
+    tx: tokio::sync::watch::Sender<u64>,
+    /// 与手动推/拉互斥，避免并发写远端
+    pub push_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// 手动拉取前后短暂置位，抑制变更触发的自动推送（防回声）
+    pub suppress: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 最近一次自动推送结果
+    last: std::sync::Arc<tokio::sync::Mutex<Option<AutoPushStatus>>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoPushStatus {
+    pub at_ms: u64,
+    pub ok: bool,
+    pub message: String,
+}
+
+impl AutopushHub {
+    fn new() -> Self {
+        let (tx, _rx) = tokio::sync::watch::channel(0);
+        Self {
+            tx,
+            push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            suppress: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// 供应商/模型配置发生增删改时调用；自动推送防抖后执行一次
+    pub fn notify_change(&self) {
+        let next = *self.tx.borrow() + 1;
+        let _ = self.tx.send(next);
+    }
+}
+
 /// IPC 命令共享的业务核心（数据库 / 日志句柄 / HTTP 客户端）
+#[derive(Clone)]
 pub struct AppCore {
     pub db: Db,
     pub logs: logs::LogHandle,
     pub http: reqwest::Client,
     pub db_path: String,
+    pub autopush: AutopushHub,
 }
 
 struct GatewayState {
@@ -220,6 +261,7 @@ async fn provider_create(
     .await
     .map_err(join_err)??;
 
+    core.autopush.notify_change();
     Ok(to_dto(created, true))
 }
 
@@ -271,7 +313,10 @@ async fn provider_update(
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(join_err)?
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
 }
 
 #[tauri::command]
@@ -288,6 +333,7 @@ async fn provider_delete(core: State<'_, AppCore>, id: String) -> Result<(), Str
 
     // 库先行成功；凭据尽力删除（幂等，失败不阻塞 UI）
     let _ = tokio::task::spawn_blocking(move || vault::delete_secret(&row.keyring_ref)).await;
+    core.autopush.notify_change();
     Ok(())
 }
 
@@ -303,7 +349,10 @@ async fn provider_set_enabled(
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(join_err)?
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
 }
 
 /// 测试连接：跑一次模型发现。HTTP 200 即视为连通
@@ -469,7 +518,10 @@ async fn model_set_limits(core: State<'_, AppCore>, input: ModelLimitsInput) -> 
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(join_err)?
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -490,7 +542,10 @@ async fn model_set_alias(core: State<'_, AppCore>, input: ModelAliasInput) -> Re
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(join_err)?
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
 }
 
 #[tauri::command]
@@ -505,7 +560,10 @@ async fn model_toggle(
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(join_err)?
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
 }
 
 // ---------------------------------------------------------------- 网关密钥
@@ -683,6 +741,8 @@ pub struct WebDavConfigDto {
     pub url: String,
     pub username: String,
     pub directory: String,
+    pub auto_push_enabled: bool,
+    pub auto_push_interval_min: u32,
 }
 
 impl From<WebDavConfig> for WebDavConfigDto {
@@ -691,6 +751,8 @@ impl From<WebDavConfig> for WebDavConfigDto {
             url: c.url,
             username: c.username,
             directory: c.directory,
+            auto_push_enabled: c.auto_push_enabled,
+            auto_push_interval_min: c.auto_push_interval_min,
         }
     }
 }
@@ -703,6 +765,10 @@ pub struct WebDavConfigInput {
     pub directory: String,
     /// Some(非空) 覆盖密码；None/空串保持原密码
     pub password: Option<String>,
+    /// 自动推送开关；None 保持原值
+    pub auto_push_enabled: Option<bool>,
+    /// 自动推送间隔分钟；None 保持原值
+    pub auto_push_interval_min: Option<u32>,
 }
 
 #[tauri::command]
@@ -713,11 +779,14 @@ async fn config_import(
 ) -> Result<import::ImportReport, String> {
     let db = core.db.clone();
     let strict = strict.unwrap_or(false);
-    tokio::task::spawn_blocking(move || {
+    let out = tokio::task::spawn_blocking(move || {
         db.with_any(|c| import::apply_import(c, &text, strict).map_err(|e| e.to_string()))
     })
     .await
-    .map_err(join_err)?
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(out)
 }
 
 #[tauri::command]
@@ -744,10 +813,21 @@ async fn webdav_config_set(
             .map_err(join_err)?
             .map_err(vault_msg)?;
     }
+    let db = core.db.clone();
+    let old: Option<WebDavConfig> = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| sync::config_get(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    let old = old.unwrap_or_default();
     let cfg = WebDavConfig {
         url: normalize_base(&input.url),
         username: input.username.trim().to_string(),
         directory: input.directory.trim().to_string(),
+        auto_push_enabled: input.auto_push_enabled.unwrap_or(old.auto_push_enabled),
+        auto_push_interval_min: input
+            .auto_push_interval_min
+            .unwrap_or(old.auto_push_interval_min),
     };
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
@@ -836,9 +916,21 @@ async fn webdav_preview(core: State<'_, AppCore>) -> Result<WebDavPreview, Strin
 
 #[tauri::command]
 async fn webdav_push(core: State<'_, AppCore>) -> Result<(), String> {
-    let cfg = get_webdav_config(&core).await?;
+    // 与自动推送互斥：手动推送期间自动轮跳过
+    let _guard = core.autopush.push_lock.lock().await;
+    push_now(&core).await
+}
+
+/// 构建导出 JSON → 本地留存快照 → PUT 覆盖远端。手动命令与自动推送共用。
+async fn push_now(core: &AppCore) -> Result<(), String> {
+    let cfg = get_webdav_config(core).await?;
     let password = get_webdav_password().await?;
-    let export_text = export_config_json(core.clone()).await?;
+    let db = core.db.clone();
+    let export_text = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
 
     // 推送前本地快照留存一份，用于误操作回退
     let db = core.db.clone();
@@ -853,17 +945,138 @@ async fn webdav_push(core: State<'_, AppCore>) -> Result<(), String> {
     sync::push(&core.http, &cfg, &password, export_text).await
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavAutoPushStatusDto {
+    pub at_ms: u64,
+    pub ok: bool,
+    pub message: String,
+}
+
+/// 最近一次自动推送结果（无记录返回 null）。
+#[tauri::command]
+async fn webdav_autopush_status(
+    core: State<'_, AppCore>,
+) -> Result<Option<WebDavAutoPushStatusDto>, String> {
+    let last = core.autopush.last.lock().await.clone();
+    Ok(last.map(|s| WebDavAutoPushStatusDto {
+        at_ms: s.at_ms,
+        ok: s.ok,
+        message: s.message,
+    }))
+}
+
+/// 自动推送循环：定时 tick 与变更通知合并；未启用时 30s 轮询配置等待开启。
+fn spawn_autopush(core: AppCore) {
+    tokio::spawn(async move {
+        let mut rx = core.autopush.tx.subscribe();
+        loop {
+            let interval = current_autopush_interval(&core).await;
+            let wait = interval.unwrap_or_else(|| std::time::Duration::from_secs(30));
+            let change = tokio::select! {
+                r = rx.changed() => {
+                    if r.is_err() {
+                        return; // hub 已随应用退出
+                    }
+                    true
+                }
+                _ = tokio::time::sleep(wait) => false,
+            };
+            if change {
+                // 防抖：等 30s 合并突发变更
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if core
+                    .autopush
+                    .suppress
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    continue;
+                }
+                // 期间被关闭则不推
+                if current_autopush_interval(&core).await.is_none() {
+                    continue;
+                }
+            } else if interval.is_none() {
+                // 定时醒来但未启用：只是配置轮询
+                continue;
+            }
+            // 抢不到锁（手动推/拉进行中）则跳过本轮
+            let Ok(_guard) = core.autopush.push_lock.try_lock() else {
+                eprintln!("[autopush] 手动同步进行中，跳过本轮");
+                continue;
+            };
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let res = push_now(&core).await;
+            let st = match &res {
+                Ok(()) => AutoPushStatus {
+                    at_ms: at,
+                    ok: true,
+                    message: "自动推送成功".into(),
+                },
+                Err(e) => AutoPushStatus {
+                    at_ms: at,
+                    ok: false,
+                    message: e.clone(),
+                },
+            };
+            eprintln!(
+                "[autopush] {} {}",
+                if st.ok { "ok" } else { "err" },
+                st.message
+            );
+            *core.autopush.last.lock().await = Some(st);
+        }
+    });
+}
+
+/// 当前自动推送间隔；未启用 / 未配置返回 None。
+async fn current_autopush_interval(core: &AppCore) -> Option<std::time::Duration> {
+    let db = core.db.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| sync::config_get(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err);
+    let cfg: Option<WebDavConfig> = match res {
+        Ok(Ok(c)) => c,
+        _ => return None,
+    };
+    let cfg = cfg?;
+    if !cfg.auto_push_enabled {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(
+        u64::from(cfg.normalized_interval()) * 60,
+    ))
+}
+
 #[tauri::command]
 async fn webdav_pull(core: State<'_, AppCore>) -> Result<import::ImportReport, String> {
+    // 与自动推送互斥；拉取内容与远端一致，抑制后续防抖推送（防回声）
+    let _guard = core.autopush.push_lock.lock().await;
     let cfg = get_webdav_config(&core).await?;
     let password = get_webdav_password().await?;
     let text = sync::pull(&core.http, &cfg, &password).await?;
     let db = core.db.clone();
-    tokio::task::spawn_blocking(move || {
+    let out = tokio::task::spawn_blocking(move || {
         db.with_any(|c| import::apply_import(c, &text, false).map_err(|e| e.to_string()))
     })
     .await
-    .map_err(join_err)?
+    .map_err(join_err)??;
+    // 防抖窗口 30s，抑制再保持 40s
+    core.autopush
+        .suppress
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let hub = core.autopush.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        hub.suppress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    });
+    Ok(out)
 }
 
 async fn get_webdav_config(core: &AppCore) -> Result<WebDavConfig, String> {
@@ -1700,8 +1913,12 @@ fn main() {
                     .build()
                     .expect("reqwest client"),
                 db_path: db_str,
+                autopush: AutopushHub::new(),
             };
             ensure_gateway_key(&core)?;
+
+            // WebDAV 自动推送循环（变更防抖 + 定时；未启用时低速轮询配置）
+            spawn_autopush(core.clone());
 
             // 2) 托盘
             let status_item =
@@ -1815,6 +2032,7 @@ fn main() {
             webdav_preview,
             webdav_push,
             webdav_pull,
+            webdav_autopush_status,
             mcp_list,
             mcp_create,
             mcp_update,

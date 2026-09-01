@@ -22,7 +22,14 @@ pub struct WebDavConfig {
     pub username: String,
     /// 远端目录（可空，默认根目录）
     pub directory: String,
+    /// 变更/定时自动推送总开关（默认关）
+    pub auto_push_enabled: bool,
+    /// 定时推送间隔分钟数（30/60/360；默认 60）
+    pub auto_push_interval_min: u32,
 }
+
+pub const AUTO_PUSH_INTERVAL_DEFAULT: u32 = 60;
+pub const AUTO_PUSH_INTERVAL_ALLOWED: [u32; 3] = [30, 60, 360];
 
 impl WebDavConfig {
     pub fn config_url(&self) -> String {
@@ -32,6 +39,15 @@ impl WebDavConfig {
             format!("{base}/{CONFIG_FILE_NAME}")
         } else {
             format!("{base}/{dir}/{CONFIG_FILE_NAME}")
+        }
+    }
+
+    /// 非法值回退默认 60 分钟。
+    pub fn normalized_interval(&self) -> u32 {
+        if AUTO_PUSH_INTERVAL_ALLOWED.contains(&self.auto_push_interval_min) {
+            self.auto_push_interval_min
+        } else {
+            AUTO_PUSH_INTERVAL_DEFAULT
         }
     }
 }
@@ -50,6 +66,12 @@ pub fn config_get(c: &Connection) -> Result<Option<WebDavConfig>, StoreError> {
         url,
         username: crate::store::meta_get(c, "webdav_username")?.unwrap_or_default(),
         directory: crate::store::meta_get(c, "webdav_directory")?.unwrap_or_default(),
+        auto_push_enabled: crate::store::meta_get(c, "webdav_auto_push_enabled")?
+            .map(|v| v == "1")
+            .unwrap_or(false),
+        auto_push_interval_min: crate::store::meta_get(c, "webdav_auto_push_interval_min")?
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(AUTO_PUSH_INTERVAL_DEFAULT),
     }))
 }
 
@@ -58,6 +80,16 @@ pub fn config_set(c: &Connection, cfg: &WebDavConfig) -> Result<(), StoreError> 
     crate::store::meta_set(c, "webdav_url", &cfg.url)?;
     crate::store::meta_set(c, "webdav_username", &cfg.username)?;
     crate::store::meta_set(c, "webdav_directory", &cfg.directory)?;
+    crate::store::meta_set(
+        c,
+        "webdav_auto_push_enabled",
+        if cfg.auto_push_enabled { "1" } else { "0" },
+    )?;
+    crate::store::meta_set(
+        c,
+        "webdav_auto_push_interval_min",
+        &cfg.normalized_interval().to_string(),
+    )?;
     Ok(())
 }
 
@@ -130,6 +162,8 @@ mod tests {
             url: "https://dav.example.com/".into(),
             username: "u".into(),
             directory: "jai".into(),
+            auto_push_enabled: true,
+            auto_push_interval_min: 30,
         };
         config_set(&c, &cfg).unwrap();
         assert_eq!(config_get(&c).unwrap(), Some(cfg));
@@ -138,11 +172,33 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_and_interval_normalization() {
+        let c = open_and_migrate(":memory:").unwrap();
+        // 未配置时：无连接配置，但间隔常量默认 60
+        assert_eq!(config_get(&c).unwrap(), None);
+        assert_eq!(AUTO_PUSH_INTERVAL_DEFAULT, 60);
+        // 写入非法间隔 → 读出回落 60
+        let cfg = WebDavConfig {
+            url: "https://dav.example.com/".into(),
+            username: "u".into(),
+            directory: String::new(),
+            auto_push_enabled: false,
+            auto_push_interval_min: 7,
+        };
+        config_set(&c, &cfg).unwrap();
+        let read = config_get(&c).unwrap().unwrap();
+        assert!(!read.auto_push_enabled);
+        assert_eq!(read.auto_push_interval_min, AUTO_PUSH_INTERVAL_DEFAULT);
+    }
+
+    #[test]
     fn config_url_joins_directory() {
         let cfg = WebDavConfig {
             url: "https://dav.example.com/remote.php/dav/files/u".into(),
             username: "u".into(),
             directory: "jai/backups".into(),
+            auto_push_enabled: false,
+            auto_push_interval_min: AUTO_PUSH_INTERVAL_DEFAULT,
         };
         assert_eq!(
             cfg.config_url(),
@@ -154,8 +210,10 @@ mod tests {
     fn config_url_without_directory() {
         let cfg = WebDavConfig {
             url: "https://dav.example.com/".into(),
-            username: "u".into(),
+            username: String::new(),
             directory: String::new(),
+            auto_push_enabled: false,
+            auto_push_interval_min: AUTO_PUSH_INTERVAL_DEFAULT,
         };
         assert_eq!(cfg.config_url(), "https://dav.example.com/jai-config.json");
     }

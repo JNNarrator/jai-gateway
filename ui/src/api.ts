@@ -12,6 +12,7 @@ import type {
   SettingsDto,
   SkillRow,
   UsageStatRow,
+  WebDavAutoPushStatus,
   WebDavConfigDto,
 } from "./types";
 
@@ -91,7 +92,11 @@ export const api = {
     username: string;
     directory: string;
     password?: string | null;
+    autoPushEnabled?: boolean;
+    autoPushIntervalMin?: number;
   }) => invoke<void>("webdav_config_set", { input }),
+  webdavAutopushStatus: () =>
+    invoke<WebDavAutoPushStatus | null>("webdav_autopush_status"),
   webdavTest: (input: {
     url: string;
     username: string;

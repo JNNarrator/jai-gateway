@@ -79,6 +79,8 @@ async fn webdav_push_pull_roundtrip() {
         url: format!("http://127.0.0.1:{port}"),
         username: "u".into(),
         directory: String::new(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
     };
     let client = reqwest::Client::new();
     let payload = r#"{"format":"jai-export/v1","providers":[]}"#.to_string();
@@ -108,6 +110,8 @@ async fn webdav_pull_imports_into_db() {
         url: format!("http://127.0.0.1:{port}"),
         username: "u".into(),
         directory: String::new(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
     };
     let client = reqwest::Client::new();
     let text = sync::pull(&client, &cfg, "pw").await.unwrap();

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { ArrowLeftRight, ClipboardPaste, CloudUpload, Download } from "lucide-react";
 import { api } from "../api";
+import type { WebDavAutoPushStatus } from "../types";
 import { toast } from "../lib/toast";
 import { PageHeader } from "@/components/common/PageHeader";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
@@ -15,6 +16,20 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+const INTERVAL_OPTIONS: { value: number; label: string }[] = [
+  { value: 30, label: "每 30 分钟" },
+  { value: 60, label: "每 1 小时" },
+  { value: 360, label: "每 6 小时" },
+];
 
 export function SyncPage() {
   const [importText, setImportText] = useState("");
@@ -25,6 +40,8 @@ export function SyncPage() {
   });
   const [pw, setPw] = useState("");
   const [showPw, setShowPw] = useState(false);
+  const [autoPush, setAutoPush] = useState({ enabled: false, intervalMin: 60 });
+  const [lastAuto, setLastAuto] = useState<WebDavAutoPushStatus | null>(null);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
@@ -35,9 +52,18 @@ export function SyncPage() {
     api
       .webdavConfigGet()
       .then((c) => {
-        if (c) setCfg(c);
+        if (c) {
+          setCfg(c);
+          setAutoPush({ enabled: c.autoPushEnabled, intervalMin: c.autoPushIntervalMin });
+        }
       })
       .catch(() => {});
+    api.webdavAutopushStatus().then(setLastAuto).catch(() => {});
+    const t = setInterval(
+      () => api.webdavAutopushStatus().then(setLastAuto).catch(() => {}),
+      60_000,
+    );
+    return () => clearInterval(t);
   }, []);
 
   async function doImport() {
@@ -62,6 +88,28 @@ export function SyncPage() {
       } catch {
         // 平台不支持打开目录时忽略
       }
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  async function saveAuto(next: { enabled: boolean; intervalMin: number }) {
+    setErr("");
+    if (!cfg.url.trim()) {
+      setErr("请先填写并保存 WebDAV 连接配置");
+      return;
+    }
+    try {
+      await api.webdavConfigSet({
+        url: cfg.url,
+        username: cfg.username,
+        directory: cfg.directory,
+        password: null,
+        autoPushEnabled: next.enabled,
+        autoPushIntervalMin: next.intervalMin,
+      });
+      setAutoPush(next);
+      setMsg(next.enabled ? "自动推送已开启" : "自动推送已关闭");
     } catch (e) {
       setErr(String(e));
     }
@@ -299,6 +347,55 @@ export function SyncPage() {
               <div className="h-full w-1/3 animate-pulse rounded bg-primary" />
             </div>
           )}
+
+          <div className="space-y-3 rounded-md border bg-muted/30 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-medium">自动推送</div>
+                <div className="text-xs leading-relaxed text-muted-foreground">
+                  配置变更后防抖 30 秒推送一次，并按所选间隔定时推送。以本机为准，直接覆盖远端。
+                </div>
+              </div>
+              <Switch
+                checked={autoPush.enabled}
+                disabled={!cfg.url.trim()}
+                aria-label="自动推送开关"
+                onCheckedChange={(v) =>
+                  void saveAuto({ enabled: v, intervalMin: autoPush.intervalMin })
+                }
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">定时间隔</span>
+              <Select
+                value={String(autoPush.intervalMin)}
+                disabled={!autoPush.enabled}
+                onValueChange={(v) =>
+                  void saveAuto({ enabled: autoPush.enabled, intervalMin: Number(v) })
+                }
+              >
+                <SelectTrigger size="sm" className="w-36">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {INTERVAL_OPTIONS.map((o) => (
+                    <SelectItem key={o.value} value={String(o.value)}>
+                      {o.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            {lastAuto && (
+              <div className="text-xs text-muted-foreground">
+                上次自动推送：
+                {new Date(lastAuto.atMs).toLocaleString("zh-CN", { hour12: false })} ·{" "}
+                <span className={lastAuto.ok ? "text-emerald-600" : "text-destructive"}>
+                  {lastAuto.ok ? "成功" : lastAuto.message}
+                </span>
+              </div>
+            )}
+          </div>
         </CardContent>
       </Card>
 

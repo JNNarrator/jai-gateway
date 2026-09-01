@@ -76,6 +76,14 @@ export interface WebDavConfigDto {
   url: string;
   username: string;
   directory: string;
+  autoPushEnabled: boolean;
+  autoPushIntervalMin: number;
+}
+
+export interface WebDavAutoPushStatus {
+  atMs: number;
+  ok: boolean;
+  message: string;
 }
 
 export interface ImportReport {
