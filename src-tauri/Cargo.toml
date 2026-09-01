@@ -13,6 +13,7 @@ tauri-build = { version = "2", features = [] }
 gateway-core = { path = "../crates/gateway-core" }
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-updater = "2"
+tauri-plugin-notification = "2"
 tokio.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

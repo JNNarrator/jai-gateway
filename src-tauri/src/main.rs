@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_notification::NotificationExt;
 
 // ---------------------------------------------------------------- 状态模型
 
@@ -360,10 +361,8 @@ async fn provider_set_enabled(
 #[tauri::command]
 async fn provider_test(core: State<'_, AppCore>, id: String) -> Result<String, String> {
     let row = fetch_provider(&core.db, &id).await?;
-    let secret = load_secret_or_none(&row.keyring_ref).await?;
-    match discover_models(&core.http, &row.family, &row.base_url, secret.as_deref()).await {
-        Ok(models) => {
-            let n = models.len();
+    match probe_provider(&core, &row).await {
+        Ok(n) => {
             let db = core.db.clone();
             tokio::task::spawn_blocking(move || {
                 let _ = db.with(|c| store::provider_mark_ok(c, &id));
@@ -1051,6 +1050,119 @@ async fn current_autopush_interval(core: &AppCore) -> Option<std::time::Duration
     Some(std::time::Duration::from_secs(
         u64::from(cfg.normalized_interval()) * 60,
     ))
+}
+
+// ---------------------------------------------------------------- 供应商健康检查
+
+/// 健康检查轮询间隔：固定 10 分钟/轮（代码常量，本期不做 UI 配置）。
+const HEALTH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+/// 单个供应商探测硬超时（模型发现内部另有 20s HTTP 超时，此处兜底防悬挂）。
+const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 通知正文错误摘要最大长度。
+const HEALTH_NOTIFY_SUMMARY_CHARS: usize = 140;
+
+/// 单供应商探测核心（provider_test 与健康检查共用）：
+/// 读凭据 → 拉模型列表。HTTP 200 即视为连通（0 个模型也算通）。
+async fn probe_provider(core: &AppCore, row: &ProviderRow) -> Result<usize, String> {
+    let secret = load_secret_or_none(&row.keyring_ref).await?;
+    let models = discover_models(&core.http, &row.family, &row.base_url, secret.as_deref()).await?;
+    Ok(models.len())
+}
+
+/// 供应商定时健康检查循环：每 10 分钟顺序探测全部 enabled 供应商，
+/// 结果写 last_ok_at/last_err_at/last_err_msg（列表健康徽章数据源，
+/// 与真实流量 proxy 侧 mark 共用同一套 store 函数）。探测不改动
+/// enabled，也不参与路由决策；仅在状态跃迁时发系统通知，
+/// 应用启动后的首轮只记录不通知（避免每次开机弹一堆）。
+fn spawn_health_check(core: AppCore, app: AppHandle) {
+    tokio::spawn(async move {
+        let mut first_round = true;
+        loop {
+            if let Err(e) = health_round(&core, &app, first_round).await {
+                eprintln!("[health] 本轮异常: {e}");
+            }
+            first_round = false;
+            tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
+        }
+    });
+}
+
+/// 库内健康态：last_err_at 非空即处于失败态
+/// （provider_mark_ok 会清空该列，provider_mark_err 会写入；真实流量同样落在这两列）。
+fn provider_row_is_failing(row: &ProviderRow) -> bool {
+    row.last_err_at.is_some()
+}
+
+/// 一轮健康检查：拉全量供应商，逐个（顺序）探测 enabled 的并按跃迁通知。
+async fn health_round(core: &AppCore, app: &AppHandle, first_round: bool) -> Result<(), String> {
+    let db = core.db.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        db.with(store::provider_list).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    for row in rows.iter().filter(|r| r.enabled) {
+        let was_failing = provider_row_is_failing(row);
+
+        // 单点隔离：独立 spawn 任务探测，panic 只体现为 JoinError 不拖垮循环；
+        // 超时的孤儿任务受 discover_models 内部 HTTP 超时约束，自行结束
+        let handle = tokio::spawn({
+            let core = core.clone();
+            let row = row.clone();
+            async move { probe_provider(&core, &row).await }
+        });
+        let res = match tokio::time::timeout(HEALTH_PROBE_TIMEOUT, handle).await {
+            Ok(Ok(Ok(n))) => Ok(n),
+            Ok(Ok(Err(msg))) => Err(msg),
+            Ok(Err(join)) => Err(format!("探测任务异常: {join}")),
+            Err(_) => Err(format!("探测超时（>{}s）", HEALTH_PROBE_TIMEOUT.as_secs())),
+        };
+
+        match res {
+            Ok(n) => {
+                let id = row.id.clone();
+                let db = core.db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = db.with(|c| store::provider_mark_ok(c, &id));
+                })
+                .await;
+                if !first_round && was_failing {
+                    eprintln!("[health] 恢复: {}（发现 {n} 个模型）", row.name);
+                    notify_health(
+                        app,
+                        format!("供应商『{}』已恢复", row.name),
+                        "健康检查：连接已恢复正常".to_string(),
+                    );
+                }
+            }
+            Err(msg) => {
+                let id = row.id.clone();
+                let m2 = msg.clone();
+                let db = core.db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = db.with(|c| store::provider_mark_err(c, &id, &m2));
+                })
+                .await;
+                if !first_round && !was_failing {
+                    eprintln!("[health] 失败: {} - {msg}", row.name);
+                    notify_health(
+                        app,
+                        format!("供应商『{}』连接失败", row.name),
+                        msg.chars().take(HEALTH_NOTIFY_SUMMARY_CHARS).collect(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 发送系统通知（失败只打日志，不影响探测流程）。
+fn notify_health(app: &AppHandle, title: String, body: String) {
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        eprintln!("[health] 通知发送失败: {e}");
+    }
 }
 
 #[tauri::command]
@@ -1844,6 +1956,7 @@ fn reflect_status(app: &AppHandle, st: &GatewayState) {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // 1) 数据目录 + 迁移（失败即中止启动 —— storage §4 早拦截）
             //    某些受限环境（CI/沙箱）对 ~/Library 无写权限，回退临时目录保证可演示。
@@ -1919,6 +2032,9 @@ fn main() {
 
             // WebDAV 自动推送循环（变更防抖 + 定时；未启用时低速轮询配置）
             spawn_autopush(core.clone());
+
+            // 供应商定时健康检查（10 分钟/轮；状态跃迁发系统通知，首轮不通知）
+            spawn_health_check(core.clone(), app.handle().clone());
 
             // 2) 托盘
             let status_item =
