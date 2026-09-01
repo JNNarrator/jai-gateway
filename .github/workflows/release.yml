@@ -70,7 +70,27 @@ jobs:
       - name: Install UI dependencies
         run: pnpm --dir ui install --frozen-lockfile
 
-      - name: Build + upload
+      # tauri-bundler 仅以 var_os 判断 APPLE_CERTIFICATE 是否存在（空串也算存在），
+      # 会误入 security import 分支并崩溃。未配置证书时必须让变量"不存在"，
+      # 因此把签名/未签名拆成两个互斥 step（GITHUB_ENV 无法删除已注入变量）
+      - name: Detect macOS signing secret
+        id: sign
+        run: echo "configured=${{ secrets.APPLE_CERTIFICATE != '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build + upload (unsigned macOS)
+        if: runner.os == 'macOS' && steps.sign.outputs.configured == 'false'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --ci
+
+      - name: Build + upload (signed)
+        if: runner.os == 'Windows' || (runner.os == 'macOS' && steps.sign.outputs.configured == 'true')
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
