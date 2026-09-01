@@ -28,7 +28,7 @@
 | --- | --- | --- | --- |
 | DeepSeek harness | OpenAI chat completions | M1 | 直通链路 + SSE + 多渠道顺延 |
 | Claude Code | Anthropic messages 直通 | M3 | 真实编码 session；count_tokens；529/429 形状 |
-| zcode | 待实测（chat 或 Anthropic 均已覆盖） | M1 或 M3 完成即具备条件，实测后归入对应验收 | — |
+| zcode | ✅ 实测通过（2026-09-01）：实际走 **OpenAI Responses 入站**（非预想的 Anthropic 线），流式 + 非流式 200，经 JAI 收到真实回复；顺带完成 M6 Responses 线真实客户端验收 | M6 验收归属（chat 线原本就具备） | 真实编码 session 长期自用即持续回归 |
 | Codex | OpenAI **Responses API** 入站 | M6 | 真实编码 session 经 `/v1/responses` |
 
 过渡通道（不承诺长期支持）：Codex 在 provider 配置里设 `wire_api = "chat"` 可先走 M1 的 chat completions 端点救急；M6 落地后回归原生线。

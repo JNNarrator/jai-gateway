@@ -37,5 +37,5 @@ JAI「技能」页点击 **复制技能包**，会把启用中的技能导出为
 
 ## 备注
 
-- 当前 zcode 真机自动回归尚未跑通（GUI 客户端需要人工操作），协议线已按本机 zcode 配置确认走 Anthropic。
-- 如 zcode 后续版本支持 OpenAI Responses 或其他协议线，接入方式同步调整。
+- **✅ 2026-09-01 真机实测通过**：zcode 真实会话经 JAI 收到正常回复，实测走 **OpenAI Responses 入站**（`/v1/responses`，非本指南初稿预想的 Anthropic 线），流式/非流式均 200。以实测为准：zcode Provider 的配置形态决定协议线，两条线（Responses / Anthropic）网关均已支持并经真实流量验证。
+- 如 zcode 后续版本调整协议形态，接入方式同步更新本指南。

@@ -35,3 +35,4 @@ UI 2.0 全分支终审: 闭环 — 可合并
 稳定性 finding: 转换路径（MCP 注入）对无终止标记上游流零转发+疑似无界缓冲（passthrough 不受影响）→ 已记 roadmap 附录 A 待修
 48h 观察: 2026-09-01 11:35 起表（release, MCP 恢复启用），observe48h.sh + 每30分钟自动化 sampling，2026-09-03 11:35 判定
 zcode 实测: key 已入用户剪贴板，用户 GUI 配置中，待测试对话后网关侧验证
+zcode 实测: ✅ PASS（2026-09-01 13:57）— 真实会话经 JAI，实测走 OpenAI Responses 入站（非预想 Anthropic 线），流式+非流式均 200；顺带完成 M6 Responses 线真实客户端验收。roadmap §2 与 zcode接入.md 已同步。
