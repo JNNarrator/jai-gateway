@@ -10,6 +10,8 @@ jobs:
   create-release:
     name: Create release draft
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       release_id: ${{ steps.create.outputs.release_id }}
     steps:
