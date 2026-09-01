@@ -25,12 +25,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" \
+          RELEASE_URL=$(gh release create "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
             --draft --prerelease \
             --title "JAI ${{ github.ref_name }}" \
-            --notes "见 CHANGELOG.md"
-          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" --jq '.id')
+            --notes "见 CHANGELOG.md")
+          # draft release 不出现在 releases/tags/<tag> 查询里，按 URL 末段取 id
+          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases" \
+            --jq '.[] | select(.draft and .tag_name == "${{ github.ref_name }}") | .id' | head -1)
+          if [ -z "$RELEASE_ID" ]; then
+            echo "FAIL: 未找到刚创建的 draft release ($RELEASE_URL)"; exit 1
+          fi
           echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
   build-tauri:
