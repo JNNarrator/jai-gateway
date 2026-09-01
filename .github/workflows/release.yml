@@ -28,6 +28,11 @@ jobs:
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
 
+      # beforeBuildCommand 会执行 ui 的 build（tsc + vite），必须先按 lockfile
+      # 装依赖：否则 PATH 兜底到 runner 全局 tsc（TS 7），与锁定版本行为不一致
+      - name: Install UI dependencies
+        run: pnpm --dir ui install --frozen-lockfile
+
       - name: Create release
         id: create
         uses: tauri-apps/tauri-action@v0
