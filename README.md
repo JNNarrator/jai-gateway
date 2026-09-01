@@ -8,7 +8,7 @@
 
 **状态**：M0–M9 全部里程碑完成，UI 2.0（阶段 0–6）已落地；真机验收矩阵（Claude Code / Codex / zcode 跨族、WebDAV 双机、签名安装包）与 48h 常驻观察按[路线图](docs/design/roadmap.md)推进中。
 
-> **客户端优先级**：优先支持国产 Agent —— **DeepSeek Harness（dsh）** 与 **zcode**。目标是通过 JAI 网关使用时，与直连上游的体验保持一致（协议、流式、工具调用、错误语义均透明兼容）。dsh 已两轮真机联调验证（Chat / Responses / MCP / Skill / 故障转移），报告见 [docs/test-report-dsh.md](docs/test-report-dsh.md)。
+> **客户端优先级**：优先支持国产 Agent —— **DeepSeek Harness（dsh）** 与 **zcode**。目标是通过 JAI 网关使用时，与直连上游的体验保持一致（协议、流式、工具调用、错误语义均透明兼容）。dsh 已两轮真机联调验证（Chat / Responses / 故障转移），报告见 [docs/test-report-dsh.md](docs/test-report-dsh.md)。
 
 ## 它解决什么问题
 
@@ -52,10 +52,11 @@ Tauri 2.0 · Rust (Axum + Reqwest) · React 19 + TypeScript + TailwindCSS 4 + sh
 JAI 优先保证 **DeepSeek Harness（dsh）** 与 **zcode** 的使用体验：
 
 - **目标**：通过 JAI 网关访问上游时，与直连上游的体验一致——协议、流式、工具调用、错误语义都保持透明兼容。
-- **dsh**：已实测打通 OpenAI Chat Completions 与 OpenAI Responses 两条链路，MCP、Skill、别名映射、故障转移均可正常工作（两轮真机联调，报告见 [docs/test-report-dsh.md](docs/test-report-dsh.md)）。
+- **dsh**：已实测打通 OpenAI Chat Completions 与 OpenAI Responses 两条链路，别名映射、故障转移均可正常工作（两轮真机联调，报告见 [docs/test-report-dsh.md](docs/test-report-dsh.md)）。
 - **zcode**：协议线待真机确认后纳入同等回归保障。
-- 同族直通默认保持字节级透传；只有显式启用 MCP/Skill 等增强能力时才进入转换路径。
-- MCP/Skill 配置可一键导出给 Agent 加载：MCP 输出标准 `mcpServers` JSON，技能输出 Markdown 文本。
+- 同族直通默认保持字节级透传，跨族（协议不同）时才进入转换路径。
+- MCP / Skill 登记后可通过网关 `/mcp` 元数据服务暴露给 Agent（见「网关」页一键复制的
+  `mcpServers` 配置）；技能另支持 ZIP 批量导入与 Markdown 导出。
 
 ## 文档索引
 
@@ -100,6 +101,24 @@ OPENAI_API_KEY=sk-jai-xxxx
 ### DeepSeek Harness（dsh，最高优先级客户端）
 
 dsh 的 provider 配置里 baseURL 填 `http://127.0.0.1:1314/v1`，API Key 用网关 Key；OpenAI Chat 与 Responses 两条线均已实测。详见接入示例（应用「网关」页内置）与[联调报告](docs/test-report-dsh.md)。
+
+### MCP 元数据服务（/mcp）
+
+在任意支持 MCP 的客户端（dsh / Claude Code / Continue 等）的 `mcpServers` 配置中加入（应用「网关」页有同款配置，**点「复制配置」自动填入真实密钥**）：
+
+```json
+{
+  "mcpServers": {
+    "jai-registry": {
+      "type": "http",
+      "url": "http://127.0.0.1:1314/mcp",
+      "headers": { "Authorization": "Bearer <网关密钥>" }
+    }
+  }
+}
+```
+
+接入后 Agent 可查询网关登记的 MCP Server / Skill 台账：`list_mcp_servers`、`get_mcp_server_detail`、`get_tool_schemas`、`list_skills`、`get_skill_detail`。该服务只提供发现与信息，不代执行工具。
 
 ## 本地开发启动
 

@@ -1,6 +1,6 @@
 [package]
 name = "jai"
-version = "0.1.0"
+version = "0.1.1"
 description = "JAI — 桌面 AI API 网关"
 edition.workspace = true
 license.workspace = true

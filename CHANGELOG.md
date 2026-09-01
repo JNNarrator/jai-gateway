@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `/mcp` 元数据 MCP Server（Streamable HTTP，与网关共用端口与鉴权）：
+  把网关登记的 MCP Server / Skill 台账以 MCP 协议暴露给 Agent——五个只读工具
+  （`list_mcp_servers` / `get_mcp_server_detail` / `get_tool_schemas` /
+  `list_skills` / `get_skill_detail`），不注入对话链路、不代执行工具；
+  env 仅回键名不回值。网关页提供 `mcpServers` 接入配置一键复制（复制时自动填入真实密钥）
+
+### Changed
+- **MCP / Skill 不再注入对话链路**：删除网关侧 MCP 工具自动合并与自动执行循环、
+  Skill 注入 system 逻辑；同族请求恢复纯字节直通。工具执行统一由客户端侧完成，
+  消除网关代执行导致的对话链路污染。管理页面保留（连接测试/工具查看/导入导出）
+
+### Fixed
+- 修复启动崩溃（v b8503f1 引入）：Tauri `setup` 闭包不在 tokio runtime 上下文，
+  `spawn_autopush` / `spawn_health_check` 裸 `tokio::spawn` 启动即 panic；
+  改用 `tauri::async_runtime::spawn`
+
+### Added
 - UI 2.0 界面升级（阶段 0–6，spec 见 `docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md`）
   - 基建：Tailwind 3→4、shadcn/ui 基座、蓝紫明暗双主题（next-themes）、sonner 通知、
     可折叠侧边栏导航、App.tsx 拆分 pages/ + components/
