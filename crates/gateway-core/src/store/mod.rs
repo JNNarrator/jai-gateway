@@ -739,7 +739,7 @@ pub fn tool_id_get(c: &Connection, outbound_id: &str) -> Result<Option<String>, 
 
 // ================================================================ MCP 导入解析
 
-/// 从标准 `{"mcpServers": {...}}` 配置解析出的单个 MCP Server 条目。
+/// 从导入配置解析出的单个 MCP Server 条目。
 /// `skip_reason` 为 Some 时表示该条目不合法，应跳过（不会写入）。
 #[derive(Debug, Clone)]
 pub struct ParsedMcpServer {
@@ -752,9 +752,258 @@ pub struct ParsedMcpServer {
     pub skip_reason: Option<String>,
 }
 
+/// 导入 MCP 配置，自动识别三种格式：
+/// 1. Codex CLI 命令行：`codex mcp add <名称> --env K=V -- <命令> [参数...]`
+/// 2. `{"mcpServers": {...}}` JSON（Claude Code / Claude Desktop；也兼容无包装的裸对象）
+/// 3. Codex `config.toml` 片段：`[mcp_servers.<名称>]`
+pub fn parse_mcp_import(text: &str) -> Result<Vec<ParsedMcpServer>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("导入内容为空".into());
+    }
+    // 容忍粘贴时带上的 shell 提示符（$ / >）
+    let body = trimmed.trim_start_matches(['$', '>']).trim_start();
+    if looks_like_mcp_add_cli(body) {
+        return parse_mcp_add_cli(body);
+    }
+    if trimmed.starts_with('{') {
+        return parse_mcp_servers_json(trimmed);
+    }
+    if trimmed.starts_with('[') || trimmed.contains("[mcp_servers.") {
+        return parse_mcp_servers_toml(trimmed);
+    }
+    Err(
+        "无法识别格式：支持 {\"mcpServers\":{...}} JSON、codex mcp add 命令行、\
+         [mcp_servers.*] TOML 三种格式"
+            .into(),
+    )
+}
+
+/// 识别是否为 `codex mcp add ...` / `claude mcp add ...` 风格命令行。
+fn looks_like_mcp_add_cli(text: &str) -> bool {
+    let tokens = tokenize_cli(text);
+    if tokens.windows(2).any(|w| w[0] == "mcp" && w[1] == "add") {
+        return matches!(
+            tokens.first().map(String::as_str),
+            Some("codex") | Some("claude") | Some("mcp")
+        );
+    }
+    false
+}
+
+/// 解析 `codex mcp add` 命令行为单个条目（`claude mcp add` 同构，一并兼容）。
+/// 语法：`[客户端] mcp add <名称> [--env K=V]... [--url URL] -- <命令> [参数...]`；
+/// 无 `--` 时，`名称` 后的第一个位置参数为命令（或 URL），其余为参数。
+pub fn parse_mcp_add_cli(text: &str) -> Result<Vec<ParsedMcpServer>, String> {
+    let mut tokens = tokenize_cli(text);
+    // 去掉客户端前缀
+    if matches!(
+        tokens.first().map(String::as_str),
+        Some("codex") | Some("claude")
+    ) {
+        tokens.remove(0);
+    }
+    if tokens.first().map(String::as_str) == Some("mcp") {
+        tokens.remove(0);
+    }
+    if tokens.first().map(String::as_str) != Some("add") {
+        return Err("命令行缺少 mcp add 子命令".into());
+    }
+    tokens.remove(0);
+
+    let mut env_pairs: Vec<(String, String)> = Vec::new();
+    let mut url: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut cmd_tokens: Vec<String> = Vec::new();
+    let mut after_ddash = false;
+    let mut malformed_env = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i].clone();
+        // 命令已开始（名称+命令两个位置参数已齐）或已过 `--`：后续 token 全部
+        // 归入命令与参数，不再当旗标解析（否则 `-y` 之类参数会被误吞）
+        let command_started = !after_ddash && positionals.len() >= 2;
+        if after_ddash {
+            cmd_tokens.push(t);
+            i += 1;
+            continue;
+        }
+        if command_started {
+            if t == "--" {
+                // clap 语义：`--` 是旗标终止符，本身不进参数
+                i += 1;
+                continue;
+            }
+            positionals.push(t);
+            i += 1;
+            continue;
+        }
+        if t == "--" {
+            after_ddash = true;
+            i += 1;
+            continue;
+        }
+        // 带值旗标（值可能是独立 token，也可能用 = 内联）
+        const VALUE_FLAGS: [&str; 8] = [
+            "--env", "-e", "--url", "--transport", "-s", "--scope", "--profile", "--header",
+        ];
+        if VALUE_FLAGS.contains(&t.as_str()) {
+            let val = tokens.get(i + 1).cloned();
+            i += 2; // 消费旗标 + 值（值缺失时 val 为 None，走下方兜底）
+            match (t.as_str(), val) {
+                ("--env", Some(v)) | ("-e", Some(v)) => {
+                    if let Some((k, value)) = v.split_once('=') {
+                        env_pairs.push((k.to_string(), value.to_string()));
+                    } else {
+                        malformed_env = true;
+                    }
+                }
+                ("--url", Some(v)) => url = Some(v),
+                _ => {} // 其余旗标与网关无关，值一并丢弃
+            }
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("--env=") {
+            i += 1;
+            if let Some((k, value)) = v.split_once('=') {
+                env_pairs.push((k.to_string(), value.to_string()));
+            } else {
+                malformed_env = true;
+            }
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("--url=") {
+            url = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if t.starts_with('-') && t.len() > 1 {
+            // 未知开关（--verbose 等）：跳过旗标本身
+            i += 1;
+            continue;
+        }
+        positionals.push(t);
+        i += 1;
+    }
+
+    let env = if env_pairs.is_empty() {
+        None
+    } else {
+        let mut map = serde_json::Map::new();
+        for (k, v) in env_pairs {
+            map.insert(k, serde_json::Value::String(v));
+        }
+        Some(serde_json::Value::Object(map).to_string())
+    };
+    let skip_reason = |reason: String| ParsedMcpServer {
+        name: positionals.first().cloned().unwrap_or_else(|| "(未命名)".into()),
+        kind: "stdio".into(),
+        command: None,
+        args: None,
+        url: None,
+        env: env.clone(),
+        skip_reason: Some(reason),
+    };
+    let name = match positionals.first() {
+        Some(n) if !n.is_empty() => n.clone(),
+        _ => return Err("命令行中未找到服务名称".into()),
+    };
+    if malformed_env {
+        return Ok(vec![skip_reason("--env 需为 KEY=VALUE 形式".into())]);
+    }
+
+    // `--` 之后是完整命令；否则位置参数依次为 名称、命令（或 URL）、参数...
+    let (kind, command, args, url) = if !cmd_tokens.is_empty() {
+        let command = cmd_tokens[0].clone();
+        let args = if cmd_tokens.len() > 1 {
+            Some(serde_json::Value::Array(
+                cmd_tokens[1..].iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+            ).to_string())
+        } else {
+            None
+        };
+        ("stdio".to_string(), Some(command), args, None)
+    } else if let Some(u) = url {
+        ("http".to_string(), None, None, Some(u))
+    } else {
+        match positionals.get(1) {
+            Some(c) if c.starts_with("http://") || c.starts_with("https://") => {
+                ("http".to_string(), None, None, Some(c.clone()))
+            }
+            Some(c) => {
+                let args = if positionals.len() > 2 {
+                    Some(serde_json::Value::Array(
+                        positionals[2..]
+                            .iter()
+                            .map(|s| serde_json::Value::String(s.clone()))
+                            .collect(),
+                    ).to_string())
+                } else {
+                    None
+                };
+                ("stdio".to_string(), Some(c.clone()), args, None)
+            }
+            None => {
+                return Ok(vec![skip_reason("stdio 类型缺少 command".into())]);
+            }
+        }
+    };
+    let skip_reason = if kind == "stdio" && command.is_none() {
+        Some("stdio 类型缺少 command".to_string())
+    } else {
+        None
+    };
+    Ok(vec![ParsedMcpServer {
+        name,
+        kind,
+        command,
+        args,
+        url,
+        env,
+        skip_reason,
+    }])
+}
+
+/// 按 shell 引号规则把命令行拆成 token：单/双引号内保留字面量（含空格与
+/// Windows 路径反斜杠），引号外按空白切分。
+fn tokenize_cli(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                in_token = true;
+                while let Some(ch) = chars.next() {
+                    if ch == c {
+                        break;
+                    }
+                    cur.push(ch);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                in_token = true;
+            }
+        }
+    }
+    if in_token {
+        tokens.push(cur);
+    }
+    tokens
+}
+
 /// 解析 Claude Code 风格 `mcpServers` JSON。
-/// 顶层必须为 `{"mcpServers": {name: {...}}}`；每个条目支持
-/// `type`（缺省 stdio）、`command`/`args`/`env`（stdio）与 `url`（sse/http）。
+/// 顶层为 `{"mcpServers": {name: {...}}}`；也兼容无包装的裸对象
+/// `{"name": {command/url/...}}`。每个条目支持 `type`（缺省 stdio）、
+/// `command`/`args`/`env`（stdio）与 `url`（sse/http）。
 /// 返回逐条解析结果，调用方决定 upsert 语义。
 pub fn parse_mcp_servers_json(json_text: &str) -> Result<Vec<ParsedMcpServer>, String> {
     let parsed: serde_json::Value =
@@ -762,65 +1011,123 @@ pub fn parse_mcp_servers_json(json_text: &str) -> Result<Vec<ParsedMcpServer>, S
     let servers = parsed
         .get("mcpServers")
         .and_then(serde_json::Value::as_object)
+        .or_else(|| {
+            // 裸对象：每个值都是含 command 或 url 的对象时，视作 server 映射本身
+            let obj = parsed.as_object()?;
+            (!obj.is_empty()
+                && obj
+                    .values()
+                    .all(|v| v.is_object() && (v.get("command").is_some() || v.get("url").is_some())))
+            .then_some(obj)
+        })
         .ok_or_else(|| "缺少 mcpServers 对象".to_string())?;
     if servers.is_empty() {
         return Err("mcpServers 为空".into());
     }
-    let mut out = Vec::with_capacity(servers.len());
-    for (name, conf) in servers {
-        let mut kind = conf
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("stdio")
-            .to_string();
-        // 兼容旧格式：无 type 但有 url 视为 http
-        if kind == "stdio"
-            && conf
-                .get("url")
-                .and_then(serde_json::Value::as_str)
-                .is_some()
-        {
-            kind = "http".to_string();
-        }
-        if !matches!(kind.as_str(), "stdio" | "sse" | "http") {
-            let skip_reason = format!("不支持的 type={kind}");
-            out.push(ParsedMcpServer {
-                name: name.clone(),
-                kind,
-                command: None,
-                args: None,
-                url: None,
-                env: None,
-                skip_reason: Some(skip_reason),
-            });
-            continue;
-        }
-        let command = conf
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(|s| s.to_string());
-        let args = conf.get("args").map(|v| v.to_string());
-        let url = conf
+    Ok(servers
+        .iter()
+        .map(|(name, conf)| json_entry_to_parsed(name, conf))
+        .collect())
+}
+
+/// 单个 JSON 条目 → ParsedMcpServer（JSON 与 TOML 两条路径共用）。
+fn json_entry_to_parsed(name: &str, conf: &serde_json::Value) -> ParsedMcpServer {
+    let mut kind = conf
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("stdio")
+        .to_string();
+    // 兼容旧格式：无 type 但有 url 视为 http
+    if kind == "stdio"
+        && conf
             .get("url")
             .and_then(serde_json::Value::as_str)
-            .map(|s| s.to_string());
-        let env = conf.get("env").map(|v| v.to_string());
-        let skip_reason = if kind == "stdio" && command.is_none() {
-            Some("stdio 类型缺少 command".to_string())
-        } else if kind != "stdio" && url.is_none() {
-            Some(format!("{kind} 类型缺少 url"))
-        } else {
-            None
+            .is_some()
+    {
+        kind = "http".to_string();
+    }
+    if !matches!(kind.as_str(), "stdio" | "sse" | "http") {
+        return ParsedMcpServer {
+            name: name.to_string(),
+            kind: kind.clone(),
+            command: None,
+            args: None,
+            url: None,
+            env: None,
+            skip_reason: Some(format!("不支持的 type={kind}")),
         };
-        out.push(ParsedMcpServer {
-            name: name.clone(),
-            kind,
-            command,
-            args,
-            url,
-            env,
-            skip_reason,
-        });
+    }
+    let command = conf
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string());
+    let args = conf.get("args").map(|v| v.to_string());
+    let url = conf
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string());
+    let env = conf.get("env").map(|v| v.to_string());
+    let skip_reason = if kind == "stdio" && command.is_none() {
+        Some("stdio 类型缺少 command".to_string())
+    } else if kind != "stdio" && url.is_none() {
+        Some(format!("{kind} 类型缺少 url"))
+    } else {
+        None
+    };
+    ParsedMcpServer {
+        name: name.to_string(),
+        kind,
+        command,
+        args,
+        url,
+        env,
+        skip_reason,
+    }
+}
+
+/// 解析 Codex `config.toml` 片段：`[mcp_servers.<name>]` 表，
+/// 支持 `command`/`args`/`env`（stdio）与 `url`（可带 `transport` 指明 sse/http）。
+pub fn parse_mcp_servers_toml(text: &str) -> Result<Vec<ParsedMcpServer>, String> {
+    let value: toml::Value = toml::from_str(text).map_err(|e| format!("TOML 解析失败: {e}"))?;
+    let servers = value
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "缺少 [mcp_servers.*] 表".to_string())?;
+    if servers.is_empty() {
+        return Err("mcp_servers 为空".into());
+    }
+    let mut out = Vec::with_capacity(servers.len());
+    for (name, conf) in servers {
+        // TOML → JSON 后复用同一条目逻辑；同时把 url 条目的 transport 折算成 type
+        let conf_json: serde_json::Value = match serde_json::to_value(conf) {
+            Ok(v) => v,
+            Err(e) => {
+                out.push(ParsedMcpServer {
+                    name: name.clone(),
+                    kind: "stdio".into(),
+                    command: None,
+                    args: None,
+                    url: None,
+                    env: None,
+                    skip_reason: Some(format!("条目无法解析: {e}")),
+                });
+                continue;
+            }
+        };
+        let mut conf_json = conf_json;
+        if conf_json.get("type").is_none() {
+            if let Some(transport) = conf.get("transport").and_then(toml::Value::as_str) {
+                let kind = match transport {
+                    "sse" => "sse",
+                    "streamable_http" | "streamable-http" | "http" => "http",
+                    _ => "",
+                };
+                if !kind.is_empty() {
+                    conf_json["type"] = serde_json::Value::String(kind.to_string());
+                }
+            }
+        }
+        out.push(json_entry_to_parsed(name, &conf_json));
     }
     Ok(out)
 }

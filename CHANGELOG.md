@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **MCP 导入自动识别三种格式**（`mcp_import` 命令，原 `mcp_import_from_json` 更名）：
+  1. `{"mcpServers": {...}}` JSON（Claude Code / Claude Desktop，另兼容无包装的裸对象）
+  2. Codex CLI 命令行：`codex mcp add <名称> --env K=V -- "命令" [参数...]`
+     （`claude mcp add` 同构兼容；无 `--` 时名称后第一个位置参数为命令/URL）
+  3. Codex `config.toml` 片段：`[mcp_servers.<名称>]`（支持 `command`/`args`/`env`
+     与 `url`/`transport`），TOML→JSON 后复用同一条目解析
+- **应用内更新**：设置页「软件更新」卡片——打开时静默检查 + 手动检查更新、
+  进度条下载安装（tauri-plugin-updater，minisign 签名校验）、完成后一键重启
+  （tauri-plugin-process）；更新源为 GitHub Releases 的 `latest.json`
 - `/mcp` 元数据 MCP Server（Streamable HTTP，与网关共用端口与鉴权）：
   把网关登记的 MCP Server / Skill 台账以 MCP 协议暴露给 Agent——五个只读工具
   （`list_mcp_servers` / `get_mcp_server_detail` / `get_tool_schemas` /

@@ -140,9 +140,9 @@ export const api = {
   mcpToolsCall: (id: string, name: string, args: unknown) =>
     invoke<unknown>("mcp_tools_call", { id, name, arguments: args }),
   mcpExportConfig: () => invoke<{ mcpServers: Record<string, unknown> }>("mcp_export_config"),
-  mcpImportFromJson: (jsonText: string) =>
-    invoke<{ imported: number; updated: number; skipped: string[] }>("mcp_import_from_json", {
-      jsonText,
+  mcpImport: (text: string) =>
+    invoke<{ imported: number; updated: number; skipped: string[] }>("mcp_import", {
+      text,
     }),
 
   // Skill 管理

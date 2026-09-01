@@ -98,7 +98,7 @@ export function McpPage() {
               onClick={() => setDialog({ mode: "import" })}
             >
               <ClipboardPaste aria-hidden />
-              粘贴 JSON 导入
+              粘贴配置导入
             </Button>
             <Button size="sm" onClick={() => setDialog({ mode: "create" })}>
               <Plus aria-hidden />
@@ -130,7 +130,7 @@ export function McpPage() {
         <EmptyState
           icon={PlugZap}
           title="还没有 MCP Server"
-          description="点击上方按钮添加一个 stdio / SSE / HTTP 类型的服务，或直接粘贴 mcpServers JSON 导入。"
+          description="点击上方按钮添加一个 stdio / SSE / HTTP 类型的服务，或直接粘贴 mcpServers JSON / codex mcp add 命令 / Codex TOML 配置导入。"
           className="py-16"
         />
       )}
@@ -282,13 +282,13 @@ function McpImportDialog({
 
   async function submit() {
     if (!text.trim()) {
-      setLocalErr("请粘贴 mcpServers JSON");
+      setLocalErr("请粘贴 MCP 配置（JSON / codex 命令行 / TOML 均可）");
       return;
     }
     setBusy(true);
     setLocalErr("");
     try {
-      const report = await api.mcpImportFromJson(text);
+      const report = await api.mcpImport(text);
       onDone(report);
     } catch (e) {
       setLocalErr(String(e));
@@ -300,11 +300,18 @@ function McpImportDialog({
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>粘贴 mcpServers JSON 导入</DialogTitle>
+          <DialogTitle>粘贴配置导入 MCP Server</DialogTitle>
           <DialogDescription>
-            支持 Claude Code 格式：
+            自动识别三种格式，同名服务会被更新，不含 command/url 的条目自动跳过：
+            <br />
+            ① Claude Code JSON：
             {` {"mcpServers": {"名称": {"command": "...", "args": [...], "env": {...}}}}`}
-            ，同名服务会被更新，不含 command/url 的条目自动跳过。
+            <br />
+            ② Codex 命令行：
+            {` codex mcp add 名称 --env K=V -- "命令" [参数...]`}
+            <br />
+            ③ Codex config.toml：
+            {` [mcp_servers.名称] command = "..." / url = "..."`}
           </DialogDescription>
         </DialogHeader>
         <textarea
@@ -314,7 +321,7 @@ function McpImportDialog({
             setText(e.target.value);
             setLocalErr("");
           }}
-          placeholder='{"mcpServers":{"my-server":{"command":"node","args":["..."],"env":{"KEY":"value"}}}}'
+          placeholder={'codex mcp add my-server --env "KEY=value" -- "C:\\path\\to\\mcp.cmd"'}
           spellCheck={false}
         />
         {localErr && (

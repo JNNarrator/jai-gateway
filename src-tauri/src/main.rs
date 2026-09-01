@@ -1388,14 +1388,12 @@ async fn mcp_export_config(core: State<'_, AppCore>) -> Result<serde_json::Value
     Ok(serde_json::json!({ "mcpServers": servers }))
 }
 
-/// 导入标准 `{"mcpServers": {name: {command/args/env/url/type}}}` 配置。
+/// 导入 MCP 配置，自动识别三种格式：`{"mcpServers":{...}}` JSON（含裸对象）、
+/// `codex mcp add ...` 命令行、`[mcp_servers.*]` TOML 片段。
 /// 按 name 去重：已存在则更新，否则新建。返回导入报告。
 #[tauri::command]
-async fn mcp_import_from_json(
-    core: State<'_, AppCore>,
-    json_text: String,
-) -> Result<serde_json::Value, String> {
-    let entries = store::parse_mcp_servers_json(&json_text)?;
+async fn mcp_import(core: State<'_, AppCore>, text: String) -> Result<serde_json::Value, String> {
+    let entries = store::parse_mcp_import(&text)?;
 
     let now = store::now_ms();
     let db = core.db.clone();
@@ -1958,6 +1956,7 @@ fn reflect_status(app: &AppHandle, st: &GatewayState) {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // 1) 数据目录 + 迁移（失败即中止启动 —— storage §4 早拦截）
@@ -2159,7 +2158,7 @@ fn main() {
             mcp_tools_list,
             mcp_tools_call,
             mcp_export_config,
-            mcp_import_from_json,
+            mcp_import,
             skill_list,
             skill_export_markdown,
             skill_create,

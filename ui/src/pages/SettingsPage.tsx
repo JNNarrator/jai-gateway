@@ -1,5 +1,8 @@
-import { useEffect, useState } from "react";
-import { KeyRound, Plus, ShieldCheck } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { KeyRound, Plus, RefreshCw, ShieldCheck } from "lucide-react";
+import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
 import { api } from "../api";
 import { toast } from "../lib/toast";
 import { goTab } from "../lib/nav";
@@ -104,7 +107,7 @@ export function SettingsPage() {
 
   return (
     <div className="mx-auto max-w-2xl space-y-4">
-      <PageHeader title="设置" description="端口、日志与安全策略。" />
+      <PageHeader title="设置" description="端口、日志、安全策略与软件更新。" />
 
       <Card>
         <CardHeader>
@@ -247,6 +250,8 @@ export function SettingsPage() {
         </CardContent>
       </Card>
 
+      <UpdateCard />
+
       <ConfirmDialog
         open={!!portBusyWarn}
         onOpenChange={(o) => !o && setPortBusyWarn("")}
@@ -328,5 +333,172 @@ export function SettingsPage() {
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+type UpdateStatus = "idle" | "checking" | "latest" | "available" | "downloading" | "ready";
+
+/** 软件更新卡片：检查 GitHub Releases 最新版本 → 下载安装 → 重启生效。 */
+function UpdateCard() {
+  const [version, setVersion] = useState("");
+  const [status, setStatus] = useState<UpdateStatus>("idle");
+  const [update, setUpdate] = useState<Update | null>(null);
+  const [progress, setProgress] = useState(0);
+  const [err, setErr] = useState("");
+  // 持有 Update 对象供下载阶段使用；卸载后置空避免悬挂引用
+  const updateRef = useRef<Update | null>(null);
+
+  useEffect(() => {
+    getVersion()
+      .then(setVersion)
+      .catch(() => setVersion(""));
+    // 打开设置页时静默检查一次；失败不打扰（如离线 / 开发模式）
+    void silentCheck();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      updateRef.current = null;
+    };
+  }, []);
+
+  async function silentCheck() {
+    try {
+      const upd = await checkForUpdate();
+      if (upd) {
+        updateRef.current = upd;
+        setUpdate(upd);
+        setStatus("available");
+      } else {
+        setStatus("latest");
+      }
+    } catch {
+      /* 静默失败：保留 idle 态，用户可手动重试 */
+    }
+  }
+
+  async function check() {
+    setStatus("checking");
+    setErr("");
+    try {
+      const upd = await checkForUpdate();
+      if (upd) {
+        updateRef.current = upd;
+        setUpdate(upd);
+        setStatus("available");
+      } else {
+        updateRef.current = null;
+        setUpdate(null);
+        setStatus("latest");
+        toast("当前已是最新版本");
+      }
+    } catch (e) {
+      setErr(String(e));
+      setStatus("idle");
+    }
+  }
+
+  async function download() {
+    const upd = updateRef.current ?? update;
+    if (!upd) return;
+    setStatus("downloading");
+    setProgress(0);
+    let received = 0;
+    let total = 0;
+    try {
+      await upd.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? 0;
+        } else if (event.event === "Progress") {
+          received += event.data.chunkLength;
+          if (total > 0) {
+            setProgress(Math.min(100, Math.round((received / total) * 100)));
+          }
+        } else if (event.event === "Finished") {
+          setProgress(100);
+        }
+      });
+      setStatus("ready");
+    } catch (e) {
+      setErr(String(e));
+      setStatus("available");
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>软件更新</CardTitle>
+        <CardDescription>
+          更新源：GitHub Releases（JNNarrator/jai-gateway），下载包经 minisign 签名校验。
+          {version ? `当前版本 v${version}。` : ""}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {status === "latest" && (
+          <div className="text-sm text-emerald-600 dark:text-emerald-400">
+            ✓ 已是最新版本{version ? `（v${version}）` : ""}
+          </div>
+        )}
+        {status === "available" && update && (
+          <div className="space-y-2">
+            <div className="text-sm">
+              发现新版本{" "}
+              <span className="font-medium text-primary">v{update.version}</span>
+              {version ? `（当前 v${version}）` : ""}
+            </div>
+            {update.body && (
+              <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                {update.body}
+              </pre>
+            )}
+          </div>
+        )}
+        {status === "downloading" && (
+          <div className="space-y-1.5">
+            <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-primary transition-all"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+            <div className="text-xs text-muted-foreground">
+              下载并安装中… {progress}%
+            </div>
+          </div>
+        )}
+        {status === "ready" && (
+          <div className="text-sm text-emerald-600 dark:text-emerald-400">
+            ✓ 更新已安装，重启应用后生效
+          </div>
+        )}
+        {err && (
+          <p className="text-xs text-destructive" role="alert">
+            {err}
+          </p>
+        )}
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void check()}
+            disabled={status === "checking" || status === "downloading"}
+          >
+            <RefreshCw aria-hidden className={cn(status === "checking" && "animate-spin")} />
+            {status === "checking" ? "检查中…" : "检查更新"}
+          </Button>
+          {status === "available" && (
+            <Button size="sm" onClick={() => void download()}>
+              下载并安装
+            </Button>
+          )}
+          {status === "ready" && (
+            <Button size="sm" onClick={() => void relaunch()}>
+              重启应用
+            </Button>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   );
 }

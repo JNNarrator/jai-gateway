@@ -120,3 +120,142 @@ fn parse_mcp_servers_json_supports_claude_code_format() {
     assert!(store::parse_mcp_servers_json("{\"mcpServers\":{}}").is_err());
     assert!(store::parse_mcp_servers_json("not json").is_err());
 }
+
+#[test]
+fn parse_mcp_servers_json_supports_bare_object() {
+    // 无 mcpServers 包装的裸对象（值都含 command/url 时视作 server 映射）
+    let entries = store::parse_mcp_servers_json(
+        r#"{"nc": {"command": "a.cmd", "env": {"K": "V"}},
+            "r": {"url": "https://mcp.example.com/mcp"}}"#,
+    )
+    .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].name, "nc");
+    assert_eq!(entries[0].env.as_deref(), Some(r#"{"K":"V"}"#));
+    assert_eq!(entries[1].kind, "http");
+    // 混入非对象值时不视作裸对象，仍报缺 mcpServers
+    assert!(store::parse_mcp_servers_json(r#"{"nc": {"command": "a"}, "n": 1}"#).is_err());
+}
+
+#[test]
+fn parse_mcp_servers_toml_supports_codex_config() {
+    // Codex config.toml 片段（用户实际样例）
+    let toml_text = r#"
+[mcp_servers.netcatty-external]
+command = "C:\\Program Files\\Netcatty\\resources\\app.asar.unpacked\\electron\\cli\\netcatty-external-mcp.cmd"
+args = []
+env = { NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE = "C:\\Users\\WM\\AppData\\Roaming\\netcatty\\external-mcp\\discovery.json" }
+"#;
+    let entries = store::parse_mcp_servers_toml(toml_text).unwrap();
+    assert_eq!(entries.len(), 1);
+    let nc = &entries[0];
+    assert_eq!(nc.name, "netcatty-external");
+    assert_eq!(nc.kind, "stdio");
+    assert!(nc.command.as_deref().unwrap().contains("netcatty-external-mcp.cmd"));
+    assert_eq!(nc.args.as_deref(), Some("[]"));
+    assert!(nc
+        .env
+        .as_deref()
+        .unwrap()
+        .contains("NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE"));
+    assert!(nc.skip_reason.is_none());
+
+    // url 条目（Streamable HTTP）与 sse transport
+    let entries = store::parse_mcp_servers_toml(
+        r#"
+[mcp_servers.docs]
+url = "https://docs.mcp.example.com/mcp"
+[mcp_servers.sse1]
+url = "https://sse.mcp.example.com/sse"
+transport = "sse"
+"#,
+    )
+    .unwrap();
+    assert_eq!(entries[0].kind, "http");
+    assert!(entries[0].skip_reason.is_none());
+    assert_eq!(entries[1].kind, "sse");
+
+    // 缺表头 / 空 / 坏 TOML 报错
+    assert!(store::parse_mcp_servers_toml("command = \"x\"").is_err());
+    assert!(store::parse_mcp_servers_toml("[mcp_servers]").is_err());
+    assert!(store::parse_mcp_servers_toml("[[[bad").is_err());
+}
+
+#[test]
+fn parse_mcp_add_cli_supports_codex_command() {
+    // Codex CLI 命令行（用户实际样例，含引号内空格路径）
+    let cli = concat!(
+        "codex mcp add netcatty-external ",
+        "--env \"NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE=C:\\Users\\WM\\AppData\\Roaming\\netcatty\\external-mcp\\discovery.json\" ",
+        "-- \"C:\\Program Files\\Netcatty\\resources\\app.asar.unpacked\\electron\\cli\\netcatty-external-mcp.cmd\""
+    );
+    let entries = store::parse_mcp_add_cli(cli).unwrap();
+    assert_eq!(entries.len(), 1);
+    let nc = &entries[0];
+    assert_eq!(nc.name, "netcatty-external");
+    assert_eq!(nc.kind, "stdio");
+    assert_eq!(
+        nc.command.as_deref().unwrap(),
+        "C:\\Program Files\\Netcatty\\resources\\app.asar.unpacked\\electron\\cli\\netcatty-external-mcp.cmd"
+    );
+    assert!(nc.args.is_none());
+    let env = nc.env.as_deref().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(env).unwrap();
+    assert_eq!(
+        parsed["NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE"],
+        "C:\\Users\\WM\\AppData\\Roaming\\netcatty\\external-mcp\\discovery.json"
+    );
+    assert!(nc.skip_reason.is_none());
+
+    // 无 `--`：名称后跟命令 + 多个参数
+    let entries = store::parse_mcp_add_cli("codex mcp add fs npx -y @modelcontextprotocol/server-fs").unwrap();
+    let fs = &entries[0];
+    assert_eq!(fs.command.as_deref(), Some("npx"));
+    assert_eq!(fs.args.as_deref(), Some(r#"["-y","@modelcontextprotocol/server-fs"]"#));
+
+    // 多个 --env + claude 前缀 + http url
+    let entries =
+        store::parse_mcp_add_cli("claude mcp add r --env A=1 --env B=2 --url https://mcp.example.com/mcp").unwrap();
+    let r = &entries[0];
+    assert_eq!(r.kind, "http");
+    assert_eq!(r.url.as_deref(), Some("https://mcp.example.com/mcp"));
+    let env: serde_json::Value = serde_json::from_str(r.env.as_deref().unwrap()).unwrap();
+    assert_eq!(env["A"], "1");
+    assert_eq!(env["B"], "2");
+
+    // 缺 command（只有名称）→ 跳过；env 非法 KEY=VALUE → 跳过
+    let entries = store::parse_mcp_add_cli("codex mcp add lonely").unwrap();
+    assert!(entries[0].skip_reason.is_some());
+    let entries = store::parse_mcp_add_cli("codex mcp add x --env BAD -- echo hi").unwrap();
+    assert!(entries[0].skip_reason.is_some());
+    // 名称缺失直接报错
+    assert!(store::parse_mcp_add_cli("codex mcp add -- echo hi").is_err());
+}
+
+#[test]
+fn parse_mcp_import_autodetects_three_formats() {
+    // 1) CLI 命令行
+    let cli = "codex mcp add netcatty-external -- \"C:\\Program Files\\Netcatty\\cli\\netcatty-external-mcp.cmd\"";
+    let entries = store::parse_mcp_import(cli).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, "stdio");
+
+    // 2) mcpServers JSON（原格式不回归）
+    let entries = store::parse_mcp_import(r#"{"mcpServers":{"a":{"command":"x"}}}"#).unwrap();
+    assert_eq!(entries[0].name, "a");
+
+    // 3) Codex TOML
+    let entries = store::parse_mcp_import(
+        "[mcp_servers.b]\ncommand = \"C:\\\\path with space\\\\x.cmd\"\nenv = { K = \"V\" }",
+    )
+    .unwrap();
+    assert_eq!(entries[0].name, "b");
+    assert!(entries[0].env.as_deref().unwrap().contains("\"K\":\"V\""));
+
+    // 空内容 / 无法识别
+    assert!(store::parse_mcp_import("   ").is_err());
+    assert!(store::parse_mcp_import("hello world").is_err());
+    // shell 提示符前缀容忍
+    let entries = store::parse_mcp_import("$ codex mcp add n -- echo hi").unwrap();
+    assert_eq!(entries[0].command.as_deref(), Some("echo"));
+}
