@@ -22,3 +22,11 @@ Task 7: complete — 构建硬门槛通过（tsc --noEmit + vite build 零错误
 --- 2026-08-31 阶段 0 完成（第二台机器续作收尾）---
 本机环境备注：pnpm 11.21 默认供应链策略 minimumReleaseAge=24h 会拦截 lockfile 中的 lucide-react@1.38.0（发布于 2026-08-31，不足 24h）。绕过方式（均不入库）：`pnpm --dir ui install --config.minimum-release-age=0`；构建用 `pnpm --dir ui --config.verify-deps-before-run=false run build`（运行前自检会自动重装并撞策略）。2026-09-01 07:24 UTC 后包龄过窗，本机命令恢复原样。.npmrc 不生效（pnpm 11 不从 .npmrc 读该设置）。
 下一阶段：阶段 1–6 各自制定独立计划（spec：docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md）
+终审 (9662753..e595582): 需修复后合并 — 3 Important（I-1 GatewayPage 亮色代码块不可读回归；I-2 McpPage env 非法 JSON 渲染崩溃白屏；I-3 ProvidersPage 编辑静默丢 extraHeaders/可改 family）+ 9 Minor；修复波派发（含 M-1 兼容映射清理/M-2/M-3/M-4/M-5），M-6/7/8/9 park
+终审修复波: complete (commit 7dcf077, I-1/I-2/I-3/M-1/M-3/M-4/M-5 全部 ADDRESSED, re-review 通过无新破坏)
+parked — M-6: separator.tsx 零使用保留 — ruling: shadcn 生成件，未来表单可用，删除无收益
+parked — M-7: 特效不支持平台无实色兜底 — ruling: 目标平台 macOS/Win10/Win11 全有特效覆盖，Linux 属 bundle targets:all 边角，低风险留待实际需求
+parked — M-8: 单 chunk 998KB（recharts） — ruling: 桌面应用本地加载无网络成本，后续需要时再 manualChunks
+parked — M-9: TitleBar userAgent 嗅探 — ruling: WKWebView UA 判定可工作，platform() 改造属风格优化
+备注: McpPage env 校验对非 stdio kind 也生效（复审非阻断观察），后续可收窄或补 http 分支提示
+UI 2.0 全分支终审: 闭环 — 可合并
