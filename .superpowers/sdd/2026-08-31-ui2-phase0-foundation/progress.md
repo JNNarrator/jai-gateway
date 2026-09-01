@@ -36,3 +36,7 @@ UI 2.0 全分支终审: 闭环 — 可合并
 48h 观察: 2026-09-01 11:35 起表（release, MCP 恢复启用），observe48h.sh + 每30分钟自动化 sampling，2026-09-03 11:35 判定
 zcode 实测: key 已入用户剪贴板，用户 GUI 配置中，待测试对话后网关侧验证
 zcode 实测: ✅ PASS（2026-09-01 13:57）— 真实会话经 JAI，实测走 OpenAI Responses 入站（非预想 Anthropic 线），流式+非流式均 200；顺带完成 M6 Responses 线真实客户端验收。roadmap §2 与 zcode接入.md 已同步。
+优化 A 批: ✅ 21329e5（密钥免显示复制/移除接入示例/导出移至同步页/JSON 框缩小/模型名复制按钮）
+优化 B 批: ✅ 869b8af（WebDAV 自动推送：变更防抖 30s + 定时 30分/1时/6时 可配，本机为准；推拉互斥 + 拉取后 40s 防回声；webdav_autopush_status IPC；修 5 处历史吞错 bug——spawn_blocking 内层 Result 未解包）
+优化 C 批: ✅ b8503f1（供应商健康检查 10 分钟/轮 + 状态跃迁系统通知（首轮抑制），复用 mark 函数与探测核心；评审 Approved）
+部署计划: 三批 + 转换路径 finding 修复一起等 48h 观察期满（9/3 11:35）部署，部署时全页面视觉走查补 A 批欠账
