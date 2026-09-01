@@ -4,6 +4,7 @@
 
 pub mod proxy;
 pub mod ratelimit;
+pub mod registry;
 pub mod security;
 
 use axum::extract::State;
@@ -98,6 +99,8 @@ pub fn build_router(ctx: GatewayCtx) -> Router {
         .route("/v1/responses", post(proxy::responses))
         // 第二阶段：旧版 OpenAI text completions（仅 openai_compat 直通）
         .route("/v1/completions", post(proxy::completions))
+        // MCP 元数据服务：网关登记的 MCP Server / Skill 台账（只读，不执行工具）
+        .route("/mcp", post(registry::mcp_endpoint))
         .layer(middleware::from_fn_with_state(
             ctx.clone(),
             proxy::security_mw,

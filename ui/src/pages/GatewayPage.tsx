@@ -15,7 +15,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-
 export function GatewayPage() {
   const [status, setStatus] = useState<import("../types").GwStatus | null>(null);
   const [key, setKey] = useState<GatewayKeyInfo | null>(null);
@@ -26,6 +25,7 @@ export function GatewayPage() {
 
   const port = status?.port ?? 1314;
   const baseUrl = `http://127.0.0.1:${port}/v1`;
+  const mcpUrl = `http://127.0.0.1:${port}/mcp`;
 
   async function refresh() {
     try {
@@ -70,6 +70,30 @@ export function GatewayPage() {
       const full = revealKey || (await api.gatewayKeyReveal()).key;
       await navigator.clipboard.writeText(full);
       toast("已复制");
+    } catch {
+      toast("复制失败", "err");
+    }
+  }
+
+  /** 复制 mcpServers 配置 JSON：展示用占位符，复制时填入真实密钥 */
+  async function doCopyMcpConfig() {
+    try {
+      const real = revealKey || (await api.gatewayKeyReveal()).key;
+      const config = JSON.stringify(
+        {
+          mcpServers: {
+            "jai-registry": {
+              type: "http",
+              url: mcpUrl,
+              headers: { Authorization: `Bearer ${real}` },
+            },
+          },
+        },
+        null,
+        2,
+      );
+      await navigator.clipboard.writeText(config);
+      toast("已复制（含真实密钥）");
     } catch {
       toast("复制失败", "err");
     }
@@ -172,6 +196,45 @@ export function GatewayPage() {
               </Button>
             </CopyField>
           </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>MCP 元数据服务</CardTitle>
+          <CardDescription>
+            与网关共用端口和密钥，提供 MCP Server / Skill 台账查询，不代执行工具。
+            在客户端的 mcpServers 配置中加入：
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          <div className="relative">
+            <pre className="overflow-x-auto rounded-md border bg-muted/50 p-3 font-mono text-xs leading-relaxed text-foreground">
+{`{
+  "mcpServers": {
+    "jai-registry": {
+      "type": "http",
+      "url": "${mcpUrl}",
+      "headers": {
+        "Authorization": "Bearer <网关密钥>"
+      }
+    }
+  }
+}`}
+            </pre>
+            <Button
+              variant="outline"
+              size="sm"
+              className="absolute right-2 top-2 h-7"
+              onClick={doCopyMcpConfig}
+            >
+              复制配置
+            </Button>
+          </div>
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            复制时自动填入真实密钥，粘贴即用；接入后 Agent 可用 list_mcp_servers /
+            get_mcp_server_detail / get_tool_schemas / list_skills / get_skill_detail 查询台账。
+          </p>
         </CardContent>
       </Card>
 

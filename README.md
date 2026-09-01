@@ -23,11 +23,14 @@
   - OpenAI `POST /v1/chat/completions` 与旧版 `POST /v1/completions`
   - OpenAI Responses API `POST /v1/responses`（Codex CLI 原生接入）
   - Anthropic `POST /v1/messages`（Claude Code 直连，含 `count_tokens` 粗估）
+  - MCP 元数据服务 `POST /mcp`（Streamable HTTP）：把网关登记的 MCP Server / Skill
+    台账以 MCP 协议暴露给 Agent——只提供发现与信息（`list_mcp_servers` /
+    `get_mcp_server_detail` / `get_tool_schemas` / `list_skills` / `get_skill_detail`），
+    不注入对话链路、不代执行工具；env 仅回键名不回值
 - 同名模型多渠道路由：按优先级自动故障转移 + 健康感知排序 + 同优先级权重负载均衡
 - 模型别名/映射：每个模型可配置发给上游的真实模型 ID
 - 跨协议转换（含 tool calling）：让任意客户端组合任意上游模型
-- MCP 工具自动合并与自动执行：把启用的 MCP Server 工具注入请求，并在上游调用时自动执行/回填
-- 技能（Skill）注入：启用技能自动进入系统提示词；支持 ZIP 批量导入与 Markdown 导出
+- MCP / 技能（Skill）管理：网关内登记 MCP Server 与技能（连接测试、工具查看、ZIP 批量导入）；**不注入对话链路**——网关只做请求转发与协议转换，工具执行由客户端侧完成
 - 请求日志（仅元数据）与用量统计可视化（recharts 堆叠柱状图，近 7/30/90 天）
 - **UI 2.0**：明暗双主题（跟随系统）、可折叠侧边栏、shadcn/ui 组件体系、
   表单校验就地展示（react-hook-form + zod）、自绘标题栏 + 窗口毛玻璃特效

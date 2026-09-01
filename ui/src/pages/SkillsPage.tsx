@@ -148,7 +148,7 @@ export function SkillsPage() {
     >
       <PageHeader
         title="技能（Skill）管理"
-        description="启用中的技能会注入系统提示词；支持 ZIP 批量导入（拖拽文件到本页即可）。"
+        description="技能登记台账，支持 ZIP 批量导入（拖拽文件到本页即可）。不再注入系统提示词；Agent 可通过网关 /mcp 元数据服务按需获取（见「网关」页接入说明）。"
         actions={
           <div className="flex items-center gap-2">
             <Button
@@ -315,7 +315,7 @@ export function SkillsPage() {
             ? `删除选中的 ${selected.size} 个技能？`
             : `删除技能「${confirmDelete ? confirmDelete.name : ""}」？`
         }
-        description="删除后注入会立即停止，操作不可撤销。"
+        description="删除后 Agent 将无法再通过 /mcp 元数据服务获取该技能，操作不可撤销。"
         confirmText="删除"
         destructive
         onConfirm={() => {

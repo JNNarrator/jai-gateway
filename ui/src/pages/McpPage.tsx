@@ -75,7 +75,7 @@ export function McpPage() {
     <div className="mx-auto max-w-3xl space-y-4">
       <PageHeader
         title="MCP Server 管理"
-        description="网关会把启用中的 MCP 工具自动合并进模型请求并代为执行。"
+        description="本机 MCP Server 登记台账。网关不再把工具注入对话链路；Agent 可通过网关 /mcp 元数据服务查询此台账（见「网关」页接入说明）。"
         actions={
           <div className="flex items-center gap-2">
             <Button

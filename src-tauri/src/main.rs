@@ -967,7 +967,8 @@ async fn webdav_autopush_status(
 
 /// 自动推送循环：定时 tick 与变更通知合并；未启用时 30s 轮询配置等待开启。
 fn spawn_autopush(core: AppCore) {
-    tokio::spawn(async move {
+    // setup 闭包不在 tokio runtime 上下文内，必须经 tauri 托管 runtime spawn
+    tauri::async_runtime::spawn(async move {
         let mut rx = core.autopush.tx.subscribe();
         loop {
             let interval = current_autopush_interval(&core).await;
@@ -1075,7 +1076,8 @@ async fn probe_provider(core: &AppCore, row: &ProviderRow) -> Result<usize, Stri
 /// enabled，也不参与路由决策；仅在状态跃迁时发系统通知，
 /// 应用启动后的首轮只记录不通知（避免每次开机弹一堆）。
 fn spawn_health_check(core: AppCore, app: AppHandle) {
-    tokio::spawn(async move {
+    // setup 闭包不在 tokio runtime 上下文内，必须经 tauri 托管 runtime spawn
+    tauri::async_runtime::spawn(async move {
         let mut first_round = true;
         loop {
             if let Err(e) = health_round(&core, &app, first_round).await {
