@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { ArrowLeftRight, ClipboardPaste, CloudUpload, Download } from "lucide-react";
 import { api } from "../api";
 import { toast } from "../lib/toast";
-import { goTab } from "../lib/nav";
 import { PageHeader } from "@/components/common/PageHeader";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { FormField } from "@/components/common/FormField";
@@ -49,6 +48,20 @@ export function SyncPage() {
       setMsg(
         `导入完成：新增供应商 ${r.providersImported}，重复跳过 ${r.providersSkippedDuplicate}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
       );
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  async function doExport() {
+    try {
+      const path = await api.exportConfigToFile();
+      toast("已导出（不含 API Key）");
+      try {
+        await api.revealInFolder(path);
+      } catch {
+        // 平台不支持打开目录时忽略
+      }
     } catch (e) {
       setErr(String(e));
     }
@@ -169,7 +182,8 @@ export function SyncPage() {
         </CardHeader>
         <CardContent className="space-y-3">
           <Textarea
-            className="h-32 font-mono text-xs"
+            rows={3}
+            className="min-h-0 font-mono text-xs"
             value={importText}
             onChange={(e) => setImportText(e.target.value)}
             placeholder="粘贴从另一台设备导出的 jai-export JSON…"
@@ -193,9 +207,8 @@ export function SyncPage() {
               <ClipboardPaste aria-hidden />
               粘贴
             </Button>
-            <span className="text-xs text-muted-foreground">导出入口仍在「网关」页。</span>
-            <Button variant="ghost" size="sm" onClick={() => goTab("gateway")}>
-              前往网关页 →
+            <Button variant="outline" onClick={doExport}>
+              导出到文件
             </Button>
           </div>
         </CardContent>

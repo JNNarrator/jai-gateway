@@ -1,9 +1,8 @@
 import { useEffect, useState } from "react";
-import { Copy, Play, Square } from "lucide-react";
+import { Play, Square } from "lucide-react";
 import { api } from "../api";
 import type { GatewayKeyInfo } from "../types";
 import { toast } from "../lib/toast";
-import { copyText } from "../lib/clipboard";
 import { PageHeader } from "@/components/common/PageHeader";
 import { CopyField } from "@/components/common/CopyField";
 import { StatusBadge } from "@/components/common/StatusBadge";
@@ -16,19 +15,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-
-const SNIPPETS: { id: "deepseek" | "openai" | "curl"; label: string }[] = [
-  { id: "deepseek", label: "DeepSeek Harness" },
-  { id: "openai", label: "OpenAI SDK" },
-  { id: "curl", label: "curl" },
-];
 
 export function GatewayPage() {
   const [status, setStatus] = useState<import("../types").GwStatus | null>(null);
@@ -36,12 +22,10 @@ export function GatewayPage() {
   const [revealKey, setRevealKey] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  const [sdk, setSdk] = useState<"deepseek" | "openai" | "curl">("deepseek");
   const [confirmRotate, setConfirmRotate] = useState(false);
 
   const port = status?.port ?? 1314;
   const baseUrl = `http://127.0.0.1:${port}/v1`;
-  const fullKey = revealKey || (key ? `${key.prefix}…` : "");
 
   async function refresh() {
     try {
@@ -73,15 +57,6 @@ export function GatewayPage() {
     }
   }
 
-  async function doReveal() {
-    if (revealKey) {
-      setRevealKey("");
-      return;
-    }
-    const full = await api.gatewayKeyReveal();
-    setRevealKey(full.key);
-  }
-
   async function doRegen() {
     const k = await api.gatewayKeyRegenerate();
     setKey(k);
@@ -89,29 +64,16 @@ export function GatewayPage() {
     toast("密钥已轮换");
   }
 
-  async function doExport() {
-    const path = await api.exportConfigToFile();
-    toast("已导出（不含 API Key）");
+  /** 不经「显示全文」直接复制完整密钥：内部取全量值，不在界面上展示 */
+  async function doCopyKey() {
     try {
-      await api.revealInFolder(path);
+      const full = revealKey || (await api.gatewayKeyReveal()).key;
+      await navigator.clipboard.writeText(full);
+      toast("已复制");
     } catch {
-      // 平台不支持打开目录时忽略
+      toast("复制失败", "err");
     }
   }
-
-  const snippet =
-    sdk === "deepseek"
-      ? `# DeepSeek Harness（dsh）
-export DEEPSEEK_API_KEY=${fullKey || "sk-jai-…"}
-# dsh 的 provider 配置里 baseURL 填 ${baseUrl}`
-      : sdk === "openai"
-        ? `# OpenAI SDK
-OPENAI_API_BASE=${baseUrl}
-OPENAI_API_KEY=${fullKey || "sk-jai-…"}`
-        : `curl ${baseUrl}/chat/completions \\
-  -H "Authorization: Bearer ${fullKey || "sk-jai-…"}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'`;
 
   return (
     <div className="mx-auto max-w-2xl space-y-4">
@@ -189,8 +151,15 @@ OPENAI_API_KEY=${fullKey || "sk-jai-…"}`
                     ? `${key.prefix}…（点击右侧显示全文）`
                     : "加载中"
               }
-              copyDisabled={!revealKey}
-              onToggleReveal={doReveal}
+              onCopy={doCopyKey}
+              onToggleReveal={() =>
+                void (revealKey
+                  ? setRevealKey("")
+                  : api
+                      .gatewayKeyReveal()
+                      .then((r) => setRevealKey(r.key))
+                      .catch(() => {}))
+              }
               revealed={!!revealKey}
             >
               <Button
@@ -203,49 +172,6 @@ OPENAI_API_KEY=${fullKey || "sk-jai-…"}`
               </Button>
             </CopyField>
           </div>
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <span className="text-muted-foreground">接入示例</span>
-              <Select value={sdk} onValueChange={(v) => setSdk(v as typeof sdk)}>
-                <SelectTrigger size="sm" className="w-44">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {SNIPPETS.map((s) => (
-                    <SelectItem key={s.id} value={s.id}>
-                      {s.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="relative">
-              <pre className="overflow-x-auto rounded-md bg-zinc-950 p-3 pr-12 font-mono text-xs leading-relaxed text-zinc-300">
-                {snippet}
-              </pre>
-              <button
-                className="absolute right-2 top-2 rounded-md border border-zinc-700 p-1.5 text-zinc-400 hover:text-zinc-100"
-                onClick={() => copyText(snippet)}
-                aria-label="复制接入示例"
-              >
-                <Copy className="size-3.5" aria-hidden />
-              </button>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>配置迁移</CardTitle>
-          <CardDescription>
-            密钥不会包含在导出文件中；导入后需在「供应商」页补录 API Key。
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Button variant="outline" onClick={doExport}>
-            导出配置（无敏感字段）
-          </Button>
         </CardContent>
       </Card>
 

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { ArrowUpDown, Boxes, Search } from "lucide-react";
+import { ArrowUpDown, Boxes, Copy, Search } from "lucide-react";
 import { api } from "../api";
 import type { ModelRow, ProviderDto } from "../types";
 import { toast } from "../lib/toast";
+import { copyText } from "../lib/clipboard";
 import { PageHeader } from "@/components/common/PageHeader";
 import { EmptyState } from "@/components/common/EmptyState";
 import { SkeletonList } from "@/components/common/SkeletonList";
@@ -213,7 +214,19 @@ function ModelRowEditor({
 
   return (
     <TableRow className={m.enabled ? "" : "opacity-50"}>
-      <TableCell className="font-mono text-xs">{m.modelName}</TableCell>
+      <TableCell className="font-mono text-xs">
+        <span className="inline-flex items-center gap-1">
+          {m.modelName}
+          <button
+            className="rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground"
+            title="复制模型名"
+            aria-label={`复制模型名 ${m.modelName}`}
+            onClick={() => copyText(m.modelName)}
+          >
+            <Copy className="size-3" aria-hidden />
+          </button>
+        </span>
+      </TableCell>
       <TableCell>
         <Input
           className="h-8 w-32 text-xs"

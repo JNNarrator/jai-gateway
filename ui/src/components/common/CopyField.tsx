@@ -53,6 +53,7 @@ export function CopyField({
   onToggleReveal,
   revealed,
   copyDisabled,
+  onCopy,
   className,
   children,
 }: {
@@ -61,12 +62,15 @@ export function CopyField({
   onToggleReveal?: () => void;
   revealed?: boolean;
   copyDisabled?: boolean;
+  /** 提供时替代内部复制逻辑（如复制前需异步取全量值），组件仍负责已复制反馈 */
+  onCopy?: () => Promise<void> | void;
   className?: string;
   children?: ReactNode;
 }) {
   const [copied, setCopied] = useState(false);
-  const doCopy = () => {
-    copyText(value);
+  const doCopy = async () => {
+    if (onCopy) await onCopy();
+    else copyText(value);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1500);
   };
