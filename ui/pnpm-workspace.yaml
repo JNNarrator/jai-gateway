@@ -1,2 +1,5 @@
 allowBuilds:
   esbuild: true
+# pnpm 10 字段：pnpm 11 只认上面的 allowBuilds，两台开发机并存兼容
+onlyBuiltDependencies:
+  - esbuild
