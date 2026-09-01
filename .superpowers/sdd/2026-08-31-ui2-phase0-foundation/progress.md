@@ -30,3 +30,8 @@ parked — M-8: 单 chunk 998KB（recharts） — ruling: 桌面应用本地加�
 parked — M-9: TitleBar userAgent 嗅探 — ruling: WKWebView UA 判定可工作，platform() 改造属风格优化
 备注: McpPage env 校验对非 stdio kind 也生效（复审非阻断观察），后续可收窄或补 http 分支提示
 UI 2.0 全分支终审: 闭环 — 可合并
+--- 2026-09-01 第一梯队（M8/M9 真机验收）执行记录 ---
+性能基线: 冷启动 0.30-1.62s ✅；SSE 1MB/s×10min passthrough 满速零积压 RSS 漂移+0.1MB ✅；空闲 RSS 主进程 123.6-126.6MB（全足迹≈360MB）超 M0 <80MB 目标 → 重定基线 finding ⚠️
+稳定性 finding: 转换路径（MCP 注入）对无终止标记上游流零转发+疑似无界缓冲（passthrough 不受影响）→ 已记 roadmap 附录 A 待修
+48h 观察: 2026-09-01 11:35 起表（release, MCP 恢复启用），observe48h.sh + 每30分钟自动化 sampling，2026-09-03 11:35 判定
+zcode 实测: key 已入用户剪贴板，用户 GUI 配置中，待测试对话后网关侧验证

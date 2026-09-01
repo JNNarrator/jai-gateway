@@ -367,7 +367,19 @@
   SSE 解析器，无 panic/悬挂
 - 护栏常量审计：现有 `ir::validate_guards` 单测（blocks ≤ 64 / args ≤ 256KB）持续全绿
 - 文档一致性：README / roadmap 随 M1–M8 同步更新
-- 资源/性能基线与 48h 本机观察：列入 M9 发布前真机验收项（本仓库无法自动完成）
+- 资源/性能基线与 48h 本机观察：见文末附录 A（2026-09-01 macOS release 实测，性能项已过，48h 观察进行中）
+
+## 附录 A：M8/M9 真机性能基线（2026-09-01，macOS arm64，release 构建）
+
+1. **冷启动到 healthz 就绪**：1.62 / 0.40 / 0.30 s（三次启动，阈值 < 3s ✅）
+2. **SSE 1MB/s × 10 分钟（passthrough 直通路径）**：
+   - 总量 611,987,250 B / 612s ≈ 1.0 MB/s 满速，零积压 ✅
+   - jai 主进程 RSS 62 样本（每 10s）：93.2–94.5 MB，漂移 +0.1 MB（0.006 MB/min）→ 无泄漏式增长 ✅
+   - 复现：`scripts/sse_mock_upstream.py`（恒速 mock 上游）+ bench 供应商直插 + curl 经网关拉流
+3. **空闲 RSS**：主进程 123.6–126.6 MB；全足迹（主进程 + WKWebView WebContent 165MB + GPU 45MB + Networking 26MB）≈ 360 MB。
+   ⚠️ M0 时代定立的「空闲 RSS < 80MB」目标与当前 webview 架构不匹配（WebContent 辅助进程为系统 XPC，不受应用控制），建议按「主进程 + WebContent 合计」或分平台重定基线 —— 待评审
+4. **⚠️ 稳定性 finding（待修，gateway-core）**：转换路径（MCP 注入启用时）对**无 finish_reason/[DONE] 终止标记的上游流**不向下游转发（35s+ 零字节），且疑似无界缓冲；passthrough 不受影响。真实 LLM 流均带终止标记故日常不受影响，但恶意/故障上游可触发内存膨胀（稳定性为一票否决域）。复现：启用 MCP + mock 恒速流；修复建议：重排缓冲护栏对终止标记缺失的流生效（超限即断开+日志）。
+5. **48h 常驻观察**：2026-09-01 11:35 起（release 实例，MCP 已恢复启用），`scripts/observe48h.sh` 每 30 分钟采样（alive/healthz/RSS），至 2026-09-03 11:35 判定零崩溃；期间第一梯队客户端各至少一例真实流量。
 
 ### M9（发布工程）—— 工程侧已完成 ✅（签名/公证/真机验收需真实 secrets 与发布主机执行）
 
