@@ -12,38 +12,24 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_id: ${{ steps.create.outputs.release_id }}
-      upload_url: ${{ steps.create.outputs.upload_url }}
     steps:
       - uses: actions/checkout@v4
 
-      # tauri-action 会先执行 beforeBuildCommand（pnpm --dir ../ui build）再创建
-      # release，ubuntu runner 默认无 pnpm，缺失会以 exit 127 失败
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: ui/pnpm-lock.yaml
-
-      # beforeBuildCommand 会执行 ui 的 build（tsc + vite），必须先按 lockfile
-      # 装依赖：否则 PATH 兜底到 runner 全局 tsc（TS 7），与锁定版本行为不一致
-      - name: Install UI dependencies
-        run: pnpm --dir ui install --frozen-lockfile
-
-      - name: Create release
+      # 只创建 draft release，不跑任何构建（tauri-action 在此 job 会执行完整
+      # tauri build，ubuntu runner 缺 webkit2gtk/glib 系统依赖必然失败）；
+      # 实际构建与产物上传只发生在下方 macos/windows 的 build-tauri job
+      - name: Create draft release
         id: create
-        uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "JAI ${{ github.ref_name }}"
-          releaseBody: "见 CHANGELOG.md"
-          releaseDraft: true
-          prerelease: true
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft --prerelease \
+            --title "JAI ${{ github.ref_name }}" \
+            --notes "见 CHANGELOG.md"
+          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" --jq '.id')
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
   build-tauri:
     name: Build (${{ matrix.platform }})
@@ -72,6 +58,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # beforeBuildCommand 会执行 ui 的 build（tsc + vite），必须先按 lockfile
+      # 装依赖：否则 PATH 兜底到 runner 全局 tsc（TS 7），与锁定版本行为不一致
+      - name: Install UI dependencies
+        run: pnpm --dir ui install --frozen-lockfile
+
       - name: Build + upload
         uses: tauri-apps/tauri-action@v0
         env:
@@ -92,5 +83,4 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          uploadUrl: ${{ needs.create-release.outputs.upload_url }}
           args: --ci
