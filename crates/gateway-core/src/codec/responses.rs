@@ -148,23 +148,31 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                     }
                                 }
                                 if let Some(fc) = item.get("function_call") {
-                                    let id = fc
-                                        .get("call_id")
-                                        .or_else(|| fc.get("id"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let name = fc
-                                        .get("name")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let input: Value = fc
-                                        .get("arguments")
-                                        .and_then(Value::as_str)
-                                        .and_then(|s| serde_json::from_str(s).ok())
-                                        .unwrap_or_else(|| json!({}));
-                                    blocks.push(Block::ToolUse { id, name, input });
+                                    // function_call 可能是单对象（内嵌形态），也可能
+                                    // 是数组（多工具调用的容错形态）；数组逐个展开。
+                                    let fcs: Vec<&Value> = match fc {
+                                        Value::Array(arr) => arr.iter().collect(),
+                                        _ => vec![fc],
+                                    };
+                                    for f in fcs {
+                                        let id = f
+                                            .get("call_id")
+                                            .or_else(|| f.get("id"))
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let name = f
+                                            .get("name")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let input: Value = f
+                                            .get("arguments")
+                                            .and_then(Value::as_str)
+                                            .and_then(|s| serde_json::from_str(s).ok())
+                                            .unwrap_or_else(|| json!({}));
+                                        blocks.push(Block::ToolUse { id, name, input });
+                                    }
                                 }
                             } else if let Some(fco) = item.get("function_call_output") {
                                 let call_id = fco
@@ -1194,6 +1202,35 @@ mod tests {
             &req.messages[2].blocks[0],
             Block::ToolResult { call_id, content, .. }
                 if call_id == "call_e1" && content[0].as_text() == Some("sunny")
+        ));
+    }
+
+    #[test]
+    fn decode_assistant_function_call_array_expands_multiple() {
+        let req = decode_request(
+            r#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"role":"assistant","content":[],
+                     "function_call":[
+                        {"call_id":"call_a1","name":"bash","arguments":"{\"command\":\"a\"}"},
+                        {"call_id":"call_b2","name":"bash","arguments":"{\"command\":\"b\"}"}
+                     ]}
+                ]
+            }"#
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(req.messages.len(), 1);
+        let blocks = &req.messages[0].blocks;
+        assert_eq!(blocks.len(), 2, "数组形态应展开为 2 个 ToolUse");
+        assert!(matches!(
+            &blocks[0],
+            Block::ToolUse { id, name, input } if id == "call_a1" && name == "bash" && input["command"] == "a"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            Block::ToolUse { id, name, input } if id == "call_b2" && name == "bash" && input["command"] == "b"
         ));
     }
 
