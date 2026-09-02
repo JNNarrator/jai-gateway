@@ -3,7 +3,6 @@
 
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
-use gateway_core::vault;
 use serde_json::{json, Value};
 
 struct Fixture {
@@ -13,7 +12,6 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    vault::testing::set_mock_default();
 
     let dir = std::env::temp_dir().join(format!(
         "jai-mcp-e2e-{}-{}",

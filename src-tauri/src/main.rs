@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
 // ---------------------------------------------------------------- 状态模型
@@ -130,15 +130,16 @@ pub struct ProviderDto {
     pub priority: i64,
     pub weight: i64,
     pub extra_headers: Option<String>,
+    pub website: Option<String>,
     pub last_ok_at: Option<i64>,
     pub last_err_at: Option<i64>,
     pub last_err_msg: Option<String>,
     pub has_key: bool,
 }
 
-fn to_dto(p: ProviderRow, has_key: bool) -> ProviderDto {
+fn to_dto(p: ProviderRow) -> ProviderDto {
     ProviderDto {
-        id: p.id,
+        id: p.id.clone(),
         name: p.name,
         base_url: p.base_url,
         family: p.family,
@@ -146,10 +147,11 @@ fn to_dto(p: ProviderRow, has_key: bool) -> ProviderDto {
         priority: p.priority,
         weight: p.weight,
         extra_headers: p.extra_headers,
+        website: p.website,
         last_ok_at: p.last_ok_at,
         last_err_at: p.last_err_at,
         last_err_msg: p.last_err_msg,
-        has_key,
+        has_key: p.api_key.is_some(),
     }
 }
 
@@ -164,19 +166,7 @@ async fn provider_list(core: State<'_, AppCore>) -> Result<Vec<ProviderDto>, Str
     .await
     .map_err(join_err)??;
 
-    let mut out = Vec::with_capacity(rows.len());
-    for p in rows {
-        let has_key = tokio::task::spawn_blocking({
-            let ref_ = p.keyring_ref.clone();
-            move || vault::get_secret(&ref_)
-        })
-        .await
-        .map_err(join_err)?
-        .map_err(vault_msg)?
-        .is_some();
-        out.push(to_dto(p, has_key));
-    }
-    Ok(out)
+    Ok(rows.into_iter().map(to_dto).collect())
 }
 
 #[derive(Deserialize)]
@@ -192,6 +182,9 @@ pub struct NewProvider {
     #[serde(default)]
     pub extra_headers: Option<String>,
     pub api_key: String,
+    /// 官网地址（可空）
+    #[serde(default)]
+    pub website: Option<String>,
 }
 
 fn default_priority() -> i64 {
@@ -216,16 +209,6 @@ async fn provider_create(
     }
 
     let id = uuid::Uuid::now_v7().to_string();
-    let keyring_ref = vault::ref_for(&id);
-
-    // storage §4：先写密钥环，成功后落库；落库失败回滚删除凭据
-    let secret = input.api_key.clone();
-    let r2 = keyring_ref.clone();
-    tokio::task::spawn_blocking(move || vault::set_secret(&r2, &secret))
-        .await
-        .map_err(join_err)?
-        .map_err(vault_msg)?;
-
     let row = ProviderRow {
         id: id.clone(),
         name: input.name.trim().to_string(),
@@ -235,7 +218,8 @@ async fn provider_create(
         priority: input.priority,
         weight: input.weight,
         extra_headers: input.extra_headers.filter(|s| !s.trim().is_empty()),
-        keyring_ref,
+        api_key: Some(input.api_key.trim().to_string()),
+        website: input.website.map(|w| w.trim().to_string()).filter(|s| !s.is_empty()),
         last_ok_at: None,
         last_err_at: None,
         last_err_msg: None,
@@ -243,15 +227,10 @@ async fn provider_create(
         updated_at: store::now_ms(),
     };
     let db = core.db.clone();
-    if let Err(e) =
-        tokio::task::spawn_blocking(move || db.with(|c| store::provider_insert(c, &row)))
-            .await
-            .map_err(join_err)?
-    {
-        let rollback_ref = vault::ref_for(&id);
-        let _ = tokio::task::spawn_blocking(move || vault::delete_secret(&rollback_ref)).await;
-        return Err(format!("数据库写入失败(已回滚凭据): {e}"));
-    }
+    tokio::task::spawn_blocking(move || db.with(|c| store::provider_insert(c, &row)))
+        .await
+        .map_err(join_err)?
+        .map_err(|e| format!("数据库写入失败: {e}"))?;
 
     let db2 = core.db.clone();
     let created = tokio::task::spawn_blocking(move || {
@@ -263,7 +242,7 @@ async fn provider_create(
     .map_err(join_err)??;
 
     core.autopush.notify_change();
-    Ok(to_dto(created, true))
+    Ok(to_dto(created))
 }
 
 #[derive(Deserialize)]
@@ -276,8 +255,10 @@ pub struct UpdateProviderInput {
     pub weight: Option<i64>,
     /// 外层 Some 表示要动这个字段；内层 None 表示清空
     pub extra_headers: Option<Option<String>>,
-    /// Some(非空) 覆盖密钥；Some("") 忽略
+    /// Some(非空) 覆盖密钥；Some("")/None 不动
     pub api_key: Option<String>,
+    /// Some 覆盖官网（空串清空）；None 不动
+    pub website: Option<String>,
 }
 
 #[tauri::command]
@@ -285,22 +266,28 @@ async fn provider_update(
     core: State<'_, AppCore>,
     input: UpdateProviderInput,
 ) -> Result<(), String> {
-    if let Some(key) = &input.api_key {
-        if !key.is_empty() {
-            let row = fetch_provider(&core.db, &input.id).await?;
-            let kr = row.keyring_ref;
-            let k = key.clone();
-            tokio::task::spawn_blocking(move || vault::set_secret(&kr, &k))
-                .await
-                .map_err(join_err)?
-                .map_err(vault_msg)?;
-        }
-    }
+    let new_key = input
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let new_website = input
+        .website
+        .as_deref()
+        .map(str::trim)
+        .map(|s| (!s.is_empty()).then(|| s.to_string()));
 
     let normalized = input.base_url.as_deref().map(normalize_base);
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
         db.with(|c| {
+            if let Some(k) = &new_key {
+                store::provider_set_api_key(c, &input.id, Some(k))?;
+            }
+            if let Some(w) = &new_website {
+                store::provider_set_website(c, &input.id, w.as_deref())?;
+            }
             store::provider_update_fields(
                 c,
                 &input.id,
@@ -322,7 +309,6 @@ async fn provider_update(
 
 #[tauri::command]
 async fn provider_delete(core: State<'_, AppCore>, id: String) -> Result<(), String> {
-    let row = fetch_provider(&core.db, &id).await?;
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
         db.with(|c| store::provider_delete(c, &id))
@@ -332,8 +318,6 @@ async fn provider_delete(core: State<'_, AppCore>, id: String) -> Result<(), Str
     .await
     .map_err(join_err)??;
 
-    // 库先行成功；凭据尽力删除（幂等，失败不阻塞 UI）
-    let _ = tokio::task::spawn_blocking(move || vault::delete_secret(&row.keyring_ref)).await;
     core.autopush.notify_change();
     Ok(())
 }
@@ -435,9 +419,8 @@ async fn provider_discover_models(
     id: String,
 ) -> Result<(usize, usize), String> {
     let row = fetch_provider(&core.db, &id).await?;
-    let secret = load_secret_or_none(&row.keyring_ref).await?;
 
-    let models = discover_models(&core.http, &row.family, &row.base_url, secret.as_deref()).await?;
+    let models = discover_models(&core.http, &row.family, &row.base_url, row.api_key.as_deref()).await?;
 
     let existing: std::collections::HashMap<String, ()> = {
         let db = core.db.clone();
@@ -648,6 +631,8 @@ async fn gateway_key_regenerate(core: State<'_, AppCore>) -> Result<GatewayKeyIn
     })
     .await
     .map_err(join_err)??;
+    // 新密钥随 WebDAV 同步：触发自动推送防抖通知（未配置 WebDAV 时无副作用）
+    core.autopush.notify_change();
     Ok(GatewayKeyInfo {
         prefix: row.prefix,
         label: row.label,
@@ -742,6 +727,8 @@ pub struct WebDavConfigDto {
     pub directory: String,
     pub auto_push_enabled: bool,
     pub auto_push_interval_min: u32,
+    /// 明文回显（0006 起密码入库并随同步携带，与网关 Key 同级安全模型）
+    pub password: Option<String>,
 }
 
 impl From<WebDavConfig> for WebDavConfigDto {
@@ -752,6 +739,7 @@ impl From<WebDavConfig> for WebDavConfigDto {
             directory: c.directory,
             auto_push_enabled: c.auto_push_enabled,
             auto_push_interval_min: c.auto_push_interval_min,
+            password: None,
         }
     }
 }
@@ -761,6 +749,8 @@ impl From<WebDavConfig> for WebDavConfigDto {
 pub struct WebDavConfigInput {
     pub url: String,
     pub username: String,
+    /// 仅 webdav_config_set 使用；测试连接不传，缺省视为根目录
+    #[serde(default)]
     pub directory: String,
     /// Some(非空) 覆盖密码；None/空串保持原密码
     pub password: Option<String>,
@@ -768,6 +758,25 @@ pub struct WebDavConfigInput {
     pub auto_push_enabled: Option<bool>,
     /// 自动推送间隔分钟；None 保持原值
     pub auto_push_interval_min: Option<u32>,
+}
+
+#[cfg(test)]
+mod webdav_input_tests {
+    use super::*;
+
+    /// 前端「测试连接」只传 url/username/password，directory 缺省必须能反序列化。
+    #[test]
+    fn webdav_test_input_without_directory() {
+        let v = serde_json::json!({
+            "url": "http://jn_file.88933.vip/",
+            "username": "jiangnan",
+            "password": null
+        });
+        let input: WebDavConfigInput =
+            serde_json::from_value(v).expect("缺 directory 也应反序列化成功");
+        assert_eq!(input.directory, "");
+        assert_eq!(input.url, "http://jn_file.88933.vip/");
+    }
 }
 
 #[tauri::command]
@@ -791,12 +800,22 @@ async fn config_import(
 #[tauri::command]
 async fn webdav_config_get(core: State<'_, AppCore>) -> Result<Option<WebDavConfigDto>, String> {
     let db = core.db.clone();
-    let cfg: Option<WebDavConfig> = tokio::task::spawn_blocking(move || {
-        db.with_any(|c| sync::config_get(c).map_err(|e| e.to_string()))
+    let (cfg, password): (Option<WebDavConfig>, Option<String>) = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| {
+            let cfg = sync::config_get(c).map_err(|e| e.to_string())?;
+            let password = store::meta_get(c, "webdav_password")
+                .map_err(|e| e.to_string())?
+                .filter(|s| !s.is_empty());
+            Ok::<_, String>((cfg, password))
+        })
     })
     .await
     .map_err(join_err)??;
-    Ok(cfg.map(WebDavConfigDto::from))
+    Ok(cfg.map(|c| {
+        let mut dto = WebDavConfigDto::from(c);
+        dto.password = password;
+        dto
+    }))
 }
 
 #[tauri::command]
@@ -804,13 +823,16 @@ async fn webdav_config_set(
     core: State<'_, AppCore>,
     input: WebDavConfigInput,
 ) -> Result<(), String> {
+    // 密码明文入 meta（0006 起与网关 key/MCP env 同级安全模型），随导出同步
     if let Some(pw) = input.password.as_deref().filter(|s| !s.trim().is_empty()) {
-        let ref_ = sync::WEBDAV_KEYRING_REF.to_string();
-        let pw = pw.to_string();
-        tokio::task::spawn_blocking(move || vault::set_secret(&ref_, &pw))
-            .await
-            .map_err(join_err)?
-            .map_err(vault_msg)?;
+        let db = core.db.clone();
+        let pw = pw.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            db.with(|c| store::meta_set(c, "webdav_password", &pw))
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(join_err)??;
     }
     let db = core.db.clone();
     let old: Option<WebDavConfig> = tokio::task::spawn_blocking(move || {
@@ -841,7 +863,16 @@ async fn webdav_config_set(
 async fn webdav_test(core: State<'_, AppCore>, input: WebDavConfigInput) -> Result<String, String> {
     let url = normalize_base(&input.url);
     let username = input.username.trim().to_string();
-    let password = input.password.clone().unwrap_or_default();
+    // 留空表示测试已保存的密码；有输入则测未保存的新密码
+    let password = match input
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(pw) => pw.to_string(),
+        None => get_webdav_password(&core).await?,
+    };
     let resp = core
         .http
         .request(reqwest::Method::OPTIONS, &url)
@@ -875,7 +906,7 @@ pub struct WebDavPreview {
 #[tauri::command]
 async fn webdav_preview(core: State<'_, AppCore>) -> Result<WebDavPreview, String> {
     let cfg = get_webdav_config(&core).await?;
-    let password = get_webdav_password().await?;
+    let password = get_webdav_password(&core).await?;
     let remote_text = sync::pull(&core.http, &cfg, &password).await?;
     let local_text = export_config_json(core.clone()).await?;
 
@@ -923,7 +954,7 @@ async fn webdav_push(core: State<'_, AppCore>) -> Result<(), String> {
 /// 构建导出 JSON → 本地留存快照 → PUT 覆盖远端。手动命令与自动推送共用。
 async fn push_now(core: &AppCore) -> Result<(), String> {
     let cfg = get_webdav_config(core).await?;
-    let password = get_webdav_password().await?;
+    let password = get_webdav_password(core).await?;
     let db = core.db.clone();
     let export_text = tokio::task::spawn_blocking(move || {
         db.with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
@@ -1065,8 +1096,7 @@ const HEALTH_NOTIFY_SUMMARY_CHARS: usize = 140;
 /// 单供应商探测核心（provider_test 与健康检查共用）：
 /// 读凭据 → 拉模型列表。HTTP 200 即视为连通（0 个模型也算通）。
 async fn probe_provider(core: &AppCore, row: &ProviderRow) -> Result<usize, String> {
-    let secret = load_secret_or_none(&row.keyring_ref).await?;
-    let models = discover_models(&core.http, &row.family, &row.base_url, secret.as_deref()).await?;
+    let models = discover_models(&core.http, &row.family, &row.base_url, row.api_key.as_deref()).await?;
     Ok(models.len())
 }
 
@@ -1172,7 +1202,7 @@ async fn webdav_pull(core: State<'_, AppCore>) -> Result<import::ImportReport, S
     // 与自动推送互斥；拉取内容与远端一致，抑制后续防抖推送（防回声）
     let _guard = core.autopush.push_lock.lock().await;
     let cfg = get_webdav_config(&core).await?;
-    let password = get_webdav_password().await?;
+    let password = get_webdav_password(&core).await?;
     let text = sync::pull(&core.http, &cfg, &password).await?;
     let db = core.db.clone();
     let out = tokio::task::spawn_blocking(move || {
@@ -1203,13 +1233,16 @@ async fn get_webdav_config(core: &AppCore) -> Result<WebDavConfig, String> {
     cfg.ok_or_else(|| "尚未配置 WebDAV".to_string())
 }
 
-async fn get_webdav_password() -> Result<String, String> {
-    let ref_ = sync::WEBDAV_KEYRING_REF.to_string();
-    tokio::task::spawn_blocking(move || vault::get_secret(&ref_))
-        .await
-        .map_err(join_err)?
-        .map_err(vault_msg)?
-        .ok_or_else(|| "WebDAV 密码尚未录入，请在设置中保存".to_string())
+async fn get_webdav_password(core: &AppCore) -> Result<String, String> {
+    let db = core.db.clone();
+    // 密码明文存 meta（0006 起），随导出同步到 WebDAV
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::meta_get(c, "webdav_password"))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??.
+    ok_or_else(|| "WebDAV 密码尚未录入，请在设置中保存".to_string())
 }
 
 // ---------------------------------------------------------------- MCP 管理
@@ -1651,12 +1684,6 @@ fn families() -> Vec<&'static str> {
     vec!["openai_compat", "openai_responses", "anthropic", "gemini"]
 }
 
-/// 当前凭据存储方式：`keyring` 或 `file`（降级）。
-#[tauri::command]
-fn vault_storage_kind() -> &'static str {
-    vault::storage_kind()
-}
-
 // ---------------------------------------------------------------- 设置（M2）
 
 #[derive(Serialize)]
@@ -1781,10 +1808,6 @@ fn join_err(e: tokio::task::JoinError) -> String {
     format!("内部任务失败: {e}")
 }
 
-fn vault_msg(e: vault::VaultError) -> String {
-    format!("系统密钥环操作失败（检查本机凭据设置）: {e}")
-}
-
 fn validate_family(f: &str) -> Result<(), String> {
     Family::from_db_str(f)
         .map(|_| ())
@@ -1806,14 +1829,6 @@ async fn fetch_provider(db: &Db, id: &str) -> Result<ProviderRow, String> {
     })
     .await
     .map_err(join_err)?
-}
-
-async fn load_secret_or_none(keyring_ref: &str) -> Result<Option<String>, String> {
-    let r = keyring_ref.to_string();
-    tokio::task::spawn_blocking(move || vault::get_secret(&r))
-        .await
-        .map_err(join_err)?
-        .map_err(vault_msg)
 }
 
 // ---------------------------------------------------------------- 监督循环
@@ -1958,6 +1973,15 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
+        // 托盘常驻（稳定性基线）：关闭窗口 = 隐藏到托盘，网关保持运行；
+        // 真正退出走托盘菜单「退出 JAI」。
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             // 1) 数据目录 + 迁移（失败即中止启动 —— storage §4 早拦截）
             //    某些受限环境（CI/沙箱）对 ~/Library 无写权限，回退临时目录保证可演示。
@@ -1984,10 +2008,21 @@ fn main() {
             let db_path = data_dir.join("jai.db");
             let db_str = db_path.to_string_lossy().to_string();
 
-            // 密钥环不可用（沙箱/CI）时降级为文件存储，保证添加供应商可用
-            vault::init(&data_dir)?;
-
             let db = Db::open(&db_str)?;
+            // 存量钥匙串凭据一次性迁移入库（0006）；此后运行时零钥匙串访问。
+            // 后台执行：授权弹框可能等待用户输入，绝不能阻塞启动路径；
+            // 弹框期间迁移不持 DB 锁（见 vault::migrate_keyring_secrets 分段持锁设计）。
+            // 失败不中止启动：新路径可照常运行，下次启动重试（标记位未置）。
+            tauri::async_runtime::spawn_blocking({
+                let db = db.clone();
+                move || {
+                    if let Err(e) =
+                        vault::migrate_keyring_secrets(&db).map_err(|e| e.to_string())
+                    {
+                        eprintln!("[vault] 钥匙串存量迁移失败(下次启动重试): {e}");
+                    }
+                }
+            });
             // 日志管道第二条连接 + 有界队列（稳定性基线 §5-3）
             let (log_handle, _log_task) = logs::spawn_logger(&db_str)?;
             println!("[store] db ready at {}", db_path.display());
@@ -2129,7 +2164,6 @@ fn main() {
             provider_test,
             provider_test_draft,
             provider_discover_models,
-            vault_storage_kind,
             model_list,
             model_set_limits,
             model_set_alias,

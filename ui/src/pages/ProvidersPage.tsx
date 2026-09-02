@@ -3,6 +3,7 @@ import { useFieldArray, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import {
+  ExternalLink,
   KeyRound,
   Pencil,
   PlugZap,
@@ -106,6 +107,9 @@ const baseSchema = z.object({
     .int("需为整数")
     .min(1, "需 ≥ 1"),
   extraHeaders: z.array(headerRowSchema),
+  website: z
+    .union([z.literal(""), z.string().trim().url("需为合法 URL（含 https:// 前缀）")])
+    .optional(),
 });
 
 const createSchema = baseSchema.extend({
@@ -152,7 +156,7 @@ export function ProvidersPage() {
     <div className="mx-auto max-w-3xl space-y-4">
       <PageHeader
         title="上游供应商"
-        description="按优先级与权重路由；凭据只写入系统钥匙串，数据库不落明文。"
+        description="按优先级与权重路由；凭据随 WebDAV 配置同步，换机拉取即用。"
         actions={
           <Button onClick={() => setDialog({ mode: "create" })}>
             <Plus aria-hidden />
@@ -178,7 +182,7 @@ export function ProvidersPage() {
         <EmptyState
           icon={KeyRound}
           title="还没有供应商"
-          description="添加第一个上游渠道 —— API Key 会立即写入系统钥匙串，数据库只保存引用地址，绝不落盘明文。"
+          description="添加第一个上游渠道 —— 凭据随配置入库并随 WebDAV 同步，导入/拉取后立即可用。"
           className="py-16"
         />
       )}
@@ -231,7 +235,7 @@ export function ProvidersPage() {
         open={!!confirmDelete}
         onOpenChange={(o) => !o && setConfirmDelete(null)}
         title={`删除供应商「${confirmDelete?.name ?? ""}」？`}
-        description="其模型映射与钥匙串凭据将一并清除，操作不可撤销。"
+        description="其模型映射与凭据将一并清除，操作不可撤销。"
         confirmText="删除"
         destructive
         onConfirm={() => {
@@ -299,6 +303,21 @@ function ProviderCard(props: {
             <div className="truncate font-mono text-xs text-muted-foreground">
               {p.baseUrl}
             </div>
+            {p.website && (
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                onClick={() => {
+                  api.openWebsite(p.website!).catch((e) =>
+                    toast(`打开官网失败: ${e}`)
+                  );
+                }}
+                title={p.website}
+              >
+                <ExternalLink className="size-3" aria-hidden />
+                官网
+              </button>
+            )}
             {(p.lastOkAt || p.lastErrAt) && (
               <div className="mt-1 text-xs">
                 {lastFailed ? (
@@ -403,6 +422,7 @@ function ProviderDialog({
       baseUrl: p?.baseUrl ?? "",
       family: (p?.family as FormValues["family"]) ?? "openai_compat",
       apiKey: "",
+      website: p?.website ?? "",
       priority: p?.priority ?? 100,
       weight: p?.weight ?? 1,
       extraHeaders: initialHeaders,
@@ -461,6 +481,7 @@ function ProviderDialog({
           weight: v.weight,
           extraHeaders: eh,
           apiKey: v.apiKey,
+          website: v.website || null,
         });
       } else if (p) {
         await api.providerUpdate({
@@ -472,6 +493,7 @@ function ProviderDialog({
           // 与新建语义一致：有行则整体覆盖为 JSON 串，全空行传 null 显式清空
           extraHeaders: eh,
           apiKey: v.apiKey || undefined,
+          website: v.website || null,
         });
       }
       toast(mode === "create" ? "供应商已创建" : "已保存");
@@ -490,7 +512,7 @@ function ProviderDialog({
           </DialogTitle>
           <DialogDescription>
             {mode === "create"
-              ? "API Key 会立即写入系统钥匙串，数据库只保存引用地址。"
+              ? "API Key 明文入库，配置 WebDAV 后随同步携带。"
               : "API Key 留空表示保持现有凭据不变。"}
           </DialogDescription>
         </DialogHeader>
@@ -543,7 +565,19 @@ function ProviderDialog({
           </FormField>
 
           <FormField
-            label="API Key（凭据存储方式见设置页）"
+            label="官网（可选）"
+            htmlFor="pf-website"
+            error={errors.website?.message}
+          >
+            <Input
+              id="pf-website"
+              placeholder="https://provider.example.com"
+              {...register("website")}
+            />
+          </FormField>
+
+          <FormField
+            label="API Key"
             htmlFor="pf-key"
             error={errors.apiKey?.message}
             labelExtra={
@@ -561,7 +595,7 @@ function ProviderDialog({
             <Input
               id="pf-key"
               type="password"
-              placeholder={mode === "edit" ? (p?.hasKey ? "•••• 已存于钥匙串" : "尚未录入") : ""}
+              placeholder={mode === "edit" ? (p?.hasKey ? "•••• 已保存" : "尚未录入") : ""}
               {...register("apiKey")}
             />
           </FormField>

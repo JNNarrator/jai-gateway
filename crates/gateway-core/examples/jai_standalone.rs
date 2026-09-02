@@ -5,7 +5,6 @@
 
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
-use gateway_core::vault;
 use std::path::PathBuf;
 
 fn env_or(name: &str) -> Option<String> {
@@ -18,7 +17,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("jai-standalone-e2e"));
     std::fs::create_dir_all(&data_dir)?;
-    vault::init(&data_dir)?;
 
     let db_path = data_dir.join("jai.db");
     let db = Db::open(&db_path.to_string_lossy())?;
@@ -43,7 +41,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     priority: 1,
                     weight: 1,
                     extra_headers: None,
-                    keyring_ref: vault::ref_for(pid),
+                    api_key: env_or(if pid == "p-onemodel" {
+                        "ONEMODEL_API_KEY"
+                    } else {
+                        "JIYUANLVDONG_API_KEY"
+                    }),
+                    website: None,
                     last_ok_at: None,
                     last_err_at: None,
                     last_err_msg: None,
@@ -68,7 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     priority: 2,
                     weight: 1,
                     extra_headers: None,
-                    keyring_ref: vault::ref_for(pid),
+                    api_key: env_or(if pid == "p-onemodel" {
+                        "ONEMODEL_API_KEY"
+                    } else {
+                        "JIYUANLVDONG_API_KEY"
+                    }),
+                    website: None,
                     last_ok_at: None,
                     last_err_at: None,
                     last_err_msg: None,
@@ -83,13 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Ok::<_, store::StoreError>(())
     })?;
-
-    if let Some(secret) = env_or("ONEMODEL_API_KEY") {
-        vault::set_secret(&vault::ref_for("p-onemodel"), &secret)?;
-    }
-    if let Some(secret) = env_or("JIYUANLVDONG_API_KEY") {
-        vault::set_secret(&vault::ref_for("p-jiyuanlvdong"), &secret)?;
-    }
 
     let preferred_port: u16 = env_or("JAI_STANDALONE_PORT")
         .and_then(|s| s.parse().ok())

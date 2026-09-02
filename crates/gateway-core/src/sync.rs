@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::StoreError;
 
-pub const WEBDAV_KEYRING_REF: &str = "jai/webdav";
 pub const CONFIG_FILE_NAME: &str = "jai-config.json";
 const SNAPSHOT_META_KEY: &str = "webdav_last_snapshot";
 

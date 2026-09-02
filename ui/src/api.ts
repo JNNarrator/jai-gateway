@@ -1,5 +1,6 @@
 // Tauri invoke 封装：M1 全部命令的类型化入口。
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   GwStatus,
   GatewayKeyInfo,
@@ -32,6 +33,7 @@ export const api = {
     weight?: number;
     extraHeaders?: string | null;
     apiKey: string;
+    website?: string | null;
   }) => invoke<ProviderDto>("provider_create", { input }),
   providerUpdate: (input: {
     id: string;
@@ -41,6 +43,7 @@ export const api = {
     weight?: number;
     extraHeaders?: string | null;
     apiKey?: string;
+    website?: string | null;
   }) => invoke<void>("provider_update", { input }),
   providerDelete: (id: string) =>
     invoke<void>("provider_delete", { id }),
@@ -58,6 +61,7 @@ export const api = {
     ),
   providerDiscoverModels: (id: string) =>
     invoke<[number, number]>("provider_discover_models", { id }),
+  openWebsite: (url: string) => openUrl(url),
 
   // 模型
   modelList: (providerId: string) =>
@@ -100,6 +104,7 @@ export const api = {
   webdavTest: (input: {
     url: string;
     username: string;
+    directory?: string;
     password?: string | null;
   }) => invoke<string>("webdav_test", { input }),
   webdavPreview: () =>
@@ -164,7 +169,6 @@ export const api = {
   skillImportZip: (data: number[]) =>
     invoke<number>("skill_import_zip", { data }),
   skillExportMarkdown: () => invoke<string>("skill_export_markdown"),
-  vaultStorageKind: () => invoke<string>("vault_storage_kind"),
 
   corsAllowGet: () => invoke<string[]>("cors_allow_get"),
   corsAllowSet: (list: string[]) => invoke<void>("cors_allow_set", { list }),

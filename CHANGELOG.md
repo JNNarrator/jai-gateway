@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **供应商官网字段**：供应商表单新增「官网」（可空），列表卡片一键跳转系统浏览器
+  （tauri-plugin-opener）
+- **WebDAV 密码回显**：同步页密码框回显已保存密码（明文入库后与网关 Key 同级展示语义）
+
+### Changed
+- **密钥迁入 SQLite，钥匙串退场**（migration `0006_secrets_in_db`）：供应商凭据明文存
+  `providers.api_key`（与网关 Key / MCP env 同级安全模型，安全性依赖数据目录文件权限）。
+  启动时一次性迁移钥匙串存量（`jai/provider/{id}`、`jai/webdav`）→ 入库 → 删除钥匙串项 →
+  置 `keyring_migrated` 标记位；迁移改为后台执行且不持 DB 锁，授权弹框不再阻塞启动。
+  此后转发、导入导出、启动**零钥匙串访问**；`vault_storage_kind` 命令、文件降级存储
+  （vault_fallback.json）与 UI 存储类型显示全部移除
+- **WebDAV 同步协议扩展（jai-export/v1）**：导出 providers 携带 `api_key`/`website`，
+  顶层新增 `gateway_key`（当前 active），meta 全量导出（WebDAV 密码随行）；
+  导入时远端 `api_key` 非空才覆盖本地、新建供应商直接带凭据（导入后立即可路由）、
+  `gateway_key` 与本地不同才轮换（吊销旧 key 保留审计）、meta 按白名单应用
+  （仅 WebDAV 连接配置与密码）
+- 网关 Key 手动重新生成后触发自动推送防抖通知（配置 WebDAV 即自动更新远端）
+
+### Fixed
+- **日志「输入/输出」token 数恒空**：修复流式 usage 抽取器两处缺陷——
+  `"usage":null` 后 32 字节窗口误命中下一 SSE 行触发错误收集且线索被丢弃
+  （glm-5.3-flash 中转流 17 个 null + 末尾 usage 帧实测恒空）；现在 `null` 显式跳过、
+  关键字与值跨 feed 分割时悬挂判定（64 字节上限保护），回归测试覆盖整段/逐字节喂入。
+  转换路径流式结束时透传 IR 累计 usage 落日志（此前硬编码 None）
+
+### Added
 - **MCP 导入自动识别三种格式**（`mcp_import` 命令，原 `mcp_import_from_json` 更名）：
   1. `{"mcpServers": {...}}` JSON（Claude Code / Claude Desktop，另兼容无包装的裸对象）
   2. Codex CLI 命令行：`codex mcp add <名称> --env K=V -- "命令" [参数...]`

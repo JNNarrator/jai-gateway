@@ -17,6 +17,7 @@ export interface ProviderDto {
   priority: number;
   weight: number;
   extraHeaders?: string | null;
+  website?: string | null;
   lastOkAt?: number | null;
   lastErrAt?: number | null;
   lastErrMsg?: string | null;
@@ -78,6 +79,7 @@ export interface WebDavConfigDto {
   directory: string;
   autoPushEnabled: boolean;
   autoPushIntervalMin: number;
+  password?: string | null;
 }
 
 export interface WebDavAutoPushStatus {

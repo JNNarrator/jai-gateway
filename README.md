@@ -20,7 +20,8 @@
 
 ## 核心特性
 
-- 多供应商管理：OpenAI 兼容 / OpenAI Responses / Anthropic / Gemini 四族渠道，密钥存系统钥匙串（Windows 凭据管理器 / macOS 钥匙串），数据库不落明文
+- 多供应商管理：OpenAI 兼容 / OpenAI Responses / Anthropic / Gemini 四族渠道，凭据明文存本地 SQLite（与网关 Key 同级安全模型，安全性依赖数据目录文件权限）
+- **配置随 WebDAV 同步**：供应商 API Key、网关 Key、WebDAV 密码随导出同步，换机器拉取即用（客户端零改动）；手动重新生成网关 Key 自动更新远端
 - 对外暴露统一网关入口（`127.0.0.1:1314`），支持四种入站协议线：
   - OpenAI `POST /v1/chat/completions` 与旧版 `POST /v1/completions`
   - OpenAI Responses API `POST /v1/responses`（Codex CLI 原生接入）
@@ -44,7 +45,7 @@
 
 ## 技术栈
 
-Tauri 2.0 · Rust (Axum + Reqwest) · React 19 + TypeScript + TailwindCSS 4 + shadcn/ui + recharts + react-hook-form/zod · SQLite · OS Keyring · MIT
+Tauri 2.0 · Rust (Axum + Reqwest) · React 19 + TypeScript + TailwindCSS 4 + shadcn/ui + recharts + react-hook-form/zod · SQLite · MIT
 
 ## 界面
 

@@ -38,7 +38,6 @@ export function SettingsPage() {
   const [logRowCap, setLogRowCap] = useState(50000);
   const [portMsg, setPortMsg] = useState("");
   const [logMsg, setLogMsg] = useState("");
-  const [vaultKind, setVaultKind] = useState("…");
   const [portBusyWarn, setPortBusyWarn] = useState("");
   const [retentionOpen, setRetentionOpen] = useState(false);
   const [originOpen, setOriginOpen] = useState(false);
@@ -59,7 +58,6 @@ export function SettingsPage() {
         setLogRowCap(s.logRowCap);
       })
       .catch(() => {});
-    api.vaultStorageKind().then(setVaultKind).catch(() => setVaultKind("unknown"));
   }, []);
 
   async function save() {
@@ -207,29 +205,13 @@ export function SettingsPage() {
             <KeyRound className="size-4" aria-hidden />
             关于密钥存储
           </CardTitle>
-          <CardDescription>
-            当前凭据存储：{" "}
-            <span
-              className={cn(
-                "font-medium",
-                vaultKind === "file"
-                  ? "text-amber-600 dark:text-amber-400"
-                  : "text-emerald-600 dark:text-emerald-400",
-              )}
-            >
-              {vaultKind === "keyring"
-                ? "系统钥匙串"
-                : vaultKind === "file"
-                  ? "文件降级（0600）"
-                  : vaultKind}
-            </span>
-          </CardDescription>
+          <CardDescription>凭据统一入库，随 WebDAV 配置同步</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <ul className="list-disc space-y-1.5 pl-5 text-xs leading-relaxed text-muted-foreground">
-            <li>上游 API Key：优先保存在 macOS 钥匙串 / Windows 凭据管理器，数据库只存引用。</li>
-            <li>若系统凭据存储不可用（如沙箱/CI 权限受限），自动降级为数据目录下的 vault_fallback.json（Unix 0600）。</li>
-            <li>网关 Key sk-jai-*：按设计决策明文存放本地 SQLite（非敏感级别），前缀展示、轮换采用吊销+新建保留审计痕迹、永不导出。</li>
+            <li>上游 API Key：明文存放在本地 SQLite，安全性依赖数据目录文件权限（与网关 Key 同级）。</li>
+            <li>网关 Key sk-jai-*：明文存放本地 SQLite，前缀展示、轮换采用吊销+新建保留审计痕迹。</li>
+            <li>配置 WebDAV 后：供应商 API Key、网关 Key、WebDAV 密码随导出同步，换机拉取即用；手动重新生成网关 Key 会自动更新远端。</li>
             <li>删除供应商会同时清除对应凭据。</li>
           </ul>
           <Button variant="outline" size="sm" onClick={() => goTab("providers")}>

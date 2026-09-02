@@ -16,7 +16,6 @@ use axum::routing::post;
 use axum::Router;
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
-use gateway_core::vault;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------- mock 上游
@@ -72,7 +71,6 @@ struct Fixture {
 }
 
 async fn fixture(priority_a: i64, priority_b: i64, status_a: u16, status_b: u16) -> Fixture {
-    vault::testing::set_mock_default();
 
     let port_a = spawn_mock(status_a, "A").await;
     let port_b = spawn_mock(status_b, "B").await;
@@ -105,7 +103,8 @@ async fn fixture(priority_a: i64, priority_b: i64, status_a: u16, status_b: u16)
         priority: prio,
         weight: 1,
         extra_headers: None,
-        keyring_ref: vault::ref_for(&format!("p-{name}")),
+        api_key: Some(format!("sk-{name}")),
+        website: None,
         last_ok_at: None,
         last_err_at: None,
         last_err_msg: None,
@@ -122,8 +121,7 @@ async fn fixture(priority_a: i64, priority_b: i64, status_a: u16, status_b: u16)
     .unwrap();
 
     // 写密钥环凭据（mock）
-    vault::set_secret(&vault::ref_for("p-A"), "sk-A").unwrap();
-    vault::set_secret(&vault::ref_for("p-B"), "sk-B").unwrap();
+    
 
     // 网关密钥
     let key = "sk-jai-integration-test-0000000000000000";

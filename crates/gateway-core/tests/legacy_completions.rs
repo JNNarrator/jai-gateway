@@ -9,7 +9,6 @@ use axum::routing::post;
 use axum::Router;
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
-use gateway_core::vault;
 use serde_json::{json, Value};
 
 async fn spawn_completions_mock() -> u16 {
@@ -47,7 +46,6 @@ async fn spawn_completions_mock() -> u16 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_completions_passthrough() {
-    vault::testing::set_mock_default();
     let up_port = spawn_completions_mock().await;
 
     let (db, main_path) = {
@@ -81,7 +79,8 @@ async fn legacy_completions_passthrough() {
                 priority: 1,
                 weight: 1,
                 extra_headers: None,
-                keyring_ref: vault::ref_for(pid),
+                api_key: Some("sk-openai".into()),
+                website: None,
                 last_ok_at: None,
                 last_err_at: None,
                 last_err_msg: None,
@@ -93,7 +92,7 @@ async fn legacy_completions_passthrough() {
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
-    vault::set_secret(&vault::ref_for(pid), "sk-openai").unwrap();
+    
     let key = "sk-jai-integration-test-0000000000000000";
     db.with(|c| {
         store::gw_key_rotate(c, key, Some("test"))?;

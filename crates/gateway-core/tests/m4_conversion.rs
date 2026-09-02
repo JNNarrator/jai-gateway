@@ -15,7 +15,6 @@ use axum::routing::post;
 use axum::Router;
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
-use gateway_core::vault;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------- mock 上游
@@ -134,6 +133,7 @@ async fn spawn_gemini_mock(mode: &'static str) -> u16 {
 struct Fixture {
     port: u16,
     key: String,
+    db: Db,
     _keepalive: (
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
@@ -175,7 +175,6 @@ impl Fixture {
 
 /// 起夹具：一个协议族为 family 的上游渠道。
 async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
-    vault::testing::set_mock_default();
     let up_port = if family == "anthropic" {
         spawn_anthropic_mock(upstream_mode).await
     } else {
@@ -217,7 +216,8 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
                 priority: 1,
                 weight: 1,
                 extra_headers: None,
-                keyring_ref: vault::ref_for(pid),
+                api_key: Some(secret.to_string()),
+                website: None,
                 last_ok_at: None,
                 last_err_at: None,
                 last_err_msg: None,
@@ -229,7 +229,7 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
-    vault::set_secret(&vault::ref_for(pid), secret).unwrap();
+    
     let key = "sk-jai-integration-test-0000000000000000";
     db.with(|c| {
         store::gw_key_rotate(c, key, Some("test"))?;
@@ -247,6 +247,7 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
     Fixture {
         port,
         key: key.to_string(),
+        db,
         _keepalive: (stop_tx, guard),
     }
 }
@@ -355,6 +356,17 @@ async fn openai_to_gemini_stream() {
     assert!(text.contains("data: "), "应为 SSE 流");
     assert!(text.contains("[DONE]"), "应以 [DONE] 结束");
     assert!(text.contains("\"content\""), "含文本增量");
+
+    // 转换流式路径：结束时透传 IR 累计的 usage 落日志
+    // （gemini mock 流式 Finish 携带 promptTokenCount=3 / candidatesTokenCount=2）
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await; // 等后台日志管道落库
+    let rows = gateway_core::store::logs::logs_recent(&fx.db, 5).unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.is_stream && r.provider_id.is_some())
+        .expect("流式请求应落日志");
+    assert_eq!(row.usage_input, Some(3), "转换流式 usage_input 应来自 IR Finish");
+    assert_eq!(row.usage_output, Some(2), "转换流式 usage_output 应来自 IR Finish");
 }
 
 #[tokio::test(flavor = "multi_thread")]

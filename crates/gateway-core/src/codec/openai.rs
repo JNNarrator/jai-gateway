@@ -34,13 +34,18 @@ pub fn peek(body: &[u8]) -> Result<PeekRequest, String> {
 
 /// 流式字节中的 usage 抽取器。
 ///
-/// 策略：滚动缓冲区搜索 `"usage"` 关键字 → 定位首个 `{` → 括号配对（感知字符串）
-/// 截取完整对象 → 首次命中即锁定。非流式响应可整体 feed 后调 [`Self::finish`]。
+/// 策略：滚动缓冲区搜索 `"usage"` 关键字 → 判定其后的值（对象/`null`/标量）→
+/// 对象则括号配对（感知字符串）截取完整对象 → 首次命中即锁定。
+/// 判定可跨 feed 悬挂（`"usage"` 在上一块末尾、值在下一块），上限
+/// [`KEY_WAIT_LIMIT`] 字节内仍无判定则放弃该关键字。
+/// 非流式响应可整体 feed 后调 [`Self::finish`]。
 #[derive(Default)]
 pub struct UsageScanner {
     buf: Vec<u8>,
     scan_from: usize,
     collect_start: Option<usize>, // Some(i): 正在收集，i 为 '{' 在 buf 内位置
+    /// Some(key_end): 已命中 `"usage"` 关键字、等待值判定（key_end = 关键字末尾偏移）
+    pending_key: Option<usize>,
     depth: usize,
     in_string: bool,
     escaped: bool,
@@ -49,6 +54,19 @@ pub struct UsageScanner {
 
 const WINDOW_KEEP: usize = 4096;
 const CAPTURE_CAP: usize = 8192;
+/// `"usage"` 后值判定窗口：64 字节内既无 `{` 也无 `null` 则放弃（合法 JSON 中
+/// `"usage"` 与其值之间只有 `:` 和空白，64 字节足够宽裕）。
+const KEY_WAIT_LIMIT: usize = 64;
+
+/// 关键字后值判定的三种去向。
+enum Decision {
+    /// 值是对象，`usize` = '{' 在 buf 内的位置，开始配对收集
+    Collect(usize),
+    /// 值是 `null`/标量/数组 → 跳过该关键字继续扫描
+    Skip,
+    /// 窗口未满但缓冲耗尽 → 保持悬挂等下个 feed
+    Wait,
+}
 
 impl UsageScanner {
     pub fn new() -> Self {
@@ -61,7 +79,6 @@ impl UsageScanner {
         loop {
             // 收集中：推进括号配对
             if let Some(start) = self.collect_start {
-                let had_progress = self.scan_from < self.buf.len();
                 while self.scan_from < self.buf.len() {
                     let b = self.buf[self.scan_from];
                     self.scan_from += 1;
@@ -95,11 +112,33 @@ impl UsageScanner {
                     // 异常保护：目标对象过大，放弃本次捕获
                     self.reset_collection();
                 }
-                if self.collect_start.is_some() && !had_progress {
-                    // 本次没有新增可消费字节且仍未结束：等待下一个 chunk
-                }
                 self.compact();
                 return;
+            }
+
+            // 悬挂判定：此前命中了 "usage" 关键字，现在继续判定其后的值
+            if let Some(key_end) = self.pending_key {
+                match self.decide_after_key(key_end) {
+                    Decision::Collect(brace_at) => {
+                        self.pending_key = None;
+                        self.collect_start = Some(brace_at);
+                        self.scan_from = brace_at;
+                        self.depth = 0;
+                        self.in_string = false;
+                        self.escaped = false;
+                        continue; // 同一 feed 内立即开始收集
+                    }
+                    Decision::Skip => {
+                        // "usage":null（或标量）——显式跳过该关键字，继续找下一个
+                        self.pending_key = None;
+                        continue;
+                    }
+                    Decision::Wait => {
+                        // 跨 feed 悬挂：线索保持，下个 feed 从关键字后继续判定
+                        self.compact();
+                        return;
+                    }
+                }
             }
 
             // 寻找下一个 "usage" 关键字
@@ -108,27 +147,39 @@ impl UsageScanner {
                 b"\"usage\"",
             ) {
                 let key_at = self.scan_from + pos;
-                self.scan_from = key_at + b"\"usage\"".len();
-                if let Some(rel_brace) = self.buf[self.scan_from..]
-                    .iter()
-                    .take(32)
-                    .position(|&b| b == b'{')
-                {
-                    let brace_at = self.scan_from + rel_brace;
-                    self.collect_start = Some(brace_at);
-                    self.scan_from = brace_at;
-                    self.depth = 0;
-                    self.in_string = false;
-                    self.escaped = false;
-                    continue; // 同一 feed 内立即开始收集
-                }
-            } else {
-                // 未找到：保留窗口尾部以处理跨块分割的关键字
-                self.scan_from = self.buf.len().saturating_sub(24);
+                let key_end = key_at + b"\"usage\"".len();
+                self.scan_from = key_end;
+                self.pending_key = Some(key_end);
+                continue; // 立即尝试判定
             }
+            // 未找到：保留窗口尾部以处理跨块分割的关键字
+            self.scan_from = self.buf.len().saturating_sub(24);
             self.compact();
             return;
         }
+    }
+
+    /// 判定 `"usage"` 关键字后的值：对象 → Collect；`null`/标量 → Skip；
+    /// 缓冲耗尽 → Wait；窗口上限耗尽仍无判定 → Skip（病态输入保护）。
+    fn decide_after_key(&self, key_end: usize) -> Decision {
+        let start = key_end.min(self.buf.len());
+        let limit = start + KEY_WAIT_LIMIT;
+        let mut i = start;
+        while i < self.buf.len() {
+            if i >= limit {
+                return Decision::Skip;
+            }
+            let b = self.buf[i];
+            match b {
+                // 值前的分隔符：`:` 与空白
+                b' ' | b'\t' | b'\n' | b'\r' | b':' => i += 1,
+                b'{' => return Decision::Collect(i),
+                b'n' if self.buf[i..].starts_with(b"null") => return Decision::Skip,
+                // 数字/引号/数组等：OpenAI usage 恒为对象，非对象即误报
+                _ => return Decision::Skip,
+            }
+        }
+        Decision::Wait
     }
 
     /// 全部输入结束后取结果并尝试解析为 JSON。
@@ -155,6 +206,9 @@ impl UsageScanner {
         self.scan_from = self.scan_from.saturating_sub(cut);
         if let Some(s) = self.collect_start.as_mut() {
             *s = s.saturating_sub(cut);
+        }
+        if let Some(p) = self.pending_key.as_mut() {
+            *p = p.saturating_sub(cut);
         }
     }
 }
@@ -1043,6 +1097,80 @@ mod tests {
         s.feed(body);
         let v = s.finish().unwrap();
         assert_eq!(v["output_tokens"], 9);
+    }
+
+    /// 回归（2026-09-02 实测）：glm-5.3-flash 中转流含 17 个 `"usage":null` +
+    /// 末尾完整 usage 帧（prompt 13 / completion 16），旧状态机会在 null 处
+    /// 误触发/丢线索导致恒空。整段 feed 必须取出末尾 usage。
+    #[test]
+    fn scanner_glm_stream_with_null_usages() {
+        let null_frame = |content: &str| {
+            format!(
+                "data: {{\"id\":\"c1\",\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}},\"index\":0}}],\"usage\":null}}\n\n"
+            )
+        };
+        let mut s = UsageScanner::new();
+        s.feed(b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}],\"usage\":null}\n\n");
+        for i in 0..17 {
+            s.feed(null_frame(&format!("字{i}")).as_bytes());
+        }
+        s.feed(b"data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":16,\"total_tokens\":29}}\n\n");
+        s.feed(b"data: [DONE]\n\n");
+        let v = s.finish().expect("null 群后末尾 usage 应被捕获");
+        assert_eq!(v["prompt_tokens"], 13);
+        assert_eq!(v["completion_tokens"], 16);
+    }
+
+    /// 同一流按 1 字节粒度逐块喂入（最恶劣切分），跨 feed 悬挂判定必须保持线索。
+    #[test]
+    fn scanner_glm_stream_byte_by_byte() {
+        let null_frame = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}],\"usage\":null}\n\n";
+        let mut body = String::new();
+        for _ in 0..17 {
+            body.push_str(null_frame);
+        }
+        body.push_str(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":16}}\n\n",
+        );
+        body.push_str("data: [DONE]\n\n");
+
+        let mut s = UsageScanner::new();
+        for b in body.as_bytes() {
+            s.feed(std::slice::from_ref(b));
+        }
+        let v = s.finish().expect("逐字节喂入也应捕获 usage");
+        assert_eq!(v["prompt_tokens"], 13);
+        assert_eq!(v["completion_tokens"], 16);
+    }
+
+    /// 关键字在块末尾截断、值在下块开头（`"usage"` 跨 feed 分割 + 值跨 feed 分割）。
+    #[test]
+    fn scanner_usage_key_and_value_split_across_feeds() {
+        let mut s = UsageScanner::new();
+        s.feed(br#"data: {"id":"x","usage"#);
+        s.feed(br#"":null,"usage""#);
+        s.feed(br#": {"prompt_to"#);
+        s.feed(br#"kens":5,"completion_tokens":6}}"#);
+        s.feed(b"\n\ndata: [DONE]\n\n");
+        let v = s.finish().expect("跨 feed 悬挂应保持线索直至取值");
+        assert_eq!(v["prompt_tokens"], 5);
+        assert_eq!(v["completion_tokens"], 6);
+    }
+
+    /// usage 值紧跟关键字在同块但窗口极限（59 字节空白）也能判定；
+    /// 超过 KEY_WAIT_LIMIT 仍无值则放弃该关键字（病态输入保护）。
+    #[test]
+    fn scanner_key_wait_limit_protection() {
+        // 窗口内可判定：59 个空白 + '{'（64 上限内）
+        let mut s = UsageScanner::new();
+        s.feed(format!("data: {{\"usage\":{}{{\"prompt_tokens\":1,\"completion_tokens\":2}}}}", " ".repeat(59)).as_bytes());
+        let v = s.finish().expect("上限内空白应仍可判定");
+        assert_eq!(v["prompt_tokens"], 1);
+
+        // 超限：70 个空白后才是 '{' —— 该关键字被放弃，不误收集
+        let mut s2 = UsageScanner::new();
+        s2.feed(format!("data: {{\"usage\":{}{{\"evil\":1}}", " ".repeat(70)).as_bytes());
+        assert!(s2.finish().is_none(), "超窗口的病态输入应被放弃");
     }
 
     #[test]

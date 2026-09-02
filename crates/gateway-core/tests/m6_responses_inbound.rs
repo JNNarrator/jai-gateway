@@ -14,7 +14,6 @@ use axum::routing::post;
 use axum::Router;
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
-use gateway_core::vault;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------- mock 上游
@@ -128,7 +127,6 @@ impl Fixture {
 }
 
 async fn fixture(mode: &'static str) -> Fixture {
-    vault::testing::set_mock_default();
     let up_port = spawn_openai_mock(mode).await;
 
     let (db, main_path) = {
@@ -160,7 +158,8 @@ async fn fixture(mode: &'static str) -> Fixture {
                 priority: 1,
                 weight: 1,
                 extra_headers: None,
-                keyring_ref: vault::ref_for("p-oai"),
+                api_key: Some("sk-oai".into()),
+                website: None,
                 last_ok_at: None,
                 last_err_at: None,
                 last_err_msg: None,
@@ -172,7 +171,7 @@ async fn fixture(mode: &'static str) -> Fixture {
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
-    vault::set_secret(&vault::ref_for("p-oai"), "sk-oai").unwrap();
+    
     let key = "sk-jai-integration-test-0000000000000000";
     db.with(|c| {
         store::gw_key_rotate(c, key, Some("test"))?;

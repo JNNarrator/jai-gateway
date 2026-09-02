@@ -110,9 +110,11 @@ pub struct ProviderRow {
     pub priority: i64,
     pub weight: i64,
     pub extra_headers: Option<String>,
-    /// keyring 引用：服务端内部使用；序列化到 UI 的 DTO 必须剔除
+    /// 上游凭据明文（0006 起入库）；None = 未录入。序列化到 UI 的 DTO 必须剔除
     #[serde(skip_serializing)]
-    pub keyring_ref: String,
+    pub api_key: Option<String>,
+    /// 供应商官网（可空）
+    pub website: Option<String>,
     pub last_ok_at: Option<i64>,
     pub last_err_at: Option<i64>,
     pub last_err_msg: Option<String>,
@@ -134,7 +136,7 @@ pub struct ModelRow {
 
 // ================================================================ providers
 
-const PROVIDER_COLS: &str = "id,name,base_url,family,enabled,priority,weight,extra_headers,keyring_ref,last_ok_at,last_err_at,last_err_msg,created_at,updated_at";
+const PROVIDER_COLS: &str = "id,name,base_url,family,enabled,priority,weight,extra_headers,api_key,website,last_ok_at,last_err_at,last_err_msg,created_at,updated_at";
 
 fn row_to_provider(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
     Ok(ProviderRow {
@@ -146,12 +148,13 @@ fn row_to_provider(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
         priority: r.get(5)?,
         weight: r.get(6)?,
         extra_headers: r.get(7)?,
-        keyring_ref: r.get(8)?,
-        last_ok_at: r.get(9)?,
-        last_err_at: r.get(10)?,
-        last_err_msg: r.get(11)?,
-        created_at: r.get(12)?,
-        updated_at: r.get(13)?,
+        api_key: r.get(8)?,
+        website: r.get(9)?,
+        last_ok_at: r.get(10)?,
+        last_err_at: r.get(11)?,
+        last_err_msg: r.get(12)?,
+        created_at: r.get(13)?,
+        updated_at: r.get(14)?,
     })
 }
 
@@ -170,7 +173,7 @@ fn row_to_model(r: &rusqlite::Row) -> rusqlite::Result<ModelRow> {
 pub fn provider_insert(c: &Connection, p: &ProviderRow) -> Result<(), StoreError> {
     c.execute(
         &format!(
-            "INSERT INTO providers({PROVIDER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
+            "INSERT INTO providers({PROVIDER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"
         ),
         params![
             p.id,
@@ -181,7 +184,8 @@ pub fn provider_insert(c: &Connection, p: &ProviderRow) -> Result<(), StoreError
             p.priority,
             p.weight,
             p.extra_headers,
-            p.keyring_ref,
+            p.api_key,
+            p.website,
             p.last_ok_at,
             p.last_err_at,
             p.last_err_msg,
@@ -267,6 +271,32 @@ pub fn provider_set_enabled(c: &Connection, id: &str, enabled: bool) -> Result<(
     c.execute(
         "UPDATE providers SET enabled=?1, updated_at=?2 WHERE id=?3",
         params![enabled as i64, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// 覆盖上游凭据（明文入库，0006 起）。`None` 表示清空。
+pub fn provider_set_api_key(
+    c: &Connection,
+    id: &str,
+    api_key: Option<&str>,
+) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE providers SET api_key=?1, updated_at=?2 WHERE id=?3",
+        params![api_key.filter(|s| !s.is_empty()), now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// 覆盖官网地址。`None` 表示清空。
+pub fn provider_set_website(
+    c: &Connection,
+    id: &str,
+    website: Option<&str>,
+) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE providers SET website=?1, updated_at=?2 WHERE id=?3",
+        params![website.filter(|s| !s.is_empty()), now_ms(), id],
     )?;
     Ok(())
 }
@@ -396,7 +426,10 @@ pub struct RouteCandidate {
     pub base_url: String,
     pub family: String,
     pub extra_headers: Option<String>,
-    pub keyring_ref: String,
+    /// 上游凭据明文（0006 起随行携带，转发直接取用）
+    pub api_key: Option<String>,
+    /// 供应商官网（可空）
+    pub website: Option<String>,
     pub upstream_model_id: Option<String>,
     pub max_output_tokens: i64,
     /// 高级路由：供应商权重（同 priority 内加权随机打散）
@@ -411,7 +444,7 @@ pub fn route_candidates(
     model_name: &str,
 ) -> Result<Vec<RouteCandidate>, StoreError> {
     let sql = "SELECT p.id, p.name, p.priority, p.base_url, p.family, p.extra_headers,
-                p.keyring_ref, m.upstream_model_id, m.max_output_tokens, p.weight,
+                p.api_key, p.website, m.upstream_model_id, m.max_output_tokens, p.weight,
                 p.last_ok_at, p.last_err_at
          FROM models m JOIN providers p ON p.id = m.provider_id
          WHERE m.model_name = ?1 AND m.enabled = 1 AND p.enabled = 1
@@ -426,12 +459,13 @@ pub fn route_candidates(
                 base_url: r.get(3)?,
                 family: r.get(4)?,
                 extra_headers: r.get(5)?,
-                keyring_ref: r.get(6)?,
-                upstream_model_id: r.get(7)?,
-                max_output_tokens: r.get(8)?,
-                weight: r.get(9)?,
-                last_ok_at: r.get(10)?,
-                last_err_at: r.get(11)?,
+                api_key: r.get(6)?,
+                website: r.get(7)?,
+                upstream_model_id: r.get(8)?,
+                max_output_tokens: r.get(9)?,
+                weight: r.get(10)?,
+                last_ok_at: r.get(11)?,
+                last_err_at: r.get(12)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -975,7 +1009,7 @@ fn tokenize_cli(text: &str) -> Vec<String> {
         match c {
             '\'' | '"' => {
                 in_token = true;
-                while let Some(ch) = chars.next() {
+                for ch in chars.by_ref() {
                     if ch == c {
                         break;
                     }

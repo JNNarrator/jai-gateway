@@ -8,7 +8,6 @@
 //!
 //! 本模块保持纯函数化：分类逻辑可单测，不依赖 axum/reqwest 具体类型。
 
-use crate::codec::Family;
 use crate::store::RouteCandidate as StoreRouteCandidate;
 
 /// 健康冷却窗口：最近失败后在该窗口内视为不健康，会被排到同优先级健康渠道之后。
@@ -156,19 +155,6 @@ pub fn client_lost() -> AttemptVerdict {
     }
 }
 
-/// 单个候选渠道（store 层 JOIN 结果的行视图，剔除 DB 细节）。
-#[derive(Debug, Clone)]
-pub struct RouteCandidate {
-    pub provider_id: String,
-    pub provider_name: String,
-    pub base_url: String,
-    pub family: Family,
-    pub extra_headers: Option<String>,
-    pub keyring_ref: String,
-    pub upstream_model_id: Option<String>,
-    pub max_output_tokens: i64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,7 +246,8 @@ mod tests {
             base_url: format!("http://{id}"),
             family: "openai_compat".into(),
             extra_headers: None,
-            keyring_ref: format!("jai/provider/{id}"),
+            api_key: Some("sk-test".into()),
+            website: None,
             upstream_model_id: None,
             max_output_tokens: 4096,
             weight,

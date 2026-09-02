@@ -1,23 +1,27 @@
-//! OS 密钥环封装 —— storage §4 生命周期。
+//! 钥匙串退场 —— 0006 起凭据明文入库，本模块只剩一次性存量迁移。
 //!
-//! service 固定 "JAI"，account = `provider/{uuid}`。DB 只存引用地址。
-//!
-//! 降级策略（bug 清单 #1）：
-//! 受限环境（沙箱/CI/无钥匙串权限）默认密钥环不可用时，自动切换到
-//! 数据目录下的 `vault_fallback.json`（Unix 0600）。UI 可显示存储类型。
+//! 运行时对系统钥匙串的访问仅此一处（首次启动迁移，可能弹最后一次授权框）；
+//! 此后启动、转发、导入导出均零钥匙串访问。下个版本可随 keyring crate 一并删除。
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-
+use crate::store::{meta_get, meta_set, StoreError};
 use thiserror::Error;
 
 pub const SERVICE: &str = "JAI";
 
+/// 存量迁移标记位（meta.keyring_migrated = "1"）。
+const MIGRATED_FLAG: &str = "keyring_migrated";
+
+#[derive(Debug, Error)]
+pub enum VaultError {
+    #[error("keyring: {0}")]
+    Keyring(#[from] keyring::Error),
+    #[error("db: {0}")]
+    Db(String),
+}
+
 /// 测试工具：内存 keyring mock（keyring crate 的全局默认 builder 注入）。
 ///
-/// 集成测试与单元测试共用；`set_mock_default()` 后所有 `Entry::new`
-/// 都落到内存存储，不触碰真实系统凭据。
+/// 仅供 `migrate_keyring_secrets` 的迁移单测使用，不触碰真实系统凭据。
 #[doc(hidden)]
 pub mod testing {
     use std::collections::HashMap;
@@ -94,210 +98,202 @@ pub mod testing {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum VaultError {
-    #[error("keyring: {0}")]
-    Keyring(#[from] keyring::Error),
-    #[error("file vault: {0}")]
-    File(String),
-}
-
-/// 文件降级存储的底层读写（可独立测试；`MODE` 全局只能初始化一次）。
-#[derive(Debug, Clone)]
-pub struct FileVault(pub PathBuf);
-
-impl FileVault {
-    pub fn read_map(&self) -> Result<HashMap<String, String>, VaultError> {
-        let text = std::fs::read_to_string(&self.0).map_err(|e| VaultError::File(e.to_string()))?;
-        serde_json::from_str(&text).map_err(|e| VaultError::File(format!("解析失败: {e}")))
-    }
-
-    pub fn write_map(&self, map: &HashMap<String, String>) -> Result<(), VaultError> {
-        let text = serde_json::to_string_pretty(map)
-            .map_err(|e| VaultError::File(format!("序列化失败: {e}")))?;
-        std::fs::write(&self.0, text).map_err(|e| VaultError::File(e.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
-    }
-
-    pub fn set(&self, ref_: &str, secret: &str) -> Result<(), VaultError> {
-        let mut map = self.read_map()?;
-        map.insert(ref_.to_string(), secret.to_string());
-        self.write_map(&map)
-    }
-
-    pub fn get(&self, ref_: &str) -> Result<Option<String>, VaultError> {
-        let map = self.read_map()?;
-        Ok(map.get(ref_).cloned())
-    }
-
-    pub fn delete(&self, ref_: &str) -> Result<(), VaultError> {
-        let mut map = self.read_map()?;
-        map.remove(ref_);
-        self.write_map(&map)
-    }
-}
-
-#[derive(Clone, Debug)]
-enum VaultMode {
-    Keyring,
-    File(FileVault),
-}
-
-static MODE: OnceLock<VaultMode> = OnceLock::new();
-
-fn mode() -> &'static VaultMode {
-    MODE.get().unwrap_or(&VaultMode::Keyring)
-}
-
-pub fn ref_for(provider_id: &str) -> String {
+fn provider_account(provider_id: &str) -> String {
     format!("jai/provider/{provider_id}")
 }
 
-fn entry(account: &str) -> Result<keyring::Entry, VaultError> {
-    Ok(keyring::Entry::new(SERVICE, account)?)
+/// keyring 读：None = 条目不存在。
+fn get_secret(account: &str) -> Result<Option<String>, VaultError> {
+    match keyring::Entry::new(SERVICE, account)?.get_password() {
+        Ok(s) => Ok(Some(s)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
-fn is_keyring_unavailable(e: &keyring::Error) -> bool {
-    matches!(
-        e,
-        keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_)
-    )
+/// keyring 删：条目不存在视为成功（幂等）。
+fn delete_secret(account: &str) -> Result<(), VaultError> {
+    match keyring::Entry::new(SERVICE, account)?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
-/// 数据目录初始化：探测系统密钥环；不可用时切换到文件降级。
-/// 必须在任何 set/get/delete 之前调用一次（Docker/CI/沙箱友好）。
-pub fn init(data_dir: &Path) -> Result<(), VaultError> {
-    if MODE.get().is_some() {
+/// 用户实例的 WebDAV 根地址切换为 https（用户确认的一次性改写）。
+const WEBDAV_HTTPS_HOST: &str = "http://jn_file.88933.vip";
+const WEBDAV_HTTPS_HOST_TO: &str = "https://jn_file.88933.vip";
+
+/// 存量密钥迁移（Rust 侧一次性，0006 之后启动时调用）：
+/// 1. meta 标记位已置 → 直接返回（幂等，也顺带跳过 https 改写之外的一切）
+/// 2. 逐个读钥匙串 `jai/provider/{id}` → 写 providers.api_key；`jai/webdav` → meta.webdav_password
+/// 3. 删除对应钥匙串项
+/// 4. 置标记位
+///
+/// 钥匙串读取**不持 DB 锁**（授权弹框可能等待用户输入数秒甚至更久，
+/// 持锁会拖死 UI）；每条凭据读取后再短暂拿锁落库。
+/// 任一钥匙串读取失败（NoEntry）不阻塞迁移——该项无凭据或已清理；
+/// 删除凭据失败也尽力继续（不影响新路径运行）。
+/// 迁移完成后**永不**再访问钥匙串。
+pub fn migrate_keyring_secrets(db: &crate::store::Db) -> Result<(), VaultError> {
+    // ---- 锁内阶段 1：https 改写 + 标记位检查 + 收集 provider ids ----
+    let (migrated, provider_ids) = db
+        .with(|c| -> Result<(bool, Vec<String>), StoreError> {
+            // 用户实例的 WebDAV http→https 改写与标记位无关，单独判定（未配置则无操作）
+            if let Some(url) = meta_get(c, "webdav_url")? {
+                if url.trim_end_matches('/') == WEBDAV_HTTPS_HOST && url.starts_with("http://") {
+                    let tail = if url.ends_with('/') { "/" } else { "" };
+                    meta_set(c, "webdav_url", &format!("{WEBDAV_HTTPS_HOST_TO}{tail}"))?;
+                }
+            }
+            let migrated = meta_get(c, MIGRATED_FLAG)?
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let ids: Vec<String> = {
+                let mut stmt = c.prepare("SELECT id FROM providers ORDER BY created_at")?;
+                let it = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                it.collect::<Result<Vec<_>, _>>()?
+            };
+            Ok((migrated, ids))
+        })
+        .map_err(|e| VaultError::Db(e.to_string()))?;
+    if migrated {
         return Ok(());
     }
 
-    match probe_keyring() {
-        Ok(()) => {
-            let _ = MODE.set(VaultMode::Keyring);
-            Ok(())
-        }
-        Err(VaultError::Keyring(ke)) if is_keyring_unavailable(&ke) => {
-            let dir = data_dir.to_path_buf();
-            std::fs::create_dir_all(&dir).map_err(|e| VaultError::File(e.to_string()))?;
-            let path = dir.join("vault_fallback.json");
-            if !path.exists() {
-                FileVault(path.clone()).write_map(&HashMap::new())?;
+    // ---- 无锁阶段 2：逐个读钥匙串（此处可能弹授权框），逐条短暂持锁落库 ----
+    // 供应商凭据：id 即 keyring account 尾段（旧 ref_for 拼接规则）
+    for id in provider_ids {
+        let account = provider_account(&id);
+        match get_secret(&account) {
+            Ok(Some(secret)) => {
+                if let Err(e) =
+                    db.with(|c| crate::store::provider_set_api_key(c, &id, Some(&secret)))
+                {
+                    eprintln!("[vault] 迁移写入 {account} 失败(跳过): {e}");
+                }
             }
-            let _ = MODE.set(VaultMode::File(FileVault(path)));
-            println!(
-                "[vault] 系统密钥环不可用({ke})，已降级为文件存储: {}",
-                data_dir.join("vault_fallback.json").display()
-            );
-            Ok(())
+            Ok(None) => {}
+            Err(e) => eprintln!("[vault] 迁移读取 {account} 失败(跳过): {e}"),
         }
-        Err(e) => Err(e),
+        // 凭据已入库（或本就不存在），钥匙串项一律清除
+        if let Err(e) = delete_secret(&account) {
+            eprintln!("[vault] 迁移删除 {account} 失败(忽略): {e}");
+        }
     }
-}
 
-/// 当前凭据存储类型：`keyring` / `file`。
-pub fn storage_kind() -> &'static str {
-    match mode() {
-        VaultMode::Keyring => "keyring",
-        VaultMode::File(_) => "file",
+    // WebDAV 密码
+    match get_secret("jai/webdav") {
+        Ok(Some(pw)) => {
+            if let Err(e) = db.with(|c| meta_set(c, "webdav_password", &pw)) {
+                eprintln!("[vault] 迁移写入 webdav_password 失败(跳过): {e}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("[vault] 迁移读取 jai/webdav 失败(跳过): {e}"),
     }
-}
+    if let Err(e) = delete_secret("jai/webdav") {
+        eprintln!("[vault] 迁移删除 jai/webdav 失败(忽略): {e}");
+    }
 
-fn probe_keyring() -> Result<(), VaultError> {
-    let acct = "jai/self-probe";
-    let e = entry(acct)?;
-    e.set_password("probe-value")?;
-    let got = e.get_password()?;
-    debug_assert_eq!(got, "probe-value");
-    let _ = e.delete_credential();
+    // ---- 锁内阶段 3：置标记位 ----
+    db.with(|c| meta_set(c, MIGRATED_FLAG, "1"))
+        .map_err(|e| VaultError::Db(e.to_string()))?;
+    println!("[vault] 钥匙串存量迁移完成，此后不再访问系统钥匙串");
     Ok(())
-}
-
-/// 启动探测：set/get/delete 三连。storage §4 ——
-/// 密钥环不可用的环境在添加供应商之前拦截。
-pub fn probe() -> Result<(), VaultError> {
-    match mode() {
-        VaultMode::Keyring => probe_keyring(),
-        VaultMode::File(_) => Ok(()),
-    }
-}
-
-pub fn set_secret(ref_: &str, secret: &str) -> Result<(), VaultError> {
-    match mode() {
-        VaultMode::Keyring => {
-            entry(ref_)?.set_password(secret)?;
-            Ok(())
-        }
-        VaultMode::File(v) => v.set(ref_, secret),
-    }
-}
-
-/// None = 条目不存在。
-pub fn get_secret(ref_: &str) -> Result<Option<String>, VaultError> {
-    match mode() {
-        VaultMode::Keyring => match entry(ref_)?.get_password() {
-            Ok(s) => Ok(Some(s)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(e.into()),
-        },
-        VaultMode::File(v) => v.get(ref_),
-    }
-}
-
-/// 尽力删除：条目不存在视为成功（幂等）。
-pub fn delete_secret(ref_: &str) -> Result<(), VaultError> {
-    match mode() {
-        VaultMode::Keyring => match entry(ref_)?.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e.into()),
-        },
-        VaultMode::File(v) => v.delete(ref_),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    // CI/测试环境统一走共享 mock 平台（不写真实钥匙串）
+    /// mock keyring 是进程级全局（builder 替换 + 共享存储），本组测试必须串行。
+    static KEYRING_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
-    fn roundtrip_on_mock_backend() {
+    fn migrates_provider_and_webdav_secrets_then_deletes_keyring() {
+        let _guard = KEYRING_TEST_LOCK.lock().unwrap();
         testing::set_mock_default();
-        let r = ref_for("test-provider");
-        assert!(get_secret(&r).unwrap().is_none());
-        set_secret(&r, "sk-upstream-xyz").unwrap();
-        assert_eq!(get_secret(&r).unwrap().as_deref(), Some("sk-upstream-xyz"));
-        delete_secret(&r).unwrap();
-        assert!(get_secret(&r).unwrap().is_none());
-        delete_secret(&r).unwrap(); // 幂等
+        let db = crate::store::Db::in_memory().unwrap();
+        let now = crate::store::now_ms();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO providers(id,name,base_url,family,enabled,priority,weight,created_at,updated_at)
+                 VALUES ('p1','A','https://api.a.com/v1','openai_compat',1,100,1,?1,?1),
+                        ('p2','B','https://api.b.com/v1','openai_compat',1,100,1,?1,?1)",
+                rusqlite::params![now],
+            )
+            .map_err(crate::store::StoreError::Sqlite)
+        })
+        .unwrap();
+        testing::set(&provider_account("p1"), "sk-upstream-1").unwrap();
+        testing::set("jai/webdav", "dav-pass").unwrap();
+
+        migrate_keyring_secrets(&db).unwrap();
+
+        let row = db.with(|c| crate::store::provider_get(c, "p1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.api_key.as_deref(), Some("sk-upstream-1"));
+        let row2 = db.with(|c| crate::store::provider_get(c, "p2"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row2.api_key, None, "无钥匙串凭据的供应商保持 None");
+        assert_eq!(
+            db.with(|c| meta_get(c, "webdav_password"))
+                .unwrap()
+                .as_deref(),
+            Some("dav-pass")
+        );
+        // 钥匙串项已删除
+        assert!(get_secret(&provider_account("p1")).unwrap().is_none());
+        assert!(get_secret("jai/webdav").unwrap().is_none());
+        // 标记位已置
+        assert_eq!(
+            db.with(|c| meta_get(c, MIGRATED_FLAG)).unwrap().as_deref(),
+            Some("1")
+        );
     }
 
     #[test]
-    fn file_vault_roundtrip_and_permissions() {
-        let dir = std::env::temp_dir().join(format!("jai-vault-file-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("vault_fallback.json");
-        let v = FileVault(path.clone());
-        v.write_map(&HashMap::new()).unwrap();
+    fn migration_is_idempotent_via_flag() {
+        let _guard = KEYRING_TEST_LOCK.lock().unwrap();
+        testing::set_mock_default();
+        let db = crate::store::Db::in_memory().unwrap();
+        let now = crate::store::now_ms();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO providers(id,name,base_url,family,enabled,priority,weight,created_at,updated_at)
+                 VALUES ('p-idem','A','https://api.a.com/v1','openai_compat',1,100,1,?1,?1)",
+                rusqlite::params![now],
+            )
+            .map_err(crate::store::StoreError::Sqlite)
+        })
+        .unwrap();
+        testing::set(&provider_account("p-idem"), "sk-first").unwrap();
+        migrate_keyring_secrets(&db).unwrap();
 
-        v.set("jai/provider/x", "shh").unwrap();
-        assert_eq!(v.get("jai/provider/x").unwrap().as_deref(), Some("shh"));
-        v.delete("jai/provider/x").unwrap();
-        assert_eq!(v.get("jai/provider/x").unwrap(), None);
-        v.delete("jai/provider/x").unwrap(); // 幂等
+        // 标记位已置：即使钥匙串出现新值也不再读取
+        testing::set(&provider_account("p-idem"), "sk-second").unwrap();
+        migrate_keyring_secrets(&db).unwrap();
+        let row = db.with(|c| crate::store::provider_get(c, "p-idem"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.api_key.as_deref(), Some("sk-first"));
+    }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "文件降级存储必须 0600 权限");
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn rewrites_webdav_url_to_https_even_when_migrated() {
+        let _guard = KEYRING_TEST_LOCK.lock().unwrap();
+        testing::set_mock_default();
+        let db = crate::store::Db::in_memory().unwrap();
+        db.with(|c| meta_set(c, "webdav_url", "http://jn_file.88933.vip/")).unwrap();
+        db.with(|c| meta_set(c, MIGRATED_FLAG, "1")).unwrap();
+        migrate_keyring_secrets(&db).unwrap();
+        assert_eq!(
+            db.with(|c| meta_get(c, "webdav_url")).unwrap().as_deref(),
+            Some("https://jn_file.88933.vip/")
+        );
     }
 }

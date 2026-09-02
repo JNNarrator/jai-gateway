@@ -14,7 +14,6 @@ use axum::routing::post;
 use axum::Router;
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
-use gateway_core::vault;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
@@ -215,7 +214,6 @@ impl Fixture {
 }
 
 async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
-    vault::testing::set_mock_default();
     let (up_port, tool_capture) = if family == "openai_compat" {
         let (p, c) = spawn_openai_mock(upstream_mode).await;
         (p, Some(c))
@@ -258,7 +256,8 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
                 priority: 1,
                 weight: 1,
                 extra_headers: None,
-                keyring_ref: vault::ref_for(pid),
+                api_key: Some(secret.to_string()),
+                website: None,
                 last_ok_at: None,
                 last_err_at: None,
                 last_err_msg: None,
@@ -270,7 +269,7 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
-    vault::set_secret(&vault::ref_for(pid), secret).unwrap();
+    
     let key = "sk-jai-integration-test-0000000000000000";
     db.with(|c| {
         store::gw_key_rotate(c, key, Some("test"))?;

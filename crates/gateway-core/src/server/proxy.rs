@@ -28,7 +28,6 @@ use crate::codec::openai::{error_body, extract_usage, peek, url_join, PeekReques
 use crate::router::{self, AttemptVerdict};
 use crate::store::logs::LogEvent;
 use crate::store::{self, Db};
-use crate::vault;
 
 use super::ratelimit::BanStatus;
 use super::security::{self, CorsAllowlist};
@@ -848,62 +847,29 @@ async fn try_candidate(
     started: Instant,
 ) -> Attempt {
     // ---- 取上游密钥 ----
-    let secret = {
-        let ref_ = cand.keyring_ref.clone();
-        match tokio::task::spawn_blocking(move || vault::get_secret(&ref_)).await {
-            Ok(Ok(Some(k))) => k,
-            Ok(Ok(None)) => {
-                let msg = "密钥环中缺少该供应商凭据，请在设置中重新录入";
-                provider_mark_fail(&ctx.db, &cand.provider_id, msg);
-                emit_log(
-                    &ctx.logs,
-                    wire.log_family(),
-                    Some(peeked),
-                    Some(&cand.provider_id),
-                    None,
-                    500,
-                    ms_since(started),
-                    peeked.stream,
-                    None,
-                    Some("UpstreamAuth".into()),
-                    Some(msg.to_string()),
-                );
-                return Attempt::Failed {
-                    kind: "UpstreamAuth",
-                    summary: format!("{}：{msg}", cand.provider_name),
-                    last_http: None,
-                };
-            }
-            Ok(Err(e)) => {
-                let msg = format!("keyring 读取失败: {e}");
-                provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
-                emit_log(
-                    &ctx.logs,
-                    wire.log_family(),
-                    Some(peeked),
-                    Some(&cand.provider_id),
-                    None,
-                    500,
-                    ms_since(started),
-                    peeked.stream,
-                    None,
-                    Some("ProviderOther".into()),
-                    Some(msg.clone()),
-                );
-                return Attempt::Failed {
-                    kind: "ProviderOther",
-                    summary: format!("{}：{msg}", cand.provider_name),
-                    last_http: None,
-                };
-            }
-            Err(e) => {
-                eprintln!("[vault] join: {e}");
-                return Attempt::Failed {
-                    kind: "ProviderOther",
-                    summary: format!("{}：密钥环任务失败", cand.provider_name),
-                    last_http: None,
-                };
-            }
+    let secret = match cand.api_key.as_deref() {
+        Some(k) => k.to_string(),
+        None => {
+            let msg = "该供应商尚未录入 API Key，请在设置中补录";
+            provider_mark_fail(&ctx.db, &cand.provider_id, msg);
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                None,
+                500,
+                ms_since(started),
+                peeked.stream,
+                None,
+                Some("UpstreamAuth".into()),
+                Some(msg.to_string()),
+            );
+            return Attempt::Failed {
+                kind: "UpstreamAuth",
+                summary: format!("{}：{msg}", cand.provider_name),
+                last_http: None,
+            };
         }
     };
 
@@ -1271,36 +1237,16 @@ async fn try_converted_candidate(
 
     // 4) 取上游密钥并组装请求
     let (out, body_json) = auth_builder;
-    let secret = {
-        let ref_ = cand.keyring_ref.clone();
-        match tokio::task::spawn_blocking(move || vault::get_secret(&ref_)).await {
-            Ok(Ok(Some(k))) => k,
-            Ok(Ok(None)) => {
-                let msg = "密钥环中缺少该供应商凭据，请在设置中重新录入";
-                provider_mark_fail(&ctx.db, &cand.provider_id, msg);
-                return Attempt::Failed {
-                    kind: "UpstreamAuth",
-                    summary: format!("{}：{msg}", cand.provider_name),
-                    last_http: None,
-                };
-            }
-            Ok(Err(e)) => {
-                let msg = format!("keyring 读取失败: {e}");
-                provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
-                return Attempt::Failed {
-                    kind: "ProviderOther",
-                    summary: format!("{}：{msg}", cand.provider_name),
-                    last_http: None,
-                };
-            }
-            Err(e) => {
-                eprintln!("[vault] join: {e}");
-                return Attempt::Failed {
-                    kind: "ProviderOther",
-                    summary: format!("{}：密钥环任务失败", cand.provider_name),
-                    last_http: None,
-                };
-            }
+    let secret = match cand.api_key.as_deref() {
+        Some(k) => k.to_string(),
+        None => {
+            let msg = "该供应商尚未录入 API Key，请在设置中补录";
+            provider_mark_fail(&ctx.db, &cand.provider_id, msg);
+            return Attempt::Failed {
+                kind: "UpstreamAuth",
+                summary: format!("{}：{msg}", cand.provider_name),
+                last_http: None,
+            };
         }
     };
     let mut out_req = match cand.family.as_str() {
@@ -1719,6 +1665,8 @@ async fn convert_streaming_response(
         tokio::spawn(async move {
             let t0 = Instant::now();
             let mut line_buf: Vec<u8> = first_lines;
+            // IR 累计的 usage：Finish 事件携带，自然结束时透传落库（修复日志输入/输出恒空）
+            let mut last_usage: Option<crate::codec::ir::Usage> = None;
 
             // 解析并发送当前行缓冲（首字节可能已包含整个 SSE 流）
             macro_rules! drain_sse_lines {
@@ -1778,6 +1726,9 @@ async fn convert_streaming_response(
                             }
                         }
                         for ev in events {
+                            if let crate::codec::ir::StreamEvent::Finish { usage, .. } = &ev {
+                                last_usage = Some(usage.clone());
+                            }
                             for frame in render_frame(&mut renderer, &ev) {
                                 if tx.send(Ok(Bytes::from(frame))).await.is_err() {
                                     emit_log(
@@ -1864,6 +1815,15 @@ async fn convert_streaming_response(
                         } else {
                             let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
                         }
+                        // 结束时透传 IR 累计的 usage（此前硬编码 None 导致日志输入/输出恒空）
+                        let usage_json = last_usage.map(|u| {
+                            json!({
+                                "prompt_tokens": u.input_tokens,
+                                "completion_tokens": u.output_tokens,
+                                "cache_read_input_tokens": u.cache_read_tokens,
+                                "cache_creation_input_tokens": u.cache_write_tokens,
+                            })
+                        });
                         emit_log(
                             &ctx2.logs,
                             wire2.log_family(),
@@ -1873,7 +1833,7 @@ async fn convert_streaming_response(
                             status.as_u16() as i64,
                             ms_since(t0),
                             true,
-                            None,
+                            usage_json.as_ref(),
                             None,
                             None,
                         );

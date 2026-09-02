@@ -54,6 +54,7 @@ export function SyncPage() {
       .then((c) => {
         if (c) {
           setCfg(c);
+          setPw(c.password ?? "");
           setAutoPush({ enabled: c.autoPushEnabled, intervalMin: c.autoPushIntervalMin });
         }
       })
@@ -126,7 +127,8 @@ export function SyncPage() {
     try {
       await api.webdavConfigSet({ ...cfg, url: normalized, password: pw || null });
       setCfg({ ...cfg, url: normalized });
-      setPw("");
+      const saved = await api.webdavConfigGet().catch(() => null);
+      if (saved) setPw(saved.password ?? "");
       setMsg("WebDAV 连接配置已保存");
     } catch (e) {
       setErr(String(e));
@@ -301,7 +303,7 @@ export function SyncPage() {
               />
             </FormField>
             <FormField
-              label="密码（存入钥匙串，留空保持原密码）"
+              label="密码（明文入库并随配置同步，留空保持原密码）"
               htmlFor="dav-pw"
               className="md:col-span-2"
               labelExtra={
