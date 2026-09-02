@@ -71,7 +71,6 @@ struct Fixture {
 }
 
 async fn fixture(priority_a: i64, priority_b: i64, status_a: u16, status_b: u16) -> Fixture {
-
     let port_a = spawn_mock(status_a, "A").await;
     let port_b = spawn_mock(status_b, "B").await;
 
@@ -121,7 +120,6 @@ async fn fixture(priority_a: i64, priority_b: i64, status_a: u16, status_b: u16)
     .unwrap();
 
     // 写密钥环凭据（mock）
-    
 
     // 网关密钥
     let key = "sk-jai-integration-test-0000000000000000";

@@ -219,7 +219,10 @@ async fn provider_create(
         weight: input.weight,
         extra_headers: input.extra_headers.filter(|s| !s.trim().is_empty()),
         api_key: Some(input.api_key.trim().to_string()),
-        website: input.website.map(|w| w.trim().to_string()).filter(|s| !s.is_empty()),
+        website: input
+            .website
+            .map(|w| w.trim().to_string())
+            .filter(|s| !s.is_empty()),
         last_ok_at: None,
         last_err_at: None,
         last_err_msg: None,
@@ -420,7 +423,13 @@ async fn provider_discover_models(
 ) -> Result<(usize, usize), String> {
     let row = fetch_provider(&core.db, &id).await?;
 
-    let models = discover_models(&core.http, &row.family, &row.base_url, row.api_key.as_deref()).await?;
+    let models = discover_models(
+        &core.http,
+        &row.family,
+        &row.base_url,
+        row.api_key.as_deref(),
+    )
+    .await?;
 
     let existing: std::collections::HashMap<String, ()> = {
         let db = core.db.clone();
@@ -800,17 +809,18 @@ async fn config_import(
 #[tauri::command]
 async fn webdav_config_get(core: State<'_, AppCore>) -> Result<Option<WebDavConfigDto>, String> {
     let db = core.db.clone();
-    let (cfg, password): (Option<WebDavConfig>, Option<String>) = tokio::task::spawn_blocking(move || {
-        db.with_any(|c| {
-            let cfg = sync::config_get(c).map_err(|e| e.to_string())?;
-            let password = store::meta_get(c, "webdav_password")
-                .map_err(|e| e.to_string())?
-                .filter(|s| !s.is_empty());
-            Ok::<_, String>((cfg, password))
+    let (cfg, password): (Option<WebDavConfig>, Option<String>) =
+        tokio::task::spawn_blocking(move || {
+            db.with_any(|c| {
+                let cfg = sync::config_get(c).map_err(|e| e.to_string())?;
+                let password = store::meta_get(c, "webdav_password")
+                    .map_err(|e| e.to_string())?
+                    .filter(|s| !s.is_empty());
+                Ok::<_, String>((cfg, password))
+            })
         })
-    })
-    .await
-    .map_err(join_err)??;
+        .await
+        .map_err(join_err)??;
     Ok(cfg.map(|c| {
         let mut dto = WebDavConfigDto::from(c);
         dto.password = password;
@@ -1096,7 +1106,13 @@ const HEALTH_NOTIFY_SUMMARY_CHARS: usize = 140;
 /// 单供应商探测核心（provider_test 与健康检查共用）：
 /// 读凭据 → 拉模型列表。HTTP 200 即视为连通（0 个模型也算通）。
 async fn probe_provider(core: &AppCore, row: &ProviderRow) -> Result<usize, String> {
-    let models = discover_models(&core.http, &row.family, &row.base_url, row.api_key.as_deref()).await?;
+    let models = discover_models(
+        &core.http,
+        &row.family,
+        &row.base_url,
+        row.api_key.as_deref(),
+    )
+    .await?;
     Ok(models.len())
 }
 
@@ -1241,8 +1257,8 @@ async fn get_webdav_password(core: &AppCore) -> Result<String, String> {
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(join_err)??.
-    ok_or_else(|| "WebDAV 密码尚未录入，请在设置中保存".to_string())
+    .map_err(join_err)??
+    .ok_or_else(|| "WebDAV 密码尚未录入，请在设置中保存".to_string())
 }
 
 // ---------------------------------------------------------------- MCP 管理
@@ -2016,9 +2032,7 @@ fn main() {
             tauri::async_runtime::spawn_blocking({
                 let db = db.clone();
                 move || {
-                    if let Err(e) =
-                        vault::migrate_keyring_secrets(&db).map_err(|e| e.to_string())
-                    {
+                    if let Err(e) = vault::migrate_keyring_secrets(&db).map_err(|e| e.to_string()) {
                         eprintln!("[vault] 钥匙串存量迁移失败(下次启动重试): {e}");
                     }
                 }

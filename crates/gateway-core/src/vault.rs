@@ -232,11 +232,13 @@ mod tests {
 
         migrate_keyring_secrets(&db).unwrap();
 
-        let row = db.with(|c| crate::store::provider_get(c, "p1"))
+        let row = db
+            .with(|c| crate::store::provider_get(c, "p1"))
             .unwrap()
             .unwrap();
         assert_eq!(row.api_key.as_deref(), Some("sk-upstream-1"));
-        let row2 = db.with(|c| crate::store::provider_get(c, "p2"))
+        let row2 = db
+            .with(|c| crate::store::provider_get(c, "p2"))
             .unwrap()
             .unwrap();
         assert_eq!(row2.api_key, None, "无钥匙串凭据的供应商保持 None");
@@ -277,7 +279,8 @@ mod tests {
         // 标记位已置：即使钥匙串出现新值也不再读取
         testing::set(&provider_account("p-idem"), "sk-second").unwrap();
         migrate_keyring_secrets(&db).unwrap();
-        let row = db.with(|c| crate::store::provider_get(c, "p-idem"))
+        let row = db
+            .with(|c| crate::store::provider_get(c, "p-idem"))
             .unwrap()
             .unwrap();
         assert_eq!(row.api_key.as_deref(), Some("sk-first"));
@@ -288,7 +291,8 @@ mod tests {
         let _guard = KEYRING_TEST_LOCK.lock().unwrap();
         testing::set_mock_default();
         let db = crate::store::Db::in_memory().unwrap();
-        db.with(|c| meta_set(c, "webdav_url", "http://jn_file.88933.vip/")).unwrap();
+        db.with(|c| meta_set(c, "webdav_url", "http://jn_file.88933.vip/"))
+            .unwrap();
         db.with(|c| meta_set(c, MIGRATED_FLAG, "1")).unwrap();
         migrate_keyring_secrets(&db).unwrap();
         assert_eq!(

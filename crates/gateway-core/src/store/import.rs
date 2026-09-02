@@ -360,11 +360,15 @@ mod tests {
             "sk-jai-remote-active-key"
         );
         assert_eq!(
-            crate::store::meta_get(&c2, "webdav_password").unwrap().as_deref(),
+            crate::store::meta_get(&c2, "webdav_password")
+                .unwrap()
+                .as_deref(),
             Some("dav-pass")
         );
         assert_eq!(
-            crate::store::meta_get(&c2, "webdav_url").unwrap().as_deref(),
+            crate::store::meta_get(&c2, "webdav_url")
+                .unwrap()
+                .as_deref(),
             Some("https://dav.test/")
         );
         // 白名单外 meta（端口/CORS）不导入

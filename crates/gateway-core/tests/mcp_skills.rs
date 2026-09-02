@@ -151,7 +151,11 @@ env = { NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE = "C:\\Users\\WM\\AppData\\Roaming\
     let nc = &entries[0];
     assert_eq!(nc.name, "netcatty-external");
     assert_eq!(nc.kind, "stdio");
-    assert!(nc.command.as_deref().unwrap().contains("netcatty-external-mcp.cmd"));
+    assert!(nc
+        .command
+        .as_deref()
+        .unwrap()
+        .contains("netcatty-external-mcp.cmd"));
     assert_eq!(nc.args.as_deref(), Some("[]"));
     assert!(nc
         .env
@@ -208,14 +212,21 @@ fn parse_mcp_add_cli_supports_codex_command() {
     assert!(nc.skip_reason.is_none());
 
     // 无 `--`：名称后跟命令 + 多个参数
-    let entries = store::parse_mcp_add_cli("codex mcp add fs npx -y @modelcontextprotocol/server-fs").unwrap();
+    let entries =
+        store::parse_mcp_add_cli("codex mcp add fs npx -y @modelcontextprotocol/server-fs")
+            .unwrap();
     let fs = &entries[0];
     assert_eq!(fs.command.as_deref(), Some("npx"));
-    assert_eq!(fs.args.as_deref(), Some(r#"["-y","@modelcontextprotocol/server-fs"]"#));
+    assert_eq!(
+        fs.args.as_deref(),
+        Some(r#"["-y","@modelcontextprotocol/server-fs"]"#)
+    );
 
     // 多个 --env + claude 前缀 + http url
-    let entries =
-        store::parse_mcp_add_cli("claude mcp add r --env A=1 --env B=2 --url https://mcp.example.com/mcp").unwrap();
+    let entries = store::parse_mcp_add_cli(
+        "claude mcp add r --env A=1 --env B=2 --url https://mcp.example.com/mcp",
+    )
+    .unwrap();
     let r = &entries[0];
     assert_eq!(r.kind, "http");
     assert_eq!(r.url.as_deref(), Some("https://mcp.example.com/mcp"));

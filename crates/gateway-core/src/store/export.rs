@@ -113,7 +113,11 @@ mod tests {
         assert_eq!(v["providers"][0]["name"], "密钥供应商");
         assert_eq!(v["providers"][0]["api_key"], "sk-upstream-secret");
         assert_eq!(v["providers"][0]["website"], "https://x.com");
-        assert_eq!(v["providers"][1]["api_key"], Value::Null, "无凭据不带 api_key 字段");
+        assert_eq!(
+            v["providers"][1]["api_key"],
+            Value::Null,
+            "无凭据不带 api_key 字段"
+        );
         assert_eq!(v["models"][0]["modelName"], "gpt-4o");
         assert_eq!(v["gateway_key"], "sk-jai-secretvalue");
         // webdav_password 随 meta 全量导出

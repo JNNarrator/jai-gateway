@@ -704,9 +704,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             continue;
         }
         if cand.family != wire.family() {
-            match try_converted_candidate(&ctx, wire, &peeked, cand, &body, started)
-                .await
-            {
+            match try_converted_candidate(&ctx, wire, &peeked, cand, &body, started).await {
                 Attempt::Delivered(resp) => return resp,
                 Attempt::Failed {
                     kind,

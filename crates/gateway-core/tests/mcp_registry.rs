@@ -8,11 +8,13 @@ use serde_json::{json, Value};
 struct Fixture {
     port: u16,
     key: String,
-    _keepalive: (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>),
+    _keepalive: (
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ),
 }
 
 async fn fixture() -> Fixture {
-
     let dir = std::env::temp_dir().join(format!(
         "jai-mcp-e2e-{}-{}",
         std::process::id(),
@@ -21,8 +23,8 @@ async fn fixture() -> Fixture {
     std::fs::create_dir_all(&dir).unwrap();
     let main_path = dir.join("main.db");
     let (db, main_path) = (Db::open(main_path.to_str().unwrap()).unwrap(), main_path);
-    let (logs, _task) = gateway_core::store::logs::spawn_logger(main_path.to_str().unwrap())
-        .unwrap();
+    let (logs, _task) =
+        gateway_core::store::logs::spawn_logger(main_path.to_str().unwrap()).unwrap();
 
     let now = store::now_ms();
     db.with(|c| {
@@ -91,7 +93,10 @@ impl Fixture {
 async fn mcp_unauthenticated_rejected() {
     let fx = fixture().await;
     let (status, _) = fx
-        .rpc(json!({"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}), false)
+        .rpc(
+            json!({"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}),
+            false,
+        )
         .await;
     assert_eq!(status, 401);
 }
@@ -102,21 +107,30 @@ async fn mcp_full_flow_with_auth() {
 
     // initialize
     let (status, resp) = fx
-        .rpc(json!({"jsonrpc":"2.0","method":"initialize","params":{},"id":1}), true)
+        .rpc(
+            json!({"jsonrpc":"2.0","method":"initialize","params":{},"id":1}),
+            true,
+        )
         .await;
     assert_eq!(status, 200);
     assert_eq!(resp["result"]["serverInfo"]["name"], "jai-gateway-registry");
 
     // notifications/initialized（无 id）→ 202
     let (status, body) = fx
-        .rpc(json!({"jsonrpc":"2.0","method":"notifications/initialized"}), true)
+        .rpc(
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            true,
+        )
         .await;
     assert_eq!(status, 202);
     assert!(body.is_null());
 
     // tools/list
     let (_, resp) = fx
-        .rpc(json!({"jsonrpc":"2.0","method":"tools/list","params":{},"id":2}), true)
+        .rpc(
+            json!({"jsonrpc":"2.0","method":"tools/list","params":{},"id":2}),
+            true,
+        )
         .await;
     assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 5);
 

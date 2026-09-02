@@ -85,7 +85,6 @@ struct Fixture {
 }
 
 async fn fixture(upstream_status: u16) -> Fixture {
-
     let headers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let up_port = spawn_anthropic_mock(upstream_status, headers.clone()).await;
 
@@ -131,7 +130,6 @@ async fn fixture(upstream_status: u16) -> Fixture {
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
-    
 
     let key = "sk-jai-integration-test-0000000000000000";
     db.with(|c| {

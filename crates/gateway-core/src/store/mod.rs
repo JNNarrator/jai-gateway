@@ -879,7 +879,14 @@ pub fn parse_mcp_add_cli(text: &str) -> Result<Vec<ParsedMcpServer>, String> {
         }
         // 带值旗标（值可能是独立 token，也可能用 = 内联）
         const VALUE_FLAGS: [&str; 8] = [
-            "--env", "-e", "--url", "--transport", "-s", "--scope", "--profile", "--header",
+            "--env",
+            "-e",
+            "--url",
+            "--transport",
+            "-s",
+            "--scope",
+            "--profile",
+            "--header",
         ];
         if VALUE_FLAGS.contains(&t.as_str()) {
             let val = tokens.get(i + 1).cloned();
@@ -930,7 +937,10 @@ pub fn parse_mcp_add_cli(text: &str) -> Result<Vec<ParsedMcpServer>, String> {
         Some(serde_json::Value::Object(map).to_string())
     };
     let skip_reason = |reason: String| ParsedMcpServer {
-        name: positionals.first().cloned().unwrap_or_else(|| "(未命名)".into()),
+        name: positionals
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "(未命名)".into()),
         kind: "stdio".into(),
         command: None,
         args: None,
@@ -950,9 +960,15 @@ pub fn parse_mcp_add_cli(text: &str) -> Result<Vec<ParsedMcpServer>, String> {
     let (kind, command, args, url) = if !cmd_tokens.is_empty() {
         let command = cmd_tokens[0].clone();
         let args = if cmd_tokens.len() > 1 {
-            Some(serde_json::Value::Array(
-                cmd_tokens[1..].iter().map(|s| serde_json::Value::String(s.clone())).collect(),
-            ).to_string())
+            Some(
+                serde_json::Value::Array(
+                    cmd_tokens[1..]
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                )
+                .to_string(),
+            )
         } else {
             None
         };
@@ -966,12 +982,15 @@ pub fn parse_mcp_add_cli(text: &str) -> Result<Vec<ParsedMcpServer>, String> {
             }
             Some(c) => {
                 let args = if positionals.len() > 2 {
-                    Some(serde_json::Value::Array(
-                        positionals[2..]
-                            .iter()
-                            .map(|s| serde_json::Value::String(s.clone()))
-                            .collect(),
-                    ).to_string())
+                    Some(
+                        serde_json::Value::Array(
+                            positionals[2..]
+                                .iter()
+                                .map(|s| serde_json::Value::String(s.clone()))
+                                .collect(),
+                        )
+                        .to_string(),
+                    )
                 } else {
                     None
                 };
@@ -1049,9 +1068,9 @@ pub fn parse_mcp_servers_json(json_text: &str) -> Result<Vec<ParsedMcpServer>, S
             // 裸对象：每个值都是含 command 或 url 的对象时，视作 server 映射本身
             let obj = parsed.as_object()?;
             (!obj.is_empty()
-                && obj
-                    .values()
-                    .all(|v| v.is_object() && (v.get("command").is_some() || v.get("url").is_some())))
+                && obj.values().all(|v| {
+                    v.is_object() && (v.get("command").is_some() || v.get("url").is_some())
+                }))
             .then_some(obj)
         })
         .ok_or_else(|| "缺少 mcpServers 对象".to_string())?;

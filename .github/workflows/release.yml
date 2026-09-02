@@ -33,7 +33,7 @@ jobs:
           if [ -z "$RELEASE_ID" ]; then
             RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases" \
               -f tag_name="${{ github.ref_name }}" \
-              -f draft=true -f prerelease=true \
+              -F draft=true -F prerelease=true \
               -f name="JAI ${{ github.ref_name }}" \
               -f body="见 CHANGELOG.md" --jq '.id')
           fi

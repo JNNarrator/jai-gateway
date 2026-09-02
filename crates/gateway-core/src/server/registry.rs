@@ -334,7 +334,7 @@ async fn handle_rpc(ctx: &GatewayCtx, v: &Value) -> Option<Value> {
                 None // notification：无 id，不回包
             } else {
                 Some(rpc_error(id, -32601, &format!("未知方法: {method}")))
-            }
+            };
         }
     };
     if id.is_null() {
@@ -392,56 +392,57 @@ mod tests {
     }
 
     fn seed(ctx: &GatewayCtx) {
-        ctx.db.with(|c| {
-            let now = store::now_ms();
-            store::mcp_insert(
-                c,
-                &store::McpServerRow {
-                    id: "s1".into(),
-                    name: "netcatty".into(),
-                    kind: "stdio".into(),
-                    command: Some("/usr/local/bin/nct-mcp".into()),
-                    args: Some(r#"["--verbose"]"#.into()),
-                    url: None,
-                    env: Some(r#"{"NETCATTY_TOKEN":"secret-value","HOME":"/x"}"#.into()),
-                    enabled: true,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
+        ctx.db
+            .with(|c| {
+                let now = store::now_ms();
+                store::mcp_insert(
+                    c,
+                    &store::McpServerRow {
+                        id: "s1".into(),
+                        name: "netcatty".into(),
+                        kind: "stdio".into(),
+                        command: Some("/usr/local/bin/nct-mcp".into()),
+                        args: Some(r#"["--verbose"]"#.into()),
+                        url: None,
+                        env: Some(r#"{"NETCATTY_TOKEN":"secret-value","HOME":"/x"}"#.into()),
+                        enabled: true,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+                store::mcp_insert(
+                    c,
+                    &store::McpServerRow {
+                        id: "s2".into(),
+                        name: "websearch".into(),
+                        kind: "http".into(),
+                        command: None,
+                        args: None,
+                        url: Some("https://mcp.example.com/mcp".into()),
+                        env: None,
+                        enabled: false,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+                store::skill_insert(
+                    c,
+                    &store::SkillRow {
+                        id: "k1".into(),
+                        name: "code-review".into(),
+                        description: "代码评审".into(),
+                        content: "按提交做评审。".into(),
+                        enabled: true,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+                Ok::<_, store::StoreError>(())
+            })
             .unwrap();
-            store::mcp_insert(
-                c,
-                &store::McpServerRow {
-                    id: "s2".into(),
-                    name: "websearch".into(),
-                    kind: "http".into(),
-                    command: None,
-                    args: None,
-                    url: Some("https://mcp.example.com/mcp".into()),
-                    env: None,
-                    enabled: false,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .unwrap();
-            store::skill_insert(
-                c,
-                &store::SkillRow {
-                    id: "k1".into(),
-                    name: "code-review".into(),
-                    description: "代码评审".into(),
-                    content: "按提交做评审。".into(),
-                    enabled: true,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .unwrap();
-            Ok::<_, store::StoreError>(())
-        })
-        .unwrap();
     }
 
     fn rpc(method: &str, params: Value, id: Value) -> Value {
@@ -477,10 +478,7 @@ mod tests {
             .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 5);
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"list_mcp_servers"));
         assert!(names.contains(&"get_skill_detail"));
     }
@@ -490,16 +488,27 @@ mod tests {
         let ctx = test_ctx();
         seed(&ctx);
 
-        let resp = handle_rpc(&ctx, &rpc("tools/call", json!({"name":"list_mcp_servers","arguments":{}}), json!(3)))
-            .await
-            .unwrap();
+        let resp = handle_rpc(
+            &ctx,
+            &rpc(
+                "tools/call",
+                json!({"name":"list_mcp_servers","arguments":{}}),
+                json!(3),
+            ),
+        )
+        .await
+        .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["servers"].as_array().unwrap().len(), 2);
 
         let resp = handle_rpc(
             &ctx,
-            &rpc("tools/call", json!({"name":"get_mcp_server_detail","arguments":{"name":"netcatty"}}), json!(4)),
+            &rpc(
+                "tools/call",
+                json!({"name":"get_mcp_server_detail","arguments":{"name":"netcatty"}}),
+                json!(4),
+            ),
         )
         .await
         .unwrap();
@@ -521,7 +530,11 @@ mod tests {
 
         let resp = handle_rpc(
             &ctx,
-            &rpc("tools/call", json!({"name":"get_skill_detail","arguments":{"name":"code-review"}}), json!(5)),
+            &rpc(
+                "tools/call",
+                json!({"name":"get_skill_detail","arguments":{"name":"code-review"}}),
+                json!(5),
+            ),
         )
         .await
         .unwrap();
@@ -532,7 +545,11 @@ mod tests {
         // 缺参数 → isError
         let resp = handle_rpc(
             &ctx,
-            &rpc("tools/call", json!({"name":"get_skill_detail","arguments":{}}), json!(6)),
+            &rpc(
+                "tools/call",
+                json!({"name":"get_skill_detail","arguments":{}}),
+                json!(6),
+            ),
         )
         .await
         .unwrap();

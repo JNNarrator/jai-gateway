@@ -43,7 +43,9 @@ async fn spawn_capture_mock(captured: Arc<Mutex<Vec<Value>>>) -> u16 {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     addr.port()
@@ -52,7 +54,10 @@ async fn spawn_capture_mock(captured: Arc<Mutex<Vec<Value>>>) -> u16 {
 struct Fixture {
     port: u16,
     key: String,
-    _keepalive: (tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>),
+    _keepalive: (
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ),
 }
 
 impl Fixture {
@@ -117,7 +122,7 @@ async fn fixture(captured: Arc<Mutex<Vec<Value>>>) -> Fixture {
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
-    
+
     let key = "sk-jai-integration-test-0000000000000000";
     db.with(|c| {
         store::gw_key_rotate(c, key, Some("test"))?;
@@ -132,17 +137,18 @@ async fn fixture(captured: Arc<Mutex<Vec<Value>>>) -> Fixture {
     let guard = tokio::spawn(async move {
         let _ = server::run_until_shutdown(listener, app, stop_rx).await;
     });
-    Fixture { port, key: key.to_string(), _keepalive: (stop_tx, guard) }
+    Fixture {
+        port,
+        key: key.to_string(),
+        _keepalive: (stop_tx, guard),
+    }
 }
 
 /// 校验 Chat messages：每个 assistant tool_calls 必须有后续 role=tool 配对。
 fn assert_tool_pairing(msgs: &[Value]) {
     for (i, m) in msgs.iter().enumerate() {
         if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
-            let ids: Vec<&str> = tcs
-                .iter()
-                .filter_map(|tc| tc["id"].as_str())
-                .collect();
+            let ids: Vec<&str> = tcs.iter().filter_map(|tc| tc["id"].as_str()).collect();
             let mut found = vec![false; ids.len()];
             for after in &msgs[i + 1..] {
                 if after["role"] == "tool" {

@@ -1163,7 +1163,13 @@ mod tests {
     fn scanner_key_wait_limit_protection() {
         // 窗口内可判定：59 个空白 + '{'（64 上限内）
         let mut s = UsageScanner::new();
-        s.feed(format!("data: {{\"usage\":{}{{\"prompt_tokens\":1,\"completion_tokens\":2}}}}", " ".repeat(59)).as_bytes());
+        s.feed(
+            format!(
+                "data: {{\"usage\":{}{{\"prompt_tokens\":1,\"completion_tokens\":2}}}}",
+                " ".repeat(59)
+            )
+            .as_bytes(),
+        );
         let v = s.finish().expect("上限内空白应仍可判定");
         assert_eq!(v["prompt_tokens"], 1);
 

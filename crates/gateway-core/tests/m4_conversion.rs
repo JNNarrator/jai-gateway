@@ -229,7 +229,7 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
-    
+
     let key = "sk-jai-integration-test-0000000000000000";
     db.with(|c| {
         store::gw_key_rotate(c, key, Some("test"))?;
@@ -365,8 +365,16 @@ async fn openai_to_gemini_stream() {
         .iter()
         .find(|r| r.is_stream && r.provider_id.is_some())
         .expect("流式请求应落日志");
-    assert_eq!(row.usage_input, Some(3), "转换流式 usage_input 应来自 IR Finish");
-    assert_eq!(row.usage_output, Some(2), "转换流式 usage_output 应来自 IR Finish");
+    assert_eq!(
+        row.usage_input,
+        Some(3),
+        "转换流式 usage_input 应来自 IR Finish"
+    );
+    assert_eq!(
+        row.usage_output,
+        Some(2),
+        "转换流式 usage_output 应来自 IR Finish"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -269,7 +269,7 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
-    
+
     let key = "sk-jai-integration-test-0000000000000000";
     db.with(|c| {
         store::gw_key_rotate(c, key, Some("test"))?;
