@@ -6,15 +6,17 @@
 
 > 开箱即用的本地 AI API 网关：把官方与第三方中转的杂牌 token 来源，收敛成一个稳定的本机入口，并让多设备（macOS / Windows）配置保持同步。
 
-**状态**：M0–M9 全部里程碑完成，UI 2.0（阶段 0–6）已落地；真机验收矩阵（Claude Code / Codex / zcode 跨族、WebDAV 双机、签名安装包）与 48h 常驻观察按[路线图](docs/design/roadmap.md)推进中。
+**状态**：M0–M9 全部里程碑完成，UI 2.0（阶段 0–6）已落地；真机验收矩阵（dsh / zcode 双客户端、WebDAV 双机、签名安装包）与 48h 常驻观察按[路线图](docs/design/roadmap.md)推进中。
 
-> **客户端优先级**：优先支持国产 Agent —— **DeepSeek Harness（dsh）** 与 **zcode**。目标是通过 JAI 网关使用时，与直连上游的体验保持一致（协议、流式、工具调用、错误语义均透明兼容）。dsh 已两轮真机联调验证（Chat / Responses / 故障转移），报告见 [docs/test-report-dsh.md](docs/test-report-dsh.md)。
+> **适配范围**：当前专注适配 **DeepSeek Harness（dsh）** 与 **zcode** 两个国产 Agent——目标是通过 JAI 网关使用时，与直连上游的体验保持一致（协议、流式、工具调用、错误语义均透明兼容）。dsh 已两轮真机联调验证（Chat / Responses / 故障转移），报告见 [docs/test-report-dsh.md](docs/test-report-dsh.md)。
+>
+> **其他客户端（Claude Code、Codex 等）**：协议直通仍可用，但暂无专属适配与回归保障——精力有限，暂不投入。
 
 ## 它解决什么问题
 
 - **token 来源杂**：官方 API、各类第三方中转并存，客户端各自配置难以维护 → JAI 统一代理，客户端只认一个地址
 - **设备多且异构**：macOS 与 Windows 各不止一台，供应商/模型配置手工同步成本高 → 配置可导出 + WebDAV 同步
-- **稳定性敏感**：agent 工作流（Claude Code、Codex 等）依赖网关常驻可用 → 稳定性为一票否决项，见路线图全局基线
+- **稳定性敏感**：agent 工作流（dsh、zcode 等）依赖网关常驻可用 → 稳定性为一票否决项，见路线图全局基线
 
 ## 核心特性
 
@@ -51,13 +53,14 @@ Tauri 2.0 · Rust (Axum + Reqwest) · React 19 + TypeScript + TailwindCSS 4 + sh
   <p><sub>明暗双主题 · 可折叠侧边栏 · 全页面语义化组件 —— 主色为蓝紫渐变的「J + AI 星火」标识</sub></p>
 </div>
 
-## 国产 Agent 优先支持
+## 适配范围（当前）
 
-JAI 优先保证 **DeepSeek Harness（dsh）** 与 **zcode** 的使用体验：
+JAI 当前专注适配 **DeepSeek Harness（dsh）** 与 **zcode**：
 
 - **目标**：通过 JAI 网关访问上游时，与直连上游的体验一致——协议、流式、工具调用、错误语义都保持透明兼容。
 - **dsh**：已实测打通 OpenAI Chat Completions 与 OpenAI Responses 两条链路，别名映射、故障转移均可正常工作（两轮真机联调，报告见 [docs/test-report-dsh.md](docs/test-report-dsh.md)）。
 - **zcode**：协议线待真机确认后纳入同等回归保障。
+- **其他客户端（Claude Code、Codex 等）**：协议直通仍可用（同族字节级透传、跨族协议转换），但无专属适配与回归保障——边界问题可能无法及时处理，暂不投入。
 - 同族直通默认保持字节级透传，跨族（协议不同）时才进入转换路径。
 - MCP / Skill 登记后可通过网关 `/mcp` 元数据服务暴露给 Agent（见「网关」页一键复制的
   `mcpServers` 配置）；技能另支持 ZIP 批量导入与 Markdown 导出。
@@ -75,13 +78,15 @@ JAI 优先保证 **DeepSeek Harness（dsh）** 与 **zcode** 的使用体验：
 | [docs/zcode接入.md](docs/zcode接入.md) | zcode 接入 JAI 与 MCP/Skill 加载指南 |
 | [docs/design/release.md](docs/design/release.md) | 签名/公证/更新通道/发布检查单 |
 
-## 第一梯队客户端
+## 适配基准客户端
 
-Claude Code · Codex · zcode · DeepSeek harness —— 首批适配与验收基准。
+DeepSeek Harness（dsh）· zcode —— 当前纳入专属适配与回归保障的客户端。
+
+> 其他客户端（Claude Code、Codex 等）通过协议直通仍可使用，但不在适配范围内，无专属适配。
 
 ## 快速接入
 
-### Claude Code（Anthropic 线，M3 已支持）
+### Claude Code（Anthropic 线，M3 已支持；非当前适配范围，协议直通仍可用）
 
 在 Claude Code 中把 Base URL 指向 JAI、API Key 换成网关 Key（`sk-jai-*`，见应用「网关」页）：
 
