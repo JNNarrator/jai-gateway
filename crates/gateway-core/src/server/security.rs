@@ -119,6 +119,9 @@ pub struct AuthedKey {
 
 /// 依据 Bearer / x-api-key 头对活跃网关密钥做常量时间认证。
 /// 命中后节流回写 last_used_at。
+// Err 直接携带 axum Response（鉴权失败即返回的错误体），体积超 clippy
+// result_large_err 阈值；属 API 形状选择，仅在认证失败路径构造。
+#[allow(clippy::result_large_err)]
 pub async fn authenticate(db: &Db, headers: &HeaderMap) -> Result<AuthedKey, Response> {
     let presented = bearer_token(headers).or_else(|| x_api_key(headers));
     let Some(token) = presented else {
