@@ -17,24 +17,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 只创建 draft release，不跑任何构建（tauri-action 在此 job 会执行完整
-      # tauri build，ubuntu runner 缺 webkit2gtk/glib 系统依赖必然失败）；
+      # 幂等创建 draft release（tauri-action 在此 job 会执行完整 tauri build，
+      # ubuntu runner 缺 webkit2gtk/glib 系统依赖必然失败，故只建 draft 不构建）；
       # 实际构建与产物上传只发生在下方 macos/windows 的 build-tauri job
       - name: Create draft release
         id: create
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RELEASE_URL=$(gh release create "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --draft --prerelease \
-            --title "JAI ${{ github.ref_name }}" \
-            --notes "见 CHANGELOG.md")
-          # draft release 不出现在 releases/tags/<tag> 查询里，按 URL 末段取 id
+          # 复用上次运行遗留的同 tag draft（重跑场景）；
+          # 否则走 API 直接创建 —— 响应即含 release id。v0.1.2 曾用
+          # gh release create + 列表回查取 id，回查撞上 API 最终一致性窗口导致 8s 失败
           RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases" \
             --jq '.[] | select(.draft and .tag_name == "${{ github.ref_name }}") | .id' | head -1)
           if [ -z "$RELEASE_ID" ]; then
-            echo "FAIL: 未找到刚创建的 draft release ($RELEASE_URL)"; exit 1
+            RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases" \
+              -f tag_name="${{ github.ref_name }}" \
+              -f draft=true -f prerelease=true \
+              -f name="JAI ${{ github.ref_name }}" \
+              -f body="见 CHANGELOG.md" --jq '.id')
+          fi
+          if [ -z "$RELEASE_ID" ]; then
+            echo "FAIL: draft release 创建失败"; exit 1
           fi
           echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
