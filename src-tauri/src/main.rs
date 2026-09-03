@@ -1317,6 +1317,7 @@ async fn mcp_create(
         url: input.url.filter(|s| !s.trim().is_empty()),
         env: input.env.filter(|s| !s.trim().is_empty()),
         enabled: true,
+        proxy_allowed: false, // 新建默认不开放代理转发，需显式开启
         created_at: now,
         updated_at: now,
     };
@@ -1365,6 +1366,21 @@ async fn mcp_set_enabled(
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
         db.with(|c| store::mcp_set_enabled(c, &id, enabled))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn mcp_set_proxy_allowed(
+    core: State<'_, AppCore>,
+    id: String,
+    allowed: bool,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::mcp_set_proxy_allowed(c, &id, allowed))
             .map_err(|e| e.to_string())
     })
     .await
@@ -1482,6 +1498,7 @@ async fn mcp_import(core: State<'_, AppCore>, text: String) -> Result<serde_json
                                 url: e.url,
                                 env: e.env,
                                 enabled: true,
+                                proxy_allowed: false,
                                 created_at: now,
                                 updated_at: now,
                             };
@@ -2202,6 +2219,7 @@ fn main() {
             mcp_create,
             mcp_update,
             mcp_set_enabled,
+            mcp_set_proxy_allowed,
             mcp_delete,
             mcp_tools_list,
             mcp_tools_call,

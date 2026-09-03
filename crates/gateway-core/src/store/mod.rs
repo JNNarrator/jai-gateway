@@ -558,6 +558,8 @@ pub struct McpServerRow {
     pub url: Option<String>,
     /// JSON 对象字符串（环境变量注入），如 {"KEY":"value"}
     pub env: Option<String>,
+    /// 是否允许 jai-registry 代理执行（动态工具列表 + tools/call 转发），默认关
+    pub proxy_allowed: bool,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -584,9 +586,10 @@ fn row_to_mcp_server(r: &rusqlite::Row) -> rusqlite::Result<McpServerRow> {
         args: r.get(4)?,
         url: r.get(5)?,
         env: r.get(6)?,
-        enabled: r.get::<_, i64>(7)? != 0,
-        created_at: r.get(8)?,
-        updated_at: r.get(9)?,
+        proxy_allowed: r.get::<_, i64>(7)? != 0,
+        enabled: r.get::<_, i64>(8)? != 0,
+        created_at: r.get(9)?,
+        updated_at: r.get(10)?,
     })
 }
 
@@ -604,7 +607,7 @@ fn row_to_skill(r: &rusqlite::Row) -> rusqlite::Result<SkillRow> {
 
 pub fn mcp_list(c: &Connection) -> Result<Vec<McpServerRow>, StoreError> {
     let mut stmt = c.prepare(
-        "SELECT id,name,kind,command,args,url,env,enabled,created_at,updated_at
+        "SELECT id,name,kind,command,args,url,env,proxy_allowed,enabled,created_at,updated_at
          FROM mcp_servers ORDER BY name",
     )?;
     let rows = stmt
@@ -615,8 +618,8 @@ pub fn mcp_list(c: &Connection) -> Result<Vec<McpServerRow>, StoreError> {
 
 pub fn mcp_insert(c: &Connection, row: &McpServerRow) -> Result<(), StoreError> {
     c.execute(
-        "INSERT INTO mcp_servers(id,name,kind,command,args,url,env,enabled,created_at,updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        "INSERT INTO mcp_servers(id,name,kind,command,args,url,env,proxy_allowed,enabled,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
             row.id,
             row.name,
@@ -625,6 +628,7 @@ pub fn mcp_insert(c: &Connection, row: &McpServerRow) -> Result<(), StoreError> 
             row.args,
             row.url,
             row.env,
+            row.proxy_allowed as i64,
             row.enabled as i64,
             row.created_at,
             row.updated_at,
@@ -648,6 +652,14 @@ pub fn mcp_update(
         "UPDATE mcp_servers SET name=?1, kind=?2, command=?3, args=?4, url=?5, env=?6, updated_at=?7
          WHERE id=?8",
         params![name, kind, command, args, url, env, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+pub fn mcp_set_proxy_allowed(c: &Connection, id: &str, allowed: bool) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE mcp_servers SET proxy_allowed=?1, updated_at=?2 WHERE id=?3",
+        params![allowed as i64, now_ms(), id],
     )?;
     Ok(())
 }

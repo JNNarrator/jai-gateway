@@ -39,6 +39,7 @@ async fn fixture() -> Fixture {
                 url: Some("https://mcp.example.com/mcp".into()),
                 env: None,
                 enabled: true,
+                proxy_allowed: false,
                 created_at: now,
                 updated_at: now,
             },

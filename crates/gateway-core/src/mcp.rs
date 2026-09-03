@@ -288,6 +288,7 @@ mod tests {
             args: None,
             url: None,
             env: Some(r#"{"NETCATTY_EXTERNAL_MCP_DISCOVERY_FILE":"/tmp/discovery.json"}"#.into()),
+            proxy_allowed: false,
             enabled: true,
             created_at: 0,
             updated_at: 0,

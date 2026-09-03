@@ -17,6 +17,7 @@ fn mcp_and_skill_crud() {
             url: None,
             env: None,
             enabled: true,
+            proxy_allowed: false,
             created_at: now,
             updated_at: now,
         };

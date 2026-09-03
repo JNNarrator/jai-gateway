@@ -1,13 +1,19 @@
 //! `/mcp` 元数据 MCP Server —— 把网关登记的 MCP Server / Skill 台账以 MCP 协议暴露。
 //!
 //! 设计约定（与用户确认的方案）：
-//! - **只读信息台**：所有工具返回"信息"，不代替 Agent 执行任何 MCP 工具；
+//! - **只读信息台**：静态工具返回"信息"，不代替 Agent 执行任何 MCP 工具；
 //!   网关不再注入对话链路，执行面归客户端（dsh / Claude Code 等）。
+//! - **代理执行（M1 起）**：`proxy_allowed=1` 的 MCP Server 的工具会以
+//!   `<server>__<tool>` 命名动态暴露，`tools/call` 显式转发到真实 Server 执行。
+//!   选择权始终在 Agent：工具出现在其工具列表里、由它主动调用，网关只做转发。
 //! - 传输：Streamable HTTP（单端点 `POST /mcp`，换行内 JSON-RPC 2.0）。
 //!   仅覆盖 `initialize` / `notifications/initialized` / `ping` /
 //!   `tools/list` / `tools/call` 子集。
 //! - 鉴权复用网关安全中间件（Authorization: Bearer / x-api-key，常量时间比对）。
 //! - env 只回键名不回值：环境变量值属供应商侧敏感信息，不通过元数据接口扩散。
+
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -16,11 +22,107 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use super::proxy::GatewayCtx;
+use crate::store::McpServerRow;
 
 /// MCP 实现版本与协议版本（客户端据此协商）。
 const PROTOCOL_VERSION: &str = "2025-03-26";
 const SERVER_NAME: &str = "jai-gateway-registry";
 const SERVER_VERSION: &str = "0.1.0";
+
+/// 动态工具列表 TTL：避免每次 tools/list 都去 spawn MCP 子进程拉工具。
+const PROXY_TOOLS_TTL: Duration = Duration::from_secs(30);
+
+/// 进程内动态工具列表缓存（server 工具聚合）。`proxy_allowed` 配置变化由
+/// 签名比对感知：签名 = 可代理 server 的 (name, kind, command, url) 连接串。
+static PROXY_TOOLS_CACHE: Mutex<Option<ProxyToolsCache>> = Mutex::new(None);
+
+struct ProxyToolsCache {
+    /// 签名（可代理 server 连接形态的 md5/摘要），变化即失效
+    signature: u64,
+    /// 聚合后的动态工具（name 已带 `<server>__` 前缀）
+    tools: Vec<Value>,
+    built_at: Instant,
+}
+
+/// 快速签名：djb2 哈希串接，足够感知配置变化（非密码学用途）。
+fn proxy_signature(servers: &[McpServerRow]) -> u64 {
+    let mut h: u64 = 5381;
+    for s in servers {
+        for part in std::iter::once(&s.name)
+            .chain(std::iter::once(&s.kind))
+            .chain(s.command.iter())
+            .chain(s.url.iter())
+        {
+            for b in part.bytes() {
+                h = h.wrapping_mul(33).wrapping_add(b as u64);
+            }
+        }
+    }
+    h
+}
+
+/// 取可代理（enabled=1 且 proxy_allowed=1）的 MCP Server 列表。
+fn proxy_servers(ctx: &GatewayCtx) -> Vec<McpServerRow> {
+    let list = ctx
+        .db
+        .with_any(|c| crate::store::mcp_list(c).map_err(|e| e.to_string()));
+    match list {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|s| s.enabled && s.proxy_allowed)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 聚合可代理 Server 的动态工具（带 `<server>__` 前缀与来源标注）。
+/// 单个 server 拉取失败跳过，不阻塞整体。
+async fn build_proxy_tools(servers: &[McpServerRow]) -> Vec<Value> {
+    let mut specs: Vec<Value> = Vec::new();
+    for s in servers {
+        let tools = match crate::mcp::list_tools(s).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[registry] {0} list_tools 失败，跳过: {e}", s.name);
+                continue;
+            }
+        };
+        for t in tools {
+            let name = format!("{}__{}", s.name, t.name);
+            specs.push(json!({
+                "name": name,
+                "description": format!("[proxy: {}] {}", s.name, t.description.as_deref().unwrap_or("")),
+                "inputSchema": t.input_schema,
+            }));
+        }
+    }
+    specs
+}
+
+/// 动态工具列表（带 30s TTL 缓存；签名变化立即失效）。
+async fn dynamic_tool_specs(ctx: &GatewayCtx) -> Vec<Value> {
+    let servers = proxy_servers(ctx);
+    let signature = proxy_signature(&servers);
+    {
+        let guard = PROXY_TOOLS_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cache) = guard.as_ref() {
+            if cache.signature == signature
+                && cache.built_at.elapsed() < PROXY_TOOLS_TTL
+            {
+                return cache.tools.clone();
+            }
+        }
+    }
+    let specs = build_proxy_tools(&servers).await;
+    if let Ok(mut guard) = PROXY_TOOLS_CACHE.lock() {
+        *guard = Some(ProxyToolsCache {
+            signature,
+            tools: specs.clone(),
+            built_at: Instant::now(),
+        });
+    }
+    specs
+}
 
 // ---------------------------------------------------------------- 工具定义
 
@@ -252,7 +354,40 @@ async fn tool_skill_detail(ctx: &GatewayCtx, name: &str) -> Value {
     })
 }
 
+/// 解析 `server__tool` 命名（按第一个双下划线分割；server 名本身可含 `_`）。
+fn parse_proxy_name(name: &str) -> Option<(&str, &str)> {
+    let (server, tool) = name.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some((server, tool))
+}
+
+/// 代理转发：`<server>__<tool>` → 真实 MCP Server 执行。
+async fn proxy_call_tool(ctx: &GatewayCtx, server_name: &str, tool_name: &str, args: &Value) -> Result<Value, String> {
+    let servers = proxy_servers(ctx);
+    let Some(server) = servers.iter().find(|s| s.name == server_name) else {
+        return Err(format!(
+            "Server「{server_name}」不存在或未开启代理执行（proxy_allowed）"
+        ));
+    };
+    let result = crate::mcp::call_tool(server, tool_name, args.clone())
+        .await
+        .map_err(|e| format!("[proxy: {server_name}] {tool_name} 调用失败: {e}"))?;
+    // 附来源标注，便于审计与 Agent 理解结果出处
+    Ok(json!({
+        "source": format!("jai-gateway-proxy/{server_name}"),
+        "result": result,
+    }))
+}
+
 async fn dispatch_tool(ctx: &GatewayCtx, name: &str, args: &Value) -> Result<Value, String> {
+    // 代理工具优先：命中 `server__tool` 且 server 可代理才转发
+    if let Some((server, tool)) = parse_proxy_name(name) {
+        // 若与静态工具重名（如 "list_mcp_servers" 不含 __，不会走到这），
+        // 直接按代理语义处理；server 校验在 proxy_call_tool 内完成。
+        return proxy_call_tool(ctx, server, tool, args).await;
+    }
     match name {
         "list_mcp_servers" => Ok(tool_list_mcp_servers(ctx).await),
         "get_mcp_server_detail" => {
@@ -308,11 +443,16 @@ async fn handle_rpc(ctx: &GatewayCtx, v: &Value) -> Option<Value> {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
                 "title": "JAI Gateway Registry",
-                "description": "网关登记的 MCP Server 与 Skill 台账（只读元数据，不执行工具）"
+                "description": "网关登记的 MCP Server 与 Skill 台账；开启代理执行的 Server 工具以 <server>__<tool> 暴露并可转发调用"
             }
         }),
         "ping" => json!({}),
-        "tools/list" => json!({"tools": tool_specs()}),
+        "tools/list" => {
+            // 静态只读工具 + 动态代理工具（可代理 server 的工具聚合，30s TTL）
+            let mut tools = tool_specs();
+            tools.extend(dynamic_tool_specs(ctx).await);
+            json!({"tools": tools})
+        }
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -405,6 +545,7 @@ mod tests {
                         args: Some(r#"["--verbose"]"#.into()),
                         url: None,
                         env: Some(r#"{"NETCATTY_TOKEN":"secret-value","HOME":"/x"}"#.into()),
+                        proxy_allowed: true,
                         enabled: true,
                         created_at: now,
                         updated_at: now,
@@ -421,6 +562,7 @@ mod tests {
                         args: None,
                         url: Some("https://mcp.example.com/mcp".into()),
                         env: None,
+                        proxy_allowed: false,
                         enabled: false,
                         created_at: now,
                         updated_at: now,
@@ -560,5 +702,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn proxy_name_split_handles_underscores_in_server() {
+        // server 名内含 `_` 也能正确切分（按第一个 `__` 拆）
+        assert_eq!(parse_proxy_name("netcatty__get_environment"),
+            Some(("netcatty", "get_environment")));
+        assert_eq!(parse_proxy_name("my_server__do_thing"),
+            Some(("my_server", "do_thing")));
+        // 缺 tool / 缺 server / 无分隔符 → 不是代理名
+        assert_eq!(parse_proxy_name("netcatty__"), None);
+        assert_eq!(parse_proxy_name("__tool"), None);
+        assert_eq!(parse_proxy_name("list_mcp_servers"), None);
+    }
+
+    #[test]
+    fn proxy_signature_stable_and_sensitive_to_config() {
+        let row = store::McpServerRow {
+            id: "s".into(), name: "a".into(), kind: "stdio".into(),
+            command: Some("/bin/x".into()), args: None, url: None, env: None,
+            proxy_allowed: true, enabled: true, created_at: 0, updated_at: 0,
+        };
+        let rows = [row.clone()];
+        let a = proxy_signature(&rows);
+        let b = proxy_signature(&rows);
+        assert_eq!(a, b, "相同配置签名应一致");
+        let mut changed = row;
+        changed.command = Some("/bin/y".into());
+        assert_ne!(a, proxy_signature(std::slice::from_ref(&changed)), "配置变化签名应改变");
+    }
+
+    #[tokio::test]
+    async fn proxy_servers_filters_enabled_and_allowed() {
+        let ctx = test_ctx();
+        seed(&ctx);
+        let servers = proxy_servers(&ctx);
+        // netcatty：enabled=1 && proxy_allowed=1；websearch：enabled=0 → 被过滤
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["netcatty"]);
+    }
+
+    #[tokio::test]
+    async fn proxy_call_to_ineligible_server_errors_without_network() {
+        let ctx = test_ctx();
+        seed(&ctx);
+        // websearch 未 enabled=1，代理校验应直接拒绝，不发起网络请求
+        let err = proxy_call_tool(&ctx, "websearch", "any", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("websearch"), "报错应点名 server: {err}");
+        assert!(err.contains("proxy_allowed"), "报错应提示未开启代理: {err}");
+    }
+
+    #[tokio::test]
+    async fn tools_list_with_unreachable_proxy_still_has_static_five() {
+        // netcatty 可代理但命令在本机不存在 → list_tools 失败应被跳过，
+        // 动态聚合不阻塞，静态 5 个工具仍在。
+        let ctx = test_ctx();
+        seed(&ctx);
+        let resp = handle_rpc(&ctx, &rpc("tools/list", json!({}), json!(8)))
+            .await
+            .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"list_mcp_servers"));
+        // 没有可用代理 target 时，不应混入任何 `server__tool` 动态项
+        assert!(!names.iter().any(|n| n.contains("__")), "不应有动态代理工具: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_tool_returns_error() {
+        let ctx = test_ctx();
+        let err = dispatch_tool(&ctx, "no_such_tool", &json!({})).await.unwrap_err();
+        assert!(err.contains("未知工具"), "未知静态工具应报错: {err}");
     }
 }
