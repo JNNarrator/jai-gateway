@@ -231,9 +231,14 @@ pub fn extract_usage(u: &Value) -> (Option<i64>, Option<i64>, Option<i64>, Optio
         .and_then(num);
     let cache_read = u
         .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| u.pointer("/input_tokens_details/cached_tokens"))
         .or_else(|| u.get("cache_read_input_tokens"))
         .and_then(num);
-    let cache_write = u.get("cache_creation_input_tokens").and_then(num);
+    let cache_write = u
+        .pointer("/prompt_tokens_details/cache_write_tokens")
+        .or_else(|| u.pointer("/input_tokens_details/cache_write_tokens"))
+        .or_else(|| u.get("cache_creation_input_tokens"))
+        .and_then(num);
     (input, output, cache_read, cache_write)
 }
 
@@ -620,17 +625,19 @@ fn usage_json(u: &Usage) -> Value {
         "completion_tokens": u.output_tokens,
         "total_tokens": u.input_tokens + u.output_tokens,
     });
-    if krate_has_cache() {
+    // 客户端（dsh 等）从 prompt_tokens_details.cached_tokens / cache_write_tokens 读取
+    // 缓存命中与写入细分；即使无缓存细分也保持 prompt_tokens 为主占用口径。
+    if u.cache_read_tokens.is_some() || u.cache_write_tokens.is_some() {
+        let mut details = serde_json::Map::new();
         if let Some(cr) = u.cache_read_tokens {
-            o["prompt_tokens_details"] = json!({"cached_tokens": cr});
+            details.insert("cached_tokens".into(), json!(cr));
         }
+        if let Some(cw) = u.cache_write_tokens {
+            details.insert("cache_write_tokens".into(), json!(cw));
+        }
+        o["prompt_tokens_details"] = Value::Object(details);
     }
     o
-}
-
-/// (无实际依赖，恒 false；预留 cache 细节)
-fn krate_has_cache() -> bool {
-    false
 }
 
 // ================================================================ M5：UpstreamCodec::OpenAI
@@ -899,11 +906,14 @@ fn parse_usage(u: Option<&Value>) -> Usage {
     let cache_read = u
         .and_then(|v| v.pointer("/prompt_tokens_details/cached_tokens"))
         .and_then(Value::as_u64);
+    let cache_write = u
+        .and_then(|v| v.pointer("/prompt_tokens_details/cache_write_tokens"))
+        .and_then(Value::as_u64);
     Usage {
         input_tokens: get("prompt_tokens"),
         output_tokens: get("completion_tokens"),
         cache_read_tokens: cache_read,
-        cache_write_tokens: None,
+        cache_write_tokens: cache_write,
     }
 }
 
@@ -913,8 +923,14 @@ pub fn parse_stream_event(raw: &[u8]) -> Result<Vec<crate::codec::ir::StreamEven
         serde_json::from_slice(raw).map_err(|e| format!("OpenAI SSE JSON 解析失败: {e}"))?;
 
     let mut out = Vec::new();
-    // usage chunk（choices 为空但有 usage）
-    if v.get("choices").map(Value::is_array) == Some(false) || v.get("choices").is_none() {
+    // usage chunk：choices 缺失/非数组，或空数组但带 usage（OpenAI 流式末帧标准形状
+    // "choices":[] + usage；此前漏掉空数组导致跨族转换 usage 恒 0）。
+    let choices_arr = v.get("choices").and_then(Value::as_array);
+    let usage_frame = match choices_arr {
+        Some(arr) => arr.is_empty(),
+        None => true,
+    };
+    if usage_frame {
         if let Some(u) = v.get("usage") {
             let usage = parse_usage(Some(u));
             out.push(StreamEvent::Finish {
@@ -1157,6 +1173,75 @@ mod tests {
         assert_eq!(v["completion_tokens"], 6);
     }
 
+    /// 复现排查（2026-09-03）：responses 直通流 输入/输出恒 0 的猜测验证。
+    /// Chat Completions 形状：choices 中途 frames + 末尾 usage 帧。
+    #[test]
+    fn repro_responses_passthrough_chatcompletions_shape() {
+        let frames = [
+            r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"},"index":0}]}"#,
+            r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"你好"},"index":0}]}"#,
+            r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[{"delta":{"content":"世界"},"index":0}]}"#,
+            r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":11333,"completion_tokens":64,"total_tokens":11397}}"#,
+            r#"data: [DONE]"#,
+        ];
+        // 整段一次性喂入（模拟整块）
+        let mut once = UsageScanner::new();
+        let joined = frames.join("\n\n") + "\n\n";
+        once.feed(joined.as_bytes());
+        let v = once.finish();
+        match &v {
+            Some(v) => println!("[chatcompletions once]: prompt={} completion={}", v["prompt_tokens"], v["completion_tokens"]),
+            None => println!("[chatcompletions once]: NONE"),
+        }
+        // 逐帧喂入（模拟真实网络分批）
+        let mut chunked = UsageScanner::new();
+        for f in frames {
+            chunked.feed((f.to_string() + "\n\n").as_bytes());
+        }
+        let v2 = chunked.finish();
+        match &v2 {
+            Some(v) => println!("[chatcompletions chunked]: prompt={} completion={}", v["prompt_tokens"], v["completion_tokens"]),
+            None => println!("[chatcompletions chunked]: NONE"),
+        }
+        assert!(v.is_some(), "ChatCompletions 形状整段喂入应捕获 usage");
+        assert!(v2.is_some(), "ChatCompletions 形状逐帧喂入应捕获 usage");
+    }
+
+    /// Responses 协议形状：response.completed 事件内嵌 usage。
+    #[test]
+    fn repro_responses_passthrough_responses_shape() {
+        let completed = r#"data: {"type":"response.completed","response":{"id":"resp_x","object":"response","status":"completed","model":"deepseek-v4-flash-0731","output":[{"type":"message","role":"assistant","content":[]}],"usage":{"input_tokens":11333,"input_tokens_details":{"cached_tokens":0},"output_tokens":64,"total_tokens":11397}}}"#;
+        let frames = [
+            r#"data: {"type":"response.created","response":{"id":"resp_x","object":"response","status":"in_progress","model":"deepseek-v4-flash-0731","output":[]}}"#,
+            r#"data: {"type":"response.output_text.delta","item_id":"msg_x","output_index":0,"delta":"你好"}"#,
+            completed,
+        ];
+        let mut once = UsageScanner::new();
+        let joined = frames.join("\n\n") + "\n\n";
+        once.feed(joined.as_bytes());
+        let v = once.finish();
+        match &v {
+            Some(v) => println!("[responses once]: input={} output={}", v["input_tokens"], v["output_tokens"]),
+            None => println!("[responses once]: NONE"),
+        }
+        // 模拟真实网络分批：把 completed 帧切成多个小块喂入
+        let mut chunked = UsageScanner::new();
+        for f in [&frames[0], &frames[1]] {
+            chunked.feed((f.to_string() + "\n\n").as_bytes());
+        }
+        for byte_slice in completed.as_bytes().chunks(48) {
+            chunked.feed(byte_slice);
+        }
+        chunked.feed(b"\n\n");
+        let v2 = chunked.finish();
+        match &v2 {
+            Some(v) => println!("[responses chunked]: input={} output={}", v["input_tokens"], v["output_tokens"]),
+            None => println!("[responses chunked]: NONE"),
+        }
+        assert!(v.is_some(), "Responses 形状整段喂入应捕获 usage");
+        assert!(v2.is_some(), "Responses 形状分批喂入应捕获 usage");
+    }
+
     /// usage 值紧跟关键字在同块但窗口极限（59 字节空白）也能判定；
     /// 超过 KEY_WAIT_LIMIT 仍无值则放弃该关键字（病态输入保护）。
     #[test]
@@ -1341,6 +1426,82 @@ mod tests {
         .unwrap();
         assert!(s3.contains("\"finish_reason\":\"stop\""));
         assert!(s3.contains("\"usage\""));
+    }
+
+    #[test]
+    fn parse_stream_event_usage_frame_with_empty_choices() {
+        // OpenAI 流式 include_usage 的标准末帧形状："choices":[] + usage。
+        // 此前该帧被当普通 chunk 丢弃，跨族转换路径 usage 恒 0（dsh ctx 恒 0 根因）。
+        let evs = super::parse_stream_event(
+            br#"{"id":"c1","object":"chat.completion.chunk","choices":[],
+                "usage":{"prompt_tokens":11333,"completion_tokens":64,"total_tokens":11397}}"#,
+        )
+        .unwrap();
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            crate::codec::ir::StreamEvent::Finish { usage, .. } => {
+                assert_eq!(usage.input_tokens, 11333);
+                assert_eq!(usage.output_tokens, 64);
+            }
+            other => panic!("应识别为 Finish，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_stream_event_empty_choices_without_usage_noop() {
+        // 空 choices 但无 usage 的帧不应产生任何事件（防御空转）
+        let evs = super::parse_stream_event(
+            br#"{"id":"c1","object":"chat.completion.chunk","choices":[]}"#,
+        )
+        .unwrap();
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn usage_json_emits_cache_details() {
+        // dsh 客户端从 prompt_tokens_details.cached_tokens / cache_write_tokens
+        // 读取缓存细分；网关 Chat 出站必须带上（此前 krate_has_cache 恒 false 整体丢弃）。
+        let u = Usage {
+            input_tokens: 90,
+            output_tokens: 6,
+            cache_read_tokens: Some(70),
+            cache_write_tokens: Some(12),
+        };
+        let v = usage_json(&u);
+        assert_eq!(v["prompt_tokens"], 90);
+        assert_eq!(v["prompt_tokens_details"]["cached_tokens"], 70);
+        assert_eq!(v["prompt_tokens_details"]["cache_write_tokens"], 12);
+
+        // 仅 cache_write 存在时也建 details
+        let u2 = Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_read_tokens: None,
+            cache_write_tokens: Some(5),
+        };
+        let v2 = usage_json(&u2);
+        assert_eq!(v2["prompt_tokens_details"]["cache_write_tokens"], 5);
+
+        // 无缓存细分时不产出空 details
+        let v3 = usage_json(&Usage::default());
+        assert!(v3.get("prompt_tokens_details").is_none());
+    }
+
+    #[test]
+    fn parse_usage_reads_cache_write_tokens() {
+        let raw = serde_json::json!({
+            "prompt_tokens": 80,
+            "completion_tokens": 4,
+            "total_tokens": 84,
+            "prompt_tokens_details": {
+                "cached_tokens": 50,
+                "cache_write_tokens": 20
+            }
+        });
+        let u = parse_usage(Some(&raw));
+        assert_eq!(u.input_tokens, 80);
+        assert_eq!(u.cache_read_tokens, Some(50));
+        assert_eq!(u.cache_write_tokens, Some(20));
     }
 
     #[test]

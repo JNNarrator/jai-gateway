@@ -470,15 +470,21 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
     let list = {
         let db = ctx.db.clone();
         tokio::task::spawn_blocking(move || {
-            db.with(|c| -> Result<Vec<(String, String)>, store::StoreError> {
+            db.with(|c| -> Result<Vec<(String, String, Option<i64>)>, store::StoreError> {
                 let mut stmt = c.prepare(
-                    "SELECT m.model_name, p.name FROM models m \
+                    "SELECT m.model_name, p.name, m.context_window FROM models m \
                      JOIN providers p ON p.id=m.provider_id \
                      WHERE m.enabled=1 AND p.enabled=1 \
                      ORDER BY p.priority ASC, m.rowid ASC",
                 )?;
                 let rows = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                        ))
+                    })?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
@@ -490,9 +496,17 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
         Ok(Ok(rows)) => {
             let mut seen = std::collections::HashSet::new();
             rows.into_iter()
-                .filter(|(id, owner)| seen.insert(format!("{owner}/{id}")))
-                .map(|(id, owner)| {
-                    json!({"id": format!("{owner}/{id}"), "object": "model", "owned_by": owner})
+                .filter(|(id, owner, _ctx)| seen.insert(format!("{owner}/{id}")))
+                .map(|(id, owner, ctx)| {
+                    // context_window 为 NULL 时给保守默认 128k（与 schema 注释/UI 编辑页一致），
+                    // 供客户端模型目录解析模型上下文窗口、计算 ctx 占用百分比。
+                    let context_window = ctx.unwrap_or(128_000);
+                    json!({
+                        "id": format!("{owner}/{id}"),
+                        "object": "model",
+                        "owned_by": owner,
+                        "contextWindow": context_window,
+                    })
                 })
                 .collect::<Vec<_>>()
         }
@@ -1112,8 +1126,21 @@ async fn try_converted_candidate(
         resolve_anthropic_inbound_tool_ids(&ctx.db, &mut req);
     }
 
-    // 2) 护栏（M4：blocks ≤ 64 / args ≤ 256KB）
+    // 2) 护栏（M4：单条消息 blocks ≤ 64 / args ≤ 256KB）
     if let Err(msg) = crate::codec::ir::validate_guards(&req) {
+        emit_log(
+            &ctx.logs,
+            wire.log_family(),
+            Some(peeked),
+            Some(cand.provider_id.as_str()),
+            cand.upstream_model_id.clone(),
+            400,
+            ms_since(started),
+            peeked.stream,
+            None,
+            Some("InvalidRequest".into()),
+            Some(msg.clone()),
+        );
         return Attempt::Delivered(wire.error_response(
             StatusCode::BAD_REQUEST,
             &msg,
@@ -1126,6 +1153,19 @@ async fn try_converted_candidate(
     if wire == InboundWire::OpenAi && req.extensions.contains_key("response_format") {
         let msg =
             "response_format（json_schema）在跨协议转换中不支持；支持子集：无。请改用提示词约束输出";
+        emit_log(
+            &ctx.logs,
+            wire.log_family(),
+            Some(peeked),
+            Some(cand.provider_id.as_str()),
+            cand.upstream_model_id.clone(),
+            400,
+            ms_since(started),
+            peeked.stream,
+            None,
+            Some("InvalidRequest".into()),
+            Some(msg.into()),
+        );
         return Attempt::Delivered(wire.error_response(
             StatusCode::BAD_REQUEST,
             msg,
@@ -2235,5 +2275,65 @@ mod tests {
             .unwrap()
             .expect("映射应已落库");
         assert_eq!(stored, long);
+    }
+
+    #[tokio::test]
+    async fn models_list_exposes_context_window() {
+        let db = Db::in_memory().unwrap();
+        db.with(|c| {
+            let now = store::now_ms();
+            store::provider_insert(
+                c,
+                &store::ProviderRow {
+                    id: "p1".into(),
+                    name: "prov".into(),
+                    base_url: "http://x".into(),
+                    family: "openai_compat".into(),
+                    enabled: true,
+                    priority: 1,
+                    weight: 1,
+                    extra_headers: None,
+                    api_key: None,
+                    website: None,
+                    last_ok_at: None,
+                    last_err_at: None,
+                    last_err_msg: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )?;
+            // 显式窗口 + NULL（回落 128k）两类都要覆盖
+            store::model_upsert(c, "p1", "alpha", Some(65536), 8192)?;
+            store::model_upsert(c, "p1", "beta", None, 4096)?;
+            Ok(())
+        })
+        .expect("seed 失败");
+
+        let dir = std::env::temp_dir().join(format!("jai-models-test-{}", rand::random::<u32>()));
+        let log_path = dir.join("main.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (logs, _t) = crate::store::logs::spawn_logger(log_path.to_str().unwrap()).unwrap();
+        let ctx = GatewayCtx::new(db.clone(), logs);
+
+        let resp = models_list(State(ctx)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        let alpha = data
+            .iter()
+            .find(|m| m["id"] == "prov/alpha")
+            .expect("alpha 模型应存在");
+        assert_eq!(alpha["contextWindow"], 65536);
+        let beta = data
+            .iter()
+            .find(|m| m["id"] == "prov/beta")
+            .expect("beta 模型应存在");
+        assert_eq!(
+            beta["contextWindow"], 128000,
+            "context_window 为 NULL 时应给保守默认 128k"
+        );
     }
 }

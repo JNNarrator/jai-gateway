@@ -9,7 +9,9 @@ use serde_json::{Map, Value};
 
 // ================================================================ 护栏常量
 
-/// 单请求最大内容块数（roadmap M4 护栏，越界 400）
+/// 单条消息最大内容块数（roadmap M4 护栏，越界 400）。
+/// 按 Anthropic 单消息 content block 上限语义，按单条消息校验、不跨消息累计——
+/// agent 客户端（dsh 等）每轮请求全量重放历史，跨消息累计会把正常长会话误伤。
 pub const MAX_BLOCKS_PER_REQUEST: usize = 64;
 /// 工具参数累计上限（roadmap M4 护栏，越界 400）
 pub const MAX_TOTAL_TOOL_ARGS_BYTES: usize = 256 * 1024;
@@ -356,12 +358,17 @@ fn base58_decode(s: &str) -> Option<Vec<u8>> {
 
 // ================================================================ 护栏校验
 
-/// M4 护栏：blocks ≤ 64 且工具参数累计 ≤ 256KB。返回 Err(描述)。
+/// M4 护栏：单条消息 blocks ≤ 64（Anthropic 单消息上限语义）且工具参数累计 ≤ 256KB。
+/// 返回 Err(描述)。
 pub fn validate_guards(req: &CanonicalRequest) -> Result<(), String> {
-    let mut blocks = 0usize;
     let mut tool_args_bytes = 0usize;
     for m in &req.messages {
-        blocks += m.blocks.len();
+        if m.blocks.len() > MAX_BLOCKS_PER_REQUEST {
+            return Err(format!(
+                "单条消息内容块超过 {} 个上限（护栏）",
+                MAX_BLOCKS_PER_REQUEST
+            ));
+        }
         for b in &m.blocks {
             if let Block::ToolUse { input, .. } = b {
                 tool_args_bytes += serde_json::to_string(input).unwrap_or_default().len();
@@ -372,12 +379,6 @@ pub fn validate_guards(req: &CanonicalRequest) -> Result<(), String> {
                     ));
                 }
             }
-        }
-        if blocks > MAX_BLOCKS_PER_REQUEST {
-            return Err(format!(
-                "单请求内容块超过 {} 个上限（护栏）",
-                MAX_BLOCKS_PER_REQUEST
-            ));
         }
     }
     Ok(())
@@ -435,6 +436,32 @@ mod tests {
             input: json!({"big": "x".repeat(MAX_TOTAL_TOOL_ARGS_BYTES + 1)}),
         }];
         assert!(validate_guards(&too_big).is_err());
+    }
+
+    #[test]
+    fn guards_count_per_message_not_request() {
+        // agent 长会话历史重放：多条消息各 40 块、累计远超 64，不应被全局累计误伤
+        let mut req = req_with_messages();
+        for m in &mut req.messages {
+            m.blocks = vec![
+                Block::Text {
+                    text: "x".into(),
+                };
+                MAX_BLOCKS_PER_REQUEST - 24
+            ];
+        }
+        assert_eq!(req.messages[0].blocks.len(), 40);
+        assert_eq!(req.messages.len(), 4);
+        assert!(validate_guards(&req).is_ok(), "跨消息累计不应触发护栏");
+
+        // 单条消息仍受 64 上限约束
+        req.messages[0].blocks = vec![
+            Block::Text {
+                text: "x".into(),
+            };
+            MAX_BLOCKS_PER_REQUEST + 1
+        ];
+        assert!(validate_guards(&req).is_err());
     }
 
     #[test]

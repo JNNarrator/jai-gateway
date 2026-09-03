@@ -67,6 +67,11 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
         match input {
             Value::String(s) => messages.push(CanonMessage::text(Role::User, s)),
             Value::Array(items) => {
+                // OpenAI Responses 里独立 reasoning item 先于其所属 assistant message 出现
+                // （dsh 等 agent 的真实历史格式）。推理内容必须并入后续 assistant 消息一起
+                // 回传上游（deepseek 等 thinking 模型要求 tool_calls 消息原样带
+                // reasoning_content，否则上游 400）—— 这里缓存到遇到下一条 assistant。
+                let mut pending_reasoning = String::new();
                 for item in items {
                     let typ = item.get("type").and_then(Value::as_str).unwrap_or_default();
                     // OpenAI 官方 input item 常省略顶层 type（直接 role+content），
@@ -77,6 +82,14 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                         _ if is_message => {
                             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                             let mut blocks = Vec::new();
+                            // 前置独立 reasoning item 并入本消息（需在 text/tool 块之前，出站
+                            // 编码按 assistant 消息聚合 reason内容时才会连同 tool_calls 一起回传）
+                            if role == "assistant" && !pending_reasoning.is_empty() {
+                                blocks.push(Block::Thinking {
+                                    signature: None,
+                                    text: std::mem::take(&mut pending_reasoning),
+                                });
+                            }
                             if let Some(content) = item.get("content").and_then(Value::as_array) {
                                 for part in content {
                                     let ptype = part
@@ -251,10 +264,29 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                             });
                         }
                         "reasoning" => {
-                            // Lenient：推理内容跨协议不转换
-                            extensions
-                                .entry("input_item:reasoning".to_string())
-                                .or_insert(Value::Null);
+                            // 独立 reasoning item：缓存文本，并入后续 assistant 消息的
+                            // Thinking 块（thinking 模型要求原样回传 reasoning_content，
+                            // 否则上游 400）。若其后没有 assistant 消息则自然丢弃。
+                            let text: String = item
+                                .get("reasoning")
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|p| {
+                                            p.get("text").and_then(Value::as_str)
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .or_else(|| {
+                                    item.get("reasoning")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string)
+                                })
+                                .unwrap_or_default();
+                            if !text.is_empty() {
+                                pending_reasoning = text;
+                            }
                         }
                         other => {
                             extensions
@@ -392,14 +424,7 @@ pub fn render_response(r: &CanonicalResponse) -> Value {
             _ => {}
         }
     }
-    let mut usage = json!({
-        "input_tokens": r.usage.input_tokens,
-        "output_tokens": r.usage.output_tokens,
-        "total_tokens": r.usage.input_tokens + r.usage.output_tokens,
-    });
-    if let Some(cr) = r.usage.cache_read_tokens {
-        usage["input_tokens_details"] = json!({"cached_tokens": cr});
-    }
+    let usage = build_usage(&r.usage);
     json!({
         "id": r.id,
         "object": "response",
@@ -409,6 +434,31 @@ pub fn render_response(r: &CanonicalResponse) -> Value {
         "output": output,
         "usage": usage,
     })
+}
+
+/// 把 IR Usage 渲染成 Responses 协议 usage 对象。
+///
+/// 客户端（dsh-tui 等 agent）从完成事件的 usage 里读取上下文占用：
+/// input_tokens 为占用主体，input_tokens_details.cached_tokens /
+/// cache_write_tokens 分别为缓存命中与写入。跨协议转换时若无缓存细分，
+/// 也不应收敛 input_tokens（OpenAI 语义里 input_tokens 已含缓存部分）。
+fn build_usage(u: &Usage) -> Value {
+    let mut usage = json!({
+        "input_tokens": u.input_tokens,
+        "output_tokens": u.output_tokens,
+        "total_tokens": u.input_tokens + u.output_tokens,
+    });
+    if u.cache_read_tokens.is_some() || u.cache_write_tokens.is_some() {
+        let mut details = serde_json::Map::new();
+        if let Some(cr) = u.cache_read_tokens {
+            details.insert("cached_tokens".into(), json!(cr));
+        }
+        if let Some(cw) = u.cache_write_tokens {
+            details.insert("cache_write_tokens".into(), json!(cw));
+        }
+        usage["input_tokens_details"] = Value::Object(details);
+    }
+    usage
 }
 
 /// 编码 IR → OpenAI Responses API 请求体（上游侧）。
@@ -642,6 +692,13 @@ pub fn parse_response(body: &[u8]) -> Result<CanonicalResponse, String> {
         .and_then(Value::as_u64)
     {
         parsed_usage.cache_read_tokens = Some(d);
+    }
+    if let Some(d) = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+    {
+        parsed_usage.cache_write_tokens = Some(d);
     }
 
     let status = v
@@ -1058,14 +1115,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                 StopReason::MaxTokens | StopReason::SafetyBlock => "incomplete",
                 _ => "completed",
             };
-            let mut usage_json = json!({
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "total_tokens": usage.input_tokens + usage.output_tokens,
-            });
-            if let Some(cr) = usage.cache_read_tokens {
-                usage_json["input_tokens_details"] = json!({"cached_tokens": cr});
-            }
+            let usage_json = build_usage(usage);
             let mut response = st.new_response(status);
             response["usage"] = usage_json;
             out.push(
@@ -1235,6 +1285,66 @@ mod tests {
     }
 
     #[test]
+    fn decode_standalone_reasoning_merges_into_next_assistant() {
+        // dsh 等 agent 的真实历史：独立 reasoning item 先于其所属 assistant message，
+        // 推理内容必须并入该 assistant 一并回传（thinking 模型要求原样带
+        // reasoning_content，否则上游 400）。旧实现把它当未知字段丢弃。
+        let req = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+                    {"type":"reasoning","id":"rs_e1",
+                     "reasoning":[{"type":"reasoning_text","text":"thinking step one"}]},
+                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]},
+                    {"role":"user","content":[{"type":"input_text","text":"continue"}]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(req.messages.len(), 3);
+        let asst = &req.messages[1];
+        assert_eq!(asst.role, Role::Assistant);
+        // Thinking 块并入 assistant 顶部，text/工具块在其后
+        assert!(matches!(
+            &asst.blocks[0],
+            Block::Thinking { text, .. } if text == "thinking step one"
+        ));
+        assert!(matches!(&asst.blocks[1], Block::Text { text } if text == "ok"));
+
+        // 独立 reasoning 与 function_call 组合：Thinking、ToolUse 都并入同一条 assistant
+        let req2 = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"type":"reasoning","id":"rs_e2",
+                     "reasoning":[{"type":"reasoning_text","text":"think step"}]},
+                    {"type":"message","role":"assistant","content":[],
+                     "function_call":[{"call_id":"call_e2","name":"f","arguments":"{}"}]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(req2.messages.len(), 1);
+        assert!(matches!(
+            &req2.messages[0].blocks[0],
+            Block::Thinking { text, .. } if text == "think step"
+        ));
+        assert!(matches!(
+            &req2.messages[0].blocks[1],
+            Block::ToolUse { id, name, .. } if id == "call_e2" && name == "f"
+        ));
+
+        // 跨族出站（Responses→openai_compat）：assistant 推理内容还原为 reasoning_content，
+        // 与 tool_calls 同消息，供 thinking 上游校验回传（否则上游 400）
+        let encoded = crate::codec::openai::encode_request(&req2).unwrap();
+        let msgs = encoded["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["reasoning_content"], "think step");
+        assert!(msgs[0]["tool_calls"].is_array());
+    }
+
+    #[test]
     fn render_response_shape() {
         let r = CanonicalResponse {
             id: "resp_test".into(),
@@ -1346,6 +1456,59 @@ mod tests {
         assert_eq!(parsed.usage.input_tokens, 10);
         assert_eq!(parsed.usage.output_tokens, 5);
         assert_eq!(parsed.usage.cache_read_tokens, Some(3));
+    }
+
+    #[test]
+    fn parse_response_reads_cache_write_tokens() {
+        // dsh 客户端从 input_tokens_details.cache_write_tokens 读缓存写入细分；
+        // 网关入站转换必须把它带回 IR Usage，出站渲染才能继续透传。
+        let body = br#"{
+            "id":"resp_cw","object":"response","status":"completed","model":"gpt-4o",
+            "output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hi","annotations":[]}]}],
+            "usage":{"input_tokens":100,"output_tokens":7,"total_tokens":107,
+              "input_tokens_details":{"cached_tokens":60,"cache_write_tokens":25}}
+        }"#;
+        let parsed = parse_response(body).expect("应解析成功");
+        assert_eq!(parsed.usage.input_tokens, 100);
+        assert_eq!(parsed.usage.cache_read_tokens, Some(60));
+        assert_eq!(parsed.usage.cache_write_tokens, Some(25));
+
+        // 出站渲染保留两个细分字段
+        let rendered = render_response(&parsed);
+        assert_eq!(rendered["usage"]["input_tokens_details"]["cached_tokens"], 60);
+        assert_eq!(
+            rendered["usage"]["input_tokens_details"]["cache_write_tokens"],
+            25
+        );
+    }
+
+    #[test]
+    fn build_usage_merges_cache_read_and_write() {
+        let u = Usage {
+            input_tokens: 50,
+            output_tokens: 9,
+            cache_read_tokens: Some(8),
+            cache_write_tokens: Some(3),
+        };
+        let v = build_usage(&u);
+        assert_eq!(v["input_tokens"], 50);
+        assert_eq!(v["input_tokens_details"]["cached_tokens"], 8);
+        assert_eq!(v["input_tokens_details"]["cache_write_tokens"], 3);
+
+        // cache_write 单独存在时也要建嵌套对象（OpenAI 语义可能只报写入不报命中）
+        let u2 = Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_read_tokens: None,
+            cache_write_tokens: Some(4),
+        };
+        let v2 = build_usage(&u2);
+        assert_eq!(v2["input_tokens_details"]["cache_write_tokens"], 4);
+        assert!(v2["input_tokens_details"].get("cached_tokens").is_none());
+
+        // 全无缓存细分时不产出空 details
+        let v3 = build_usage(&Usage::default());
+        assert!(v3.get("input_tokens_details").is_none());
     }
 
     #[test]
