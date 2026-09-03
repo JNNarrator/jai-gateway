@@ -871,7 +871,6 @@ async fn webdav_config_set(
 
 #[tauri::command]
 async fn webdav_test(core: State<'_, AppCore>, input: WebDavConfigInput) -> Result<String, String> {
-    let url = normalize_base(&input.url);
     let username = input.username.trim().to_string();
     // 留空表示测试已保存的密码；有输入则测未保存的新密码
     let password = match input
@@ -883,22 +882,16 @@ async fn webdav_test(core: State<'_, AppCore>, input: WebDavConfigInput) -> Resu
         Some(pw) => pw.to_string(),
         None => get_webdav_password(&core).await?,
     };
-    let resp = core
-        .http
-        .request(reqwest::Method::OPTIONS, &url)
-        .basic_auth(&username, Some(&password))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("连接失败: {e}"))?;
-    let status = resp.status().as_u16();
-    if status == 401 || status == 403 {
-        Err(format!("连接成功但认证失败（HTTP {status}）"))
-    } else if (200..400).contains(&status) {
-        Ok("连接成功".into())
-    } else {
-        Err(format!("连接异常（HTTP {status}）"))
-    }
+    // PROPFIND 带认证探测（sync::probe）——OPTIONS 常被服务器匿名放行，
+    // 无法证明凭据有效（DUFS 实测 OPTIONS 免认证 200、GET 错误凭据 401）
+    let cfg = WebDavConfig {
+        url: normalize_base(&input.url),
+        username,
+        directory: input.directory.trim().to_string(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
+    };
+    sync::probe(&core.http, &cfg, &password).await
 }
 
 #[derive(Serialize)]

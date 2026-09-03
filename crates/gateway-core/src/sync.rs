@@ -121,7 +121,12 @@ pub async fn push(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("WebDAV 推送失败 HTTP {status}: {text}"));
+        let hint = match status.as_u16() {
+            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码）",
+            404 => "（目标目录不存在，请先在远端创建该目录）",
+            _ => "",
+        };
+        return Err(format!("WebDAV 推送失败 HTTP {status}{hint}: {text}"));
     }
     Ok(())
 }
@@ -142,11 +147,49 @@ pub async fn pull(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("WebDAV 拉取失败 HTTP {status}: {text}"));
+        let hint = match status.as_u16() {
+            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码，或在设置中重新保存）",
+            404 => "（远端尚无配置文件：请先在任一设备执行「推送」，或检查目录是否正确）",
+            _ => "",
+        };
+        return Err(format!("WebDAV 拉取失败 HTTP {status}{hint}: {text}"));
     }
     resp.text()
         .await
         .map_err(|e| format!("WebDAV 响应读取失败: {e}"))
+}
+
+/// 校验 WebDAV 连接与凭据。
+///
+/// 用带认证的 `PROPFIND Depth:0` 探测，而非 OPTIONS——DUFS 等服务器对
+/// OPTIONS 匿名放行（实测返回 200），用它测连接会把无效凭据误报为
+/// 「连接成功」；PROPFIND 需真实认证，401/403 即凭据错误。
+pub async fn probe(
+    http: &reqwest::Client,
+    cfg: &WebDavConfig,
+    password: &str,
+) -> Result<String, String> {
+    let base = cfg.url.trim_end_matches('/');
+    let resp = http
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND 合法方法"),
+            base,
+        )
+        .basic_auth(&cfg.username, Some(password))
+        .header("Depth", "0")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("连接失败: {e}"))?;
+    let status = resp.status().as_u16();
+    match status {
+        200..=299 => Ok("连接成功".into()),
+        401 | 403 => Err(format!(
+            "认证失败（HTTP {status}）：用户名或密码不正确，请在设置中更新"
+        )),
+        404 => Err("路径不存在（HTTP 404）：请检查 WebDAV 根地址与目录设置".into()),
+        _ => Err(format!("连接异常（HTTP {status}）")),
+    }
 }
 
 #[cfg(test)]

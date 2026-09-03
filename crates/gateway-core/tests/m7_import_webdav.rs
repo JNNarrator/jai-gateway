@@ -4,8 +4,9 @@
 
 use axum::body::Body;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::Response;
-use axum::routing::{get, put};
+use axum::routing::{any, get, put};
 use axum::Router;
 use gateway_core::store::{self, Db};
 use gateway_core::sync::{self, WebDavConfig};
@@ -14,6 +15,67 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 // ---------------------------------------------------------------- mock WebDAV
+
+/// 需要认证的 mock：Authorization 必须等于 `Basic dTpwdw==`（u:pw）。
+/// GET/PUT/PROPFIND 校验，OPTIONS 匿名放行——复现 DUFS「OPTIONS 200、GET 401」行为。
+async fn spawn_dav_mock_auth() -> u16 {
+    fn basic_ok(h: &HeaderMap) -> bool {
+        h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Basic dTpwdw==")
+    }
+    let app = Router::new()
+        .route(
+            "/jai-config.json",
+            get(move |h: HeaderMap| async move {
+                if !basic_ok(&h) {
+                    return Response::builder().status(401).body(Body::empty()).unwrap();
+                }
+                Response::builder()
+                    .status(200)
+                    .body(Body::from("{\"ok\":true}"))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/jai-config.json",
+            put(move |h: HeaderMap, _body: String| async move {
+                if !basic_ok(&h) {
+                    return Response::builder().status(401).body(Body::empty()).unwrap();
+                }
+                Response::builder().status(201).body(Body::empty()).unwrap()
+            }),
+        )
+        .route(
+            "/",
+            any(move |h: HeaderMap| async move {
+                // PROPFIND（probe 用）也要认证
+                let status = if basic_ok(&h) { 207 } else { 401 };
+                Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.port()
+}
+
+/// 远端文件不存在的 mock：GET 一律 404。
+async fn spawn_dav_mock_missing() -> u16 {
+    let app = Router::new().route(
+        "/jai-config.json",
+        get(|| async { Response::builder().status(404).body(Body::empty()).unwrap() }),
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.port()
+}
 
 async fn spawn_dav_mock() -> (u16, Arc<Mutex<Option<String>>>) {
     #[derive(Clone)]
@@ -122,4 +184,84 @@ async fn webdav_pull_imports_into_db() {
     assert_eq!(report.providers_imported, 1);
     assert_eq!(report.models_imported, 1);
     assert_eq!(report.missing_keys, vec!["WebDav"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_verifies_credentials() {
+    let port = spawn_dav_mock_auth().await;
+    let client = reqwest::Client::new();
+    let cfg = WebDavConfig {
+        url: format!("http://127.0.0.1:{port}"),
+        username: "u".into(),
+        directory: String::new(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
+    };
+
+    // 错误凭据 → 认证失败（此前 OPTIONS 匿名放行会把这里误报成「连接成功」）
+    let err = sync::probe(&client, &cfg, "wrong").await.unwrap_err();
+    assert!(err.contains("认证失败"), "{err}");
+
+    // 正确凭据 → 连接成功
+    assert_eq!(sync::probe(&client, &cfg, "pw").await.unwrap(), "连接成功");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_push_error_hints_for_bad_credentials() {
+    let port = spawn_dav_mock_auth().await;
+    let client = reqwest::Client::new();
+    let cfg = WebDavConfig {
+        url: format!("http://127.0.0.1:{port}"),
+        username: "u".into(),
+        directory: String::new(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
+    };
+
+    let e = sync::pull(&client, &cfg, "wrong").await.unwrap_err();
+    assert!(e.contains("认证失败") && e.contains("HTTP 401"), "{e}");
+    let e = sync::push(&client, &cfg, "wrong", "{}".into())
+        .await
+        .unwrap_err();
+    assert!(e.contains("认证失败") && e.contains("HTTP 401"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_404_hints_missing_remote_file() {
+    let port = spawn_dav_mock_missing().await;
+    let client = reqwest::Client::new();
+    let cfg = WebDavConfig {
+        url: format!("http://127.0.0.1:{port}"),
+        username: "u".into(),
+        directory: String::new(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
+    };
+
+    let e = sync::pull(&client, &cfg, "pw").await.unwrap_err();
+    assert!(e.contains("HTTP 404") && e.contains("远端尚无"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_404_hints_bad_path() {
+    let app = Router::new().route(
+        "/somewhere-else",
+        any(|| async { Response::builder().status(404).body(Body::empty()).unwrap() }),
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    // 探测路径（无斜杠）不匹配 /somewhere-else → 404
+    let cfg = WebDavConfig {
+        url: format!("http://127.0.0.1:{}", addr.port()),
+        username: "u".into(),
+        directory: String::new(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
+    };
+    let err = sync::probe(&client, &cfg, "pw").await.unwrap_err();
+    assert!(err.contains("路径不存在"), "{err}");
 }
