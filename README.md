@@ -4,102 +4,105 @@
 
 # JAI — 桌面 AI API 网关
 
-> 开箱即用的本地 AI API 网关：把官方与第三方中转的杂牌 token 来源，收敛成一个稳定的本机入口，并让多设备（macOS / Windows）配置保持同步。
+> 开箱即用的本地 AI API 网关：把官方与第三方中转的杂牌 token 来源，收敛成一个稳定的本机入口（`127.0.0.1:1314`），并让多设备（macOS / Windows）配置随 WebDAV 保持同步。
 
-**状态**：M0–M9 全部里程碑完成，UI 2.0（阶段 0–6）已落地；真机验收矩阵（dsh / zcode 双客户端、WebDAV 双机、签名安装包）与 48h 常驻观察按[路线图](docs/design/roadmap.md)推进中。
+**状态**：M0–M9 全部里程碑完成 · UI 2.0（阶段 0–6）已落地 · v0.1.3
 
-> **适配范围**：当前专注适配 **DeepSeek Harness（dsh）** 与 **zcode** 两个国产 Agent——目标是通过 JAI 网关使用时，与直连上游的体验保持一致（协议、流式、工具调用、错误语义均透明兼容）。dsh 已两轮真机联调验证（Chat / Responses / 故障转移），报告见 [docs/test-report-dsh.md](docs/test-report-dsh.md)。
->
-> **其他客户端（Claude Code、Codex 等）**：协议直通仍可用，但暂无专属适配与回归保障——精力有限，暂不投入。
+---
 
-## 它解决什么问题
+## 项目架构
 
-- **token 来源杂**：官方 API、各类第三方中转并存，客户端各自配置难以维护 → JAI 统一代理，客户端只认一个地址
-- **设备多且异构**：macOS 与 Windows 各不止一台，供应商/模型配置手工同步成本高 → 配置可导出 + WebDAV 同步
-- **稳定性敏感**：agent 工作流（dsh、zcode 等）依赖网关常驻可用 → 稳定性为一票否决项，见路线图全局基线
+JAI 是 Tauri 2 本地应用，分三层：**React 前端 → Tauri 桌面壳 → Rust 网关核心库（gateway-core）**。
 
-## 核心特性
+```
+┌──────────────────────────────────────────────────────────┐
+│ UI（React 19 + TS + TailwindCSS 4 + shadcn/ui）          │
+│ Providers / Models / Gateway / Logs / Stats /            │
+│ MCP / Skills / Sync / Settings（9 页）                    │
+└──────────────────────┬───────────────────────────────────┘
+                       │ Tauri IPC（~60 个命令）
+┌──────────────────────▼───────────────────────────────────┐
+│ 桌面壳 src-tauri（Tauri 2）                               │
+│ 网关监督循环（看门狗 + 自动重启）· 系统托盘常驻           │
+│ WebDAV 自动推送（变更防抖 + 定时）· 供应商健康检查        │
+└──────────────────────┬───────────────────────────────────┘
+                       │ 进程内调用
+┌──────────────────────▼───────────────────────────────────┐
+│ gateway-core（Rust 网关核心库）                           │
+│  server   Axum 网关：入站协议线 / 安全中间件 / 代理       │
+│  codec    协议中间表示（IR）+ 各协议适配器               │
+│  router   多渠道路由：优先级故障转移 / 负载均衡           │
+│  store    SQLite 唯一事实源（供应商/模型/密钥/日志）      │
+│  discover 上游模型自动发现 · sync WebDAV 拉取推送        │
+│  mcp      MCP Server 台账 · skills 技能管理             │
+└──────────────────────┬───────────────────────────────────┘
+                       │ HTTP 出站（reqwest）
+        ┌──────────────┼──────────────┬────────────┐
+  openai_compat   openai_responses   anthropic    gemini
+```
 
-- 多供应商管理：OpenAI 兼容 / OpenAI Responses / Anthropic / Gemini 四族渠道，凭据明文存本地 SQLite（与网关 Key 同级安全模型，安全性依赖数据目录文件权限）
-- **配置随 WebDAV 同步**：供应商 API Key、网关 Key、WebDAV 密码随导出同步，换机器拉取即用（客户端零改动）；手动重新生成网关 Key 自动更新远端
-- 对外暴露统一网关入口（`127.0.0.1:1314`），支持四种入站协议线：
-  - OpenAI `POST /v1/chat/completions` 与旧版 `POST /v1/completions`
-  - OpenAI Responses API `POST /v1/responses`（Codex CLI 原生接入）
-  - Anthropic `POST /v1/messages`（Claude Code 直连，含 `count_tokens` 粗估）
-  - MCP 元数据服务 `POST /mcp`（Streamable HTTP）：把网关登记的 MCP Server / Skill
-    台账以 MCP 协议暴露给 Agent——只提供发现与信息（`list_mcp_servers` /
-    `get_mcp_server_detail` / `get_tool_schemas` / `list_skills` / `get_skill_detail`），
-    不注入对话链路、不代执行工具；env 仅回键名不回值
-- 同名模型多渠道路由：按优先级自动故障转移 + 健康感知排序 + 同优先级权重负载均衡
-- 模型别名/映射：每个模型可配置发给上游的真实模型 ID
-- 跨协议转换（含 tool calling）：让任意客户端组合任意上游模型
-- MCP / 技能（Skill）管理：网关内登记 MCP Server 与技能（连接测试、工具查看、ZIP 批量导入）；
-  MCP 配置导入自动识别三种格式——`{"mcpServers":{...}}` JSON、`codex mcp add` 命令行、
-  Codex `[mcp_servers.*]` TOML 片段；**不注入对话链路**——网关只做请求转发与协议转换，
-  工具执行由客户端侧完成
-- 应用内更新：设置页一键检查 / 下载 / 安装 GitHub Releases 最新版本（minisign 签名校验，重启生效）
-- 请求日志（仅元数据）与用量统计可视化（recharts 堆叠柱状图，近 7/30/90 天）
-- **UI 2.0**：明暗双主题（跟随系统）、可折叠侧边栏、shadcn/ui 组件体系、
-  表单校验就地展示（react-hook-form + zod）、自绘标题栏 + 窗口毛玻璃特效
-- 安全基线：强制鉴权（常量时间比对）、Host/Origin 校验、CORS 默认拒绝、鉴权失败限速、推送前快照
+### 协议双轨制（架构核心）
+
+网关的协议转换层按「**同族直通，跨族才转换**」设计（详细规格见 [docs/design/protocol-ir.md](docs/design/protocol-ir.md)）：
+
+- **同族直通**：入站协议族与出站供应商同族时走**字节级直通**——只改写上游 URL 与鉴权头，body 原样转发。零损耗，缓存控制、citations 等未建模特性原样保留。
+- **跨族转换**：解码 → 统一中间表示（IR）→ 编码。IR 先归一三大结构性差异：system 提示词位置、tool 结果载体、stop reason 枚举，使任意客户端协议都能组合任意上游模型（含 tool calling）。
+- 日志采集在直通路径上做旁路轻量扫描（抓 usage 数字），不做语义级解析。
+
+### 桌面壳关键机制
+
+- **网关监督循环**：独立任务常驻，异常退出自动重启（带重启计数），端口被占时自动顺延
+- **托盘常驻**：关闭窗口只隐藏到托盘，网关保持运行；真正退出走托盘菜单
+- **WebDAV 自动推送**：配置变更防抖合并 + 定时推送；手动推/拉与其互斥，推送前留存本地快照
+- **供应商健康检查**：每 10 分钟一轮探测全部启用供应商，状态跃迁时发系统通知
+- **SQLite 迁移 + 异步日志管道**：启动即应用迁移，失败即中止启动（早拦截）；日志经有界队列异步落库，不影响请求主路径
 
 ## 技术栈
 
-Tauri 2.0 · Rust (Axum + Reqwest) · React 19 + TypeScript + TailwindCSS 4 + shadcn/ui + recharts + react-hook-form/zod · SQLite · MIT
-
-## 界面
-
-<div align="center">
-  <img src="ui/public/jai-logo.svg" width="40" alt="" />
-  <p><sub>明暗双主题 · 可折叠侧边栏 · 全页面语义化组件 —— 主色为蓝紫渐变的「J + AI 星火」标识</sub></p>
-</div>
-
-## 适配范围（当前）
-
-JAI 当前专注适配 **DeepSeek Harness（dsh）** 与 **zcode**：
-
-- **目标**：通过 JAI 网关访问上游时，与直连上游的体验一致——协议、流式、工具调用、错误语义都保持透明兼容。
-- **dsh**：已实测打通 OpenAI Chat Completions 与 OpenAI Responses 两条链路，别名映射、故障转移均可正常工作（两轮真机联调，报告见 [docs/test-report-dsh.md](docs/test-report-dsh.md)）。
-- **zcode**：协议线待真机确认后纳入同等回归保障。
-- **其他客户端（Claude Code、Codex 等）**：协议直通仍可用（同族字节级透传、跨族协议转换），但无专属适配与回归保障——边界问题可能无法及时处理，暂不投入。
-- 同族直通默认保持字节级透传，跨族（协议不同）时才进入转换路径。
-- MCP / Skill 登记后可通过网关 `/mcp` 元数据服务暴露给 Agent（见「网关」页一键复制的
-  `mcpServers` 配置）；技能另支持 ZIP 批量导入与 Markdown 导出。
-
-## 文档索引
-
-| 文档 | 内容 |
+| 层 | 选型 |
 | --- | --- |
-| [docs/需求主文档](docs/) —— 见仓库根《JAI — 桌面 AI API 网关.md》 | 需求全量定义与评审记录 |
-| [docs/design/protocol-ir.md](docs/design/protocol-ir.md) | 协议中间表示、逐字段映射总表、行为规范 |
-| [docs/design/storage-schema.md](docs/design/storage-schema.md) | SQLite 表结构、密钥管理、日志策略 |
-| [docs/design/roadmap.md](docs/design/roadmap.md) | M0–M9 里程碑路线图、稳定性基线、UI 2.0 完成快照 |
-| [docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md](docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md) | UI 2.0 设计 spec（阶段 0–6） |
-| [docs/test-report-dsh.md](docs/test-report-dsh.md) | 本机 dsh 真机联调测试报告（两轮） |
-| [docs/zcode接入.md](docs/zcode接入.md) | zcode 接入 JAI 与 MCP/Skill 加载指南 |
-| [docs/design/release.md](docs/design/release.md) | 签名/公证/更新通道/发布检查单 |
+| 桌面框架 | Tauri 2.0（macOS / Windows） |
+| 后端 | Rust · Axum（HTTP 网关）· Reqwest（出站）· rusqlite（SQLite） |
+| 前端 | React 19 + TypeScript + TailwindCSS 4 + shadcn/ui + recharts + react-hook-form/zod |
+| 存储 | SQLite（供应商 / 模型 / 网关密钥 / 请求日志 / meta） |
+| 同步 | WebDAV（jai-export/v1 导出协议，last-write-wins） |
+| 更新 | GitHub Releases + tauri-plugin-updater（minisign 签名校验） |
 
-## 适配基准客户端
+## 核心特性
 
-DeepSeek Harness（dsh）· zcode —— 当前纳入专属适配与回归保障的客户端。
+- 多供应商管理：OpenAI 兼容 / OpenAI Responses / Anthropic / Gemini 四族渠道；凭据明文存本地 SQLite（与网关 Key 同级安全模型，安全性依赖数据目录文件权限）
+- **配置随 WebDAV 同步**：供应商 API Key、网关 Key、WebDAV 密码随导出同步，换机器拉取即用（客户端零改动）；手动重新生成网关 Key 自动更新远端；推送前快照 + last-write-wins
+- 对外暴露统一网关入口（`127.0.0.1:1314`），支持多条入站协议线：
+  - OpenAI `POST /v1/chat/completions` 与旧版 `POST /v1/completions`
+  - OpenAI Responses API `POST /v1/responses`
+  - Anthropic `POST /v1/messages`（Claude Code 直连，含 `count_tokens` 粗估）
+  - MCP 元数据服务 `POST /mcp`（Streamable HTTP）：把网关登记的 MCP Server / Skill 台账以 MCP 协议暴露给 Agent——`list_mcp_servers` / `get_mcp_server_detail` / `get_tool_schemas` / `list_skills` / `get_skill_detail` 五个只读工具，不注入对话链路、不代执行工具；env 仅回键名不回值
+- 同名模型多渠道路由：按优先级自动故障转移 + 健康感知排序 + 同优先级权重负载均衡
+- 模型别名/映射：每个模型可配置发给上游的真实模型 ID
+- 跨协议转换（含 tool calling）：让任意客户端组合任意上游模型
+- 上游模型自动发现：从供应商 `/models` 拉取模型并入库，自动填上下文窗口/最大输出缺省值
+- MCP / 技能（Skill）管理：网关内登记 MCP Server 与技能（连通检查、工具查看、ZIP 批量导入、Markdown 导出）；MCP 配置导入自动识别三种格式——`{"mcpServers":{...}}` JSON、`codex mcp add` 命令行、Codex `[mcp_servers.*]` TOML 片段
+- 应用内更新：设置页一键检查 / 下载 / 安装 GitHub Releases 最新版本（minisign 签名校验，重启生效）
+- 请求日志（仅元数据）与用量统计可视化（recharts 堆叠柱状图，近 7/30/90 天；可配保留天数/行数上限）
+- **UI 2.0**：明暗双主题（跟随系统）、可折叠侧边栏、shadcn/ui 组件体系、表单校验就地展示（react-hook-form + zod）、自绘标题栏 + 窗口毛玻璃特效
+- 安全基线：强制鉴权（常量时间比对）、Host/Origin 校验、CORS 默认拒绝、鉴权失败限速、推送前快照
 
-> 其他客户端（Claude Code、Codex 等）通过协议直通仍可使用，但不在适配范围内，无专属适配。
+## 重点支持客户端
 
-## 快速接入
+JAI 当前专注适配两个国产 Agent，协议直通与跨族转换对其透明可用：
 
-### Claude Code（Anthropic 线，M3 已支持；非当前适配范围，协议直通仍可用）
+- **DeepSeek Harness（dsh）**：第一优先客户端，Chat Completions 与 Responses 两条协议线均作为适配目标——选择 `openai-completions`（Chat）或 `openai-responses`（Responses）协议线接入。
+- **zcode**：协议线确认后纳入同等适配。
 
-在 Claude Code 中把 Base URL 指向 JAI、API Key 换成网关 Key（`sk-jai-*`，见应用「网关」页）：
+接入配置：baseURL `http://127.0.0.1:1314/v1`，API Key 用网关 Key（`sk-jai-*`，见应用「网关」页，同页提供各客户端内置接入示例）。
 
-```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:1314
-ANTHROPIC_AUTH_TOKEN=sk-jai-xxxx            # 或 ANTHROPIC_API_KEY=sk-jai-xxxx
-claude
-```
+> 💡 Windows 提示：JAI（reqwest）不读 Windows 系统代理，访问需代理的上游时需以 `HTTPS_PROXY=http://127.0.0.1:7890` 启动，否则对需代理的上游返回 502 `all_providers_failed`。
 
-要求：供应商页添加一个 **Anthropic** 协议族渠道并录入上游 Key，模型列表存在 Claude 型号（如 `claude-sonnet-4-5`）且启用。多轮对话、工具调用、prompt caching 均走字节级直通；`count_tokens` 由网关粗估返回，避免客户端降级。
+其他客户端（Claude Code、Codex、Continue 等）经协议直通仍可使用，但不在专属适配范围内。
 
-### 任意 OpenAI 兼容客户端（M1/M2 已支持）
+## 使用 · 快速接入
+
+### 任意 OpenAI 兼容客户端
 
 ```bash
 OPENAI_API_BASE=http://127.0.0.1:1314/v1
@@ -108,9 +111,15 @@ OPENAI_API_KEY=sk-jai-xxxx
 
 同名模型可配置多个渠道，按优先级自动故障转移（一级 5xx/429/超时 → 顺延下一渠道）。
 
-### DeepSeek Harness（dsh，最高优先级客户端）
+### Claude Code（Anthropic 线）
 
-dsh 的 provider 配置里 baseURL 填 `http://127.0.0.1:1314/v1`，API Key 用网关 Key；OpenAI Chat 与 Responses 两条线均已实测。详见接入示例（应用「网关」页内置）与[联调报告](docs/test-report-dsh.md)。
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:1314
+ANTHROPIC_AUTH_TOKEN=sk-jai-xxxx            # 或 ANTHROPIC_API_KEY=sk-jai-xxxx
+claude
+```
+
+要求：供应商页添加一个 **Anthropic** 协议族渠道并录入上游 Key，模型列表存在 Claude 型号（如 `claude-sonnet-4-5`）且启用。多轮对话、工具调用、prompt caching 走字节级直通；`count_tokens` 由网关粗估返回，避免客户端降级。
 
 ### MCP 元数据服务（/mcp）
 
@@ -128,9 +137,22 @@ dsh 的 provider 配置里 baseURL 填 `http://127.0.0.1:1314/v1`，API Key 用�
 }
 ```
 
-接入后 Agent 可查询网关登记的 MCP Server / Skill 台账：`list_mcp_servers`、`get_mcp_server_detail`、`get_tool_schemas`、`list_skills`、`get_skill_detail`。该服务只提供发现与信息，不代执行工具。
+接入后 Agent 可查询网关登记的 MCP Server / Skill 台账（五个只读工具）。该服务只提供发现与信息，不代执行工具。
 
-## 本地开发启动
+## 开发
+
+### 目录结构
+
+```
+JAI/
+├── crates/gateway-core/    # 网关核心库（协议/路由/存储/同步/MCP/Skill）
+├── src-tauri/              # Tauri 桌面壳（IPC 命令/托盘/网关监督）
+├── ui/                     # React 前端（pages/ + components/ + lib/）
+├── scripts/                # 开发与构建脚本（dev.sh 等）
+└── docs/                   # 需求与设计文档（见下方索引）
+```
+
+### 本地开发启动
 
 ```bash
 pnpm install            # 根工作区依赖
@@ -142,7 +164,19 @@ bash scripts/dev.sh     # 一键启动：Vite + Tauri 桌面壳
 - 网关默认监听 `http://127.0.0.1:1314`
 - 健康检查：`curl http://127.0.0.1:1314/healthz`
 - 前端构建门禁：`pnpm --dir ui build`（`tsc --noEmit` + `vite build` 零错误）
-- 全量回归：`bash scripts/regression.sh`（fmt / clippy / test / 前端 build）
+- 质量门禁：`bash scripts/regression.sh`（开发期一键检查）
+
+## 文档索引
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/需求主文档](docs/) —— 见仓库根《JAI — 桌面 AI API 网关.md》 | 需求全量定义与评审记录 |
+| [docs/design/protocol-ir.md](docs/design/protocol-ir.md) | 协议中间表示、逐字段映射总表、行为规范 |
+| [docs/design/storage-schema.md](docs/design/storage-schema.md) | SQLite 表结构、密钥管理、日志策略 |
+| [docs/design/roadmap.md](docs/design/roadmap.md) | M0–M9 里程碑路线图、稳定性基线 |
+| [docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md](docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md) | UI 2.0 设计 spec（阶段 0–6） |
+| [docs/zcode接入.md](docs/zcode接入.md) | zcode 接入 JAI 与 MCP/Skill 加载指南 |
+| [docs/design/release.md](docs/design/release.md) | 签名/公证/更新通道/发布检查单 |
 
 ## License
 
