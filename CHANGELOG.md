@@ -131,3 +131,8 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - `/v1/models` 暴露 `contextWindow`、usage 输出 cache 细分（prompt_tokens_details
   cached_tokens）、解析 `choices:[]` 的 usage 末帧，修复 ctx 占用指标
+- **WebDAV「测试连接」误判**：原用 OPTIONS 探测，DUFS 等服务器匿名放行
+  （实测免认证 200），凭据无效也误报「连接成功」；改用带凭据的
+  `PROPFIND Depth:0` 真实校验（sync::probe），401/403 → 「认证失败：用户名或
+  密码不正确」，404 → 「路径不存在」，拉取/推送错误同步分类提示
+  （401/403 认证失败、拉取 404 远端尚无配置文件、推送 404 目录不存在）
