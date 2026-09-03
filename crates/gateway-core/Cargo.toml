@@ -21,3 +21,8 @@ sha2.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
 zip.workspace = true
+
+# 测试专用假 MCP stdio server（集成测试经 CARGO_BIN_EXE_mcp_fake_server 引用）
+[[bin]]
+name = "mcp_fake_server"
+path = "src/bin/mcp_fake_server.rs"

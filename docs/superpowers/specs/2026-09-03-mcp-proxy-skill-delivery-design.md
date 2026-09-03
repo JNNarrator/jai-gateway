@@ -136,16 +136,24 @@ name = "skill__<name>" 且 skill 存在且 enabled
 - 审计日志 `[完成]`
   - 独立表 `proxy_call_logs`（migration 0008）+ `store::proxy_call_log`，与 `request_logs` 隔离（后者 `route_mode` 有 CHECK、会被 usage 聚合污染）
   - `proxy_call_tool` 每次调用记录 `{ts, server_name, tool_name, kind, status(ok/error), duration_ms, error}`，失败也记，异步落库
-- 进程复用优化 `[进行中]`
+- 进程复用优化 `[完成]`
   - 实测（netcatty-external，6 次）：平均 **~198ms/次**（181-274ms），冷启动 274ms。超出设计预期 50-100ms，故按「实测超标才做」推进连接池
   - 方案：重构 `run_stdio_jsonrpc`（mcp.rs:127）为「懒初始化 + 进程复用」。每个 `(cmd,args,env)` 键维护一个可复用 stdio 进程：首次调用 spawn+initialize，后续 tools/call 复用已初始化进程；JSON-RPC id 递增；超时回收 + 崩溃/无响应重建；单进程顺序执行用锁串行化（不同 server 独立连接）
-  - 现状：`run_stdio_jsonrpc` 现每次 spawn 后 initialize→notifications/initialized→request→kill（一次性）；`_tx` 参数为预留异步挂载点
+  - 落地（mcp.rs：`StdioPool` 全局池，键 = cmd/args/排序 env 的内容指纹，env 值只参与哈希不落池防密钥泄漏；`ConnState` 状态机 Uninit→Ready→Dead）
+    - 懒初始化：首次调用 spawn + initialize 握手（initialize id=1，业务请求 id 从 2 递增）
+    - 复用：后续 tools/list、tools/call 直接走已初始化进程，每次调用刷新 last_used
+    - 空闲回收：获取时 `last_used` 超过 `JAI_MCP_POOL_IDLE_MS`（默认 30s）→ kill + 同调用内重建
+    - 崩溃重建：获取时 `try_wait` 发现进程已退出 → 同调用内重建；请求中写失败/EOF → kill + 废弃（下次调用重建）；每次调用超时 `JAI_MCP_POOL_CALL_TIMEOUT_MS`（默认 120s，旧实现无限挂起）→ kill + 废弃
+    - 串行化：每连接一个 tokio Mutex，同 server 请求顺序执行；不同 server 键不同、独立连接互不阻塞
+    - 孤儿防护：`ReadyConn::drop` 兜底 `start_kill`，调用方中途取消（如 registry 10s 外层超时）也不会留孤儿进程
+  - 测试：`tests/mcp_pool.rs` 7 项集成测试（假 server 二进制 `mcp_fake_server`，经 `CARGO_BIN_EXE_*` 引用）——进程复用（pid/count 状态延续）、崩溃重建（crash / die_after_response 两路径）、超时废弃后自动恢复、空闲回收重建、env 参与连接键（不同 env 独立进程、同 env 共享、env JSON 键序无关）、8 路并发串行化不串帧
+  - 效果：进程内所有 stdio 工具调用（tools/list + tools/call 全入口）共享进程，冷启动开销从「每次 ~198ms」降到「仅首次 + 空闲超时后」
 
 ## 风险与对策
 
 | 风险 | 对策 |
 |---|---|
-| stdio server 每次调用 spawn 进程（冷启动开销） | M1 接受（一次调用一次进程，简单可靠）；已实测 ~198ms 超标，M3 推进连接池（懒初始化+复用+超时回收+崩溃重建） |
+| stdio server 每次调用 spawn 进程（冷启动开销） | 已实测 ~198ms 超标，M3 连接池已落地（懒初始化+复用+超时回收+崩溃重建，见上），冷启动仅剩首次/回收后 |
 | 动态工具列表膨胀（多 server × 多工具） | `proxy_allowed` 默认关 + 工具列表注明来源 + 必要时按 server 分组折叠 |
 | 工具重名（两个 server 都有 get_environment） | 两级命名空间天然隔离（`serverA__get_environment` ≠ `serverB__get_environment`） |
 | 代理执行越权风险 | `proxy_allowed` 显式开关 + 来源标注 + 文档写明权限语义 |
