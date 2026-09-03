@@ -439,14 +439,42 @@ async fn proxy_call_tool(ctx: &GatewayCtx, server_name: &str, tool_name: &str, a
             "Server「{server_name}」不存在或未开启代理执行（proxy_allowed）"
         ));
     };
+    let start = Instant::now();
     let result = crate::mcp::call_tool(server, tool_name, args.clone())
         .await
-        .map_err(|e| format!("[proxy: {server_name}] {tool_name} 调用失败: {e}"))?;
-    // 附来源标注，便于审计与 Agent 理解结果出处
-    Ok(json!({
+        .map_err(|e| format!("[proxy: {server_name}] {tool_name} 调用失败: {e}"));
+    let duration_ms = start.elapsed().as_millis() as i64;
+
+    // 审计落库（独立 proxy_call_logs 表；失败也要记，便于排查）
+    let audit = result.as_ref().map(|_| ("ok", None)).unwrap_or_else(|e| {
+        ("error", Some(e.as_str()))
+    });
+    let kind = server.kind.clone();
+    let db = ctx.db.clone();
+    let (status, err) = audit;
+    let err_owned = err.map(str::to_string);
+    let log_server = server_name.to_string();
+    let log_tool = tool_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _ = db.with_any(|c| {
+            crate::store::proxy_call_log(
+                c,
+                &log_server,
+                &log_tool,
+                &kind,
+                status,
+                duration_ms,
+                err_owned.as_deref(),
+            )
+        });
+    });
+
+    // 附来源标注，便于 Agent 理解结果出处
+    let payload = result.map(|v| json!({
         "source": format!("jai-gateway-proxy/{server_name}"),
-        "result": result,
-    }))
+        "result": v,
+    }))?;
+    Ok(payload)
 }
 
 async fn dispatch_tool(ctx: &GatewayCtx, name: &str, args: &Value) -> Result<Value, String> {

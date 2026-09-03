@@ -131,15 +131,21 @@ name = "skill__<name>" 且 skill 存在且 enabled
 
 ### M3：加固
 
-- UI「MCP」页加「允许代理执行」开关（per-server）
-- 调用日志/审计：proxy 调用落 request_logs 或独立表
-- 进程复用优化（stdio server 冷启动 50-100ms，如需再优化）
+- UI「MCP」页加「允许代理执行」开关（per-server） `[完成]`
+  - 前端：`McpServerRow` 加 `proxyAllowed` 字段（serde camelCase）、`api.mcpSetProxyAllowed` 封装、McpPage 每行加「代理」Switch（照抄 enabled toggle 模式）
+- 审计日志 `[完成]`
+  - 独立表 `proxy_call_logs`（migration 0008）+ `store::proxy_call_log`，与 `request_logs` 隔离（后者 `route_mode` 有 CHECK、会被 usage 聚合污染）
+  - `proxy_call_tool` 每次调用记录 `{ts, server_name, tool_name, kind, status(ok/error), duration_ms, error}`，失败也记，异步落库
+- 进程复用优化 `[进行中]`
+  - 实测（netcatty-external，6 次）：平均 **~198ms/次**（181-274ms），冷启动 274ms。超出设计预期 50-100ms，故按「实测超标才做」推进连接池
+  - 方案：重构 `run_stdio_jsonrpc`（mcp.rs:127）为「懒初始化 + 进程复用」。每个 `(cmd,args,env)` 键维护一个可复用 stdio 进程：首次调用 spawn+initialize，后续 tools/call 复用已初始化进程；JSON-RPC id 递增；超时回收 + 崩溃/无响应重建；单进程顺序执行用锁串行化（不同 server 独立连接）
+  - 现状：`run_stdio_jsonrpc` 现每次 spawn 后 initialize→notifications/initialized→request→kill（一次性）；`_tx` 参数为预留异步挂载点
 
 ## 风险与对策
 
 | 风险 | 对策 |
 |---|---|
-| stdio server 每次调用 spawn 进程（冷启动开销） | M1 接受（一次调用一次进程，简单可靠）；M3 若实测超标再做连接池 |
+| stdio server 每次调用 spawn 进程（冷启动开销） | M1 接受（一次调用一次进程，简单可靠）；已实测 ~198ms 超标，M3 推进连接池（懒初始化+复用+超时回收+崩溃重建） |
 | 动态工具列表膨胀（多 server × 多工具） | `proxy_allowed` 默认关 + 工具列表注明来源 + 必要时按 server 分组折叠 |
 | 工具重名（两个 server 都有 get_environment） | 两级命名空间天然隔离（`serverA__get_environment` ≠ `serverB__get_environment`） |
 | 代理执行越权风险 | `proxy_allowed` 显式开关 + 来源标注 + 文档写明权限语义 |

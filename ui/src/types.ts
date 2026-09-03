@@ -111,6 +111,8 @@ export interface McpServerRow {
   url?: string | null;
   env?: string | null;
   enabled: boolean;
+  /** 是否允许 jai-registry 代理执行（动态工具 + tools/call 转发） */
+  proxyAllowed: boolean;
   createdAt: number;
   updatedAt: number;
 }

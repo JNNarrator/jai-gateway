@@ -28,6 +28,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0007_mcp_proxy_allowed",
         include_str!("migrations/0007_mcp_proxy_allowed.sql"),
     ),
+    (
+        "0008_proxy_call_logs",
+        include_str!("migrations/0008_proxy_call_logs.sql"),
+    ),
 ];
 
 #[cfg(test)]

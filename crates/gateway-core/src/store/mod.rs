@@ -664,6 +664,24 @@ pub fn mcp_set_proxy_allowed(c: &Connection, id: &str, allowed: bool) -> Result<
     Ok(())
 }
 
+/// 追加一条 jai-registry 代理转发调用的审计记录（独立表，隔离于 request_logs）。
+pub fn proxy_call_log(
+    c: &Connection,
+    server_name: &str,
+    tool_name: &str,
+    kind: &str,
+    status: &str,
+    duration_ms: i64,
+    error: Option<&str>,
+) -> Result<(), StoreError> {
+    c.execute(
+        "INSERT INTO proxy_call_logs(ts,server_name,tool_name,kind,status,duration_ms,error)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![now_ms(), server_name, tool_name, kind, status, duration_ms, error],
+    )?;
+    Ok(())
+}
+
 pub fn mcp_set_enabled(c: &Connection, id: &str, enabled: bool) -> Result<(), StoreError> {
     c.execute(
         "UPDATE mcp_servers SET enabled=?1, updated_at=?2 WHERE id=?3",

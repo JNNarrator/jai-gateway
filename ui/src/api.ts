@@ -140,6 +140,8 @@ export const api = {
   }) => invoke<void>("mcp_update", { input }),
   mcpSetEnabled: (id: string, enabled: boolean) =>
     invoke<void>("mcp_set_enabled", { id, enabled }),
+  mcpSetProxyAllowed: (id: string, allowed: boolean) =>
+    invoke<void>("mcp_set_proxy_allowed", { id, allowed }),
   mcpDelete: (id: string) => invoke<void>("mcp_delete", { id }),
   mcpToolsList: (id: string) => invoke<McpTool[]>("mcp_tools_list", { id }),
   mcpToolsCall: (id: string, name: string, args: unknown) =>

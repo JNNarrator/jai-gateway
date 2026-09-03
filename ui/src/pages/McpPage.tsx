@@ -147,6 +147,14 @@ export function McpPage() {
                 onCheckedChange={(v) => act(() => api.mcpSetEnabled(m.id, v))}
                 aria-label={`启用/停用 ${m.name}`}
               />
+              <label className="flex shrink-0 cursor-pointer items-center gap-1.5">
+                <Switch
+                  checked={m.proxyAllowed}
+                  onCheckedChange={(v) => act(() => api.mcpSetProxyAllowed(m.id, v))}
+                  aria-label={`允许代理执行 ${m.name}`}
+                />
+                <span className="text-xs text-muted-foreground">代理</span>
+              </label>
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium text-foreground">{m.name}</span>

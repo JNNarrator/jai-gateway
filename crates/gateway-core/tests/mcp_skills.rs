@@ -271,3 +271,47 @@ fn parse_mcp_import_autodetects_three_formats() {
     let entries = store::parse_mcp_import("$ codex mcp add n -- echo hi").unwrap();
     assert_eq!(entries[0].command.as_deref(), Some("echo"));
 }
+
+#[test]
+fn proxy_call_logs_audit_table_roundtrip() {
+    // 0008 迁移建表后：插入 ok/error 两条审计，可查回、含时间与耗时
+    let db = Db::in_memory().unwrap();
+
+    db.with(|c| {
+        store::proxy_call_log(c, "netcatty-external", "terminal_execute", "stdio", "ok", 85, None)?;
+        store::proxy_call_log(
+            c,
+            "netcatty-external",
+            "sftp_write_file",
+            "stdio",
+            "error",
+            210,
+            Some("permission denied"),
+        )?;
+
+        let mut stmt = c.prepare(
+            "SELECT server_name, tool_name, kind, status, duration_ms, error
+             FROM proxy_call_logs ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("netcatty-external".into(), "terminal_execute".into(), "stdio".into(), "ok".into(), 85, None));
+        assert_eq!(rows[1].3, "error");
+        assert_eq!(rows[1].5.as_deref(), Some("permission denied"));
+
+        Ok::<_, store::StoreError>(())
+    })
+    .unwrap();
+}
