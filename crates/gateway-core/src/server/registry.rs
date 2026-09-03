@@ -109,9 +109,7 @@ async fn dynamic_tool_specs(ctx: &GatewayCtx) -> Vec<Value> {
     {
         let guard = PROXY_TOOLS_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(cache) = guard.as_ref() {
-            if cache.signature == signature
-                && cache.built_at.elapsed() < PROXY_TOOLS_TTL
-            {
+            if cache.signature == signature && cache.built_at.elapsed() < PROXY_TOOLS_TTL {
                 return cache.tools.clone();
             }
         }
@@ -397,7 +395,9 @@ async fn deliver_skill(ctx: &GatewayCtx, name: &str) -> Result<Value, String> {
     .map_err(|e| format!("任务失败: {e}"))??;
 
     let Some(s) = skills.iter().find(|s| s.name == name) else {
-        return Err(format!("未找到名为「{name}」的技能，用 list_skills 查看现有登记"));
+        return Err(format!(
+            "未找到名为「{name}」的技能，用 list_skills 查看现有登记"
+        ));
     };
     if !s.enabled {
         return Err(format!("技能「{name}」未启用（enabled=0），暂不投递"));
@@ -432,7 +432,12 @@ fn parse_proxy_name(name: &str) -> Option<(&str, &str)> {
 }
 
 /// 代理转发：`<server>__<tool>` → 真实 MCP Server 执行。
-async fn proxy_call_tool(ctx: &GatewayCtx, server_name: &str, tool_name: &str, args: &Value) -> Result<Value, String> {
+async fn proxy_call_tool(
+    ctx: &GatewayCtx,
+    server_name: &str,
+    tool_name: &str,
+    args: &Value,
+) -> Result<Value, String> {
     let servers = proxy_servers(ctx);
     let Some(server) = servers.iter().find(|s| s.name == server_name) else {
         return Err(format!(
@@ -446,9 +451,10 @@ async fn proxy_call_tool(ctx: &GatewayCtx, server_name: &str, tool_name: &str, a
     let duration_ms = start.elapsed().as_millis() as i64;
 
     // 审计落库（独立 proxy_call_logs 表；失败也要记，便于排查）
-    let audit = result.as_ref().map(|_| ("ok", None)).unwrap_or_else(|e| {
-        ("error", Some(e.as_str()))
-    });
+    let audit = result
+        .as_ref()
+        .map(|_| ("ok", None))
+        .unwrap_or_else(|e| ("error", Some(e.as_str())));
     let kind = server.kind.clone();
     let db = ctx.db.clone();
     let (status, err) = audit;
@@ -470,10 +476,12 @@ async fn proxy_call_tool(ctx: &GatewayCtx, server_name: &str, tool_name: &str, a
     });
 
     // 附来源标注，便于 Agent 理解结果出处
-    let payload = result.map(|v| json!({
-        "source": format!("jai-gateway-proxy/{server_name}"),
-        "result": v,
-    }))?;
+    let payload = result.map(|v| {
+        json!({
+            "source": format!("jai-gateway-proxy/{server_name}"),
+            "result": v,
+        })
+    })?;
     Ok(payload)
 }
 
@@ -810,10 +818,14 @@ mod tests {
     #[test]
     fn proxy_name_split_handles_underscores_in_server() {
         // server 名内含 `_` 也能正确切分（按第一个 `__` 拆）
-        assert_eq!(parse_proxy_name("netcatty__get_environment"),
-            Some(("netcatty", "get_environment")));
-        assert_eq!(parse_proxy_name("my_server__do_thing"),
-            Some(("my_server", "do_thing")));
+        assert_eq!(
+            parse_proxy_name("netcatty__get_environment"),
+            Some(("netcatty", "get_environment"))
+        );
+        assert_eq!(
+            parse_proxy_name("my_server__do_thing"),
+            Some(("my_server", "do_thing"))
+        );
         // 缺 tool / 缺 server / 无分隔符 → 不是代理名
         assert_eq!(parse_proxy_name("netcatty__"), None);
         assert_eq!(parse_proxy_name("__tool"), None);
@@ -823,9 +835,17 @@ mod tests {
     #[test]
     fn proxy_signature_stable_and_sensitive_to_config() {
         let row = store::McpServerRow {
-            id: "s".into(), name: "a".into(), kind: "stdio".into(),
-            command: Some("/bin/x".into()), args: None, url: None, env: None,
-            proxy_allowed: true, enabled: true, created_at: 0, updated_at: 0,
+            id: "s".into(),
+            name: "a".into(),
+            kind: "stdio".into(),
+            command: Some("/bin/x".into()),
+            args: None,
+            url: None,
+            env: None,
+            proxy_allowed: true,
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
         };
         let rows = [row.clone()];
         let a = proxy_signature(&rows);
@@ -833,7 +853,11 @@ mod tests {
         assert_eq!(a, b, "相同配置签名应一致");
         let mut changed = row;
         changed.command = Some("/bin/y".into());
-        assert_ne!(a, proxy_signature(std::slice::from_ref(&changed)), "配置变化签名应改变");
+        assert_ne!(
+            a,
+            proxy_signature(std::slice::from_ref(&changed)),
+            "配置变化签名应改变"
+        );
     }
 
     #[tokio::test]
@@ -871,20 +895,28 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"list_mcp_servers"));
         // enabled=1 的 skill 会以 skill__<name> 暴露（M2 正常行为）
-        assert!(names.contains(&"skill__code-review"), "应暴露已启用 skill: {names:?}");
+        assert!(
+            names.contains(&"skill__code-review"),
+            "应暴露已启用 skill: {names:?}"
+        );
         // 没有可用代理 target 时，不应混入任何 `server__tool` 动态代理项
         let proxied: Vec<&str> = names
             .iter()
             .copied()
             .filter(|n| n.contains("__") && !n.starts_with("skill__"))
             .collect();
-        assert!(proxied.is_empty(), "有不可达代理 target，不应出现 server__tool: {proxied:?}");
+        assert!(
+            proxied.is_empty(),
+            "有不可达代理 target，不应出现 server__tool: {proxied:?}"
+        );
     }
 
     #[tokio::test]
     async fn dispatch_unknown_tool_returns_error() {
         let ctx = test_ctx();
-        let err = dispatch_tool(&ctx, "no_such_tool", &json!({})).await.unwrap_err();
+        let err = dispatch_tool(&ctx, "no_such_tool", &json!({}))
+            .await
+            .unwrap_err();
         assert!(err.contains("未知工具"), "未知静态工具应报错: {err}");
     }
 
@@ -984,12 +1016,20 @@ mod tests {
             .unwrap();
         assert_eq!(payload["truncated"], true);
         let text = payload["content"].as_str().unwrap();
-        assert!(text.len() <= SKILL_MAX_BYTES + 64, "截断后仍超限: {}", text.len());
+        assert!(
+            text.len() <= SKILL_MAX_BYTES + 64,
+            "截断后仍超限: {}",
+            text.len()
+        );
         assert!(text.contains("已截断"), "应注明截断: {text}");
         // 截断处不把多字节 UTF-8 切断：content 前缀（去掉尾部标记行）须为合法 UTF-8
         if let Some(pos) = text.find("……（技能全文超出") {
             let prefix = &text[..pos];
-            assert!(prefix.len() <= SKILL_MAX_BYTES, "截断边界超过上限: {}", prefix.len());
+            assert!(
+                prefix.len() <= SKILL_MAX_BYTES,
+                "截断边界超过上限: {}",
+                prefix.len()
+            );
             assert!(prefix.is_char_boundary(prefix.len()), "截断落在字符中间");
         }
     }

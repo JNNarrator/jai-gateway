@@ -470,24 +470,26 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
     let list = {
         let db = ctx.db.clone();
         tokio::task::spawn_blocking(move || {
-            db.with(|c| -> Result<Vec<(String, String, Option<i64>)>, store::StoreError> {
-                let mut stmt = c.prepare(
-                    "SELECT m.model_name, p.name, m.context_window FROM models m \
+            db.with(
+                |c| -> Result<Vec<(String, String, Option<i64>)>, store::StoreError> {
+                    let mut stmt = c.prepare(
+                        "SELECT m.model_name, p.name, m.context_window FROM models m \
                      JOIN providers p ON p.id=m.provider_id \
                      WHERE m.enabled=1 AND p.enabled=1 \
                      ORDER BY p.priority ASC, m.rowid ASC",
-                )?;
-                let rows = stmt
-                    .query_map([], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, Option<i64>>(2)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
+                    )?;
+                    let rows = stmt
+                        .query_map([], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<i64>>(2)?,
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                },
+            )
         })
         .await
     };

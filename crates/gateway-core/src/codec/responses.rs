@@ -272,9 +272,7 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                 .and_then(Value::as_array)
                                 .map(|arr| {
                                     arr.iter()
-                                        .filter_map(|p| {
-                                            p.get("text").and_then(Value::as_str)
-                                        })
+                                        .filter_map(|p| p.get("text").and_then(Value::as_str))
                                         .collect::<Vec<_>>()
                                         .join("\n")
                                 })
@@ -1475,7 +1473,10 @@ mod tests {
 
         // 出站渲染保留两个细分字段
         let rendered = render_response(&parsed);
-        assert_eq!(rendered["usage"]["input_tokens_details"]["cached_tokens"], 60);
+        assert_eq!(
+            rendered["usage"]["input_tokens_details"]["cached_tokens"],
+            60
+        );
         assert_eq!(
             rendered["usage"]["input_tokens_details"]["cache_write_tokens"],
             25

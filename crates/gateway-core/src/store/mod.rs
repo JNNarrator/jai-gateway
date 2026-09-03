@@ -677,7 +677,15 @@ pub fn proxy_call_log(
     c.execute(
         "INSERT INTO proxy_call_logs(ts,server_name,tool_name,kind,status,duration_ms,error)
          VALUES (?1,?2,?3,?4,?5,?6,?7)",
-        params![now_ms(), server_name, tool_name, kind, status, duration_ms, error],
+        params![
+            now_ms(),
+            server_name,
+            tool_name,
+            kind,
+            status,
+            duration_ms,
+            error
+        ],
     )?;
     Ok(())
 }

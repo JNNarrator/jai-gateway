@@ -278,7 +278,15 @@ fn proxy_call_logs_audit_table_roundtrip() {
     let db = Db::in_memory().unwrap();
 
     db.with(|c| {
-        store::proxy_call_log(c, "netcatty-external", "terminal_execute", "stdio", "ok", 85, None)?;
+        store::proxy_call_log(
+            c,
+            "netcatty-external",
+            "terminal_execute",
+            "stdio",
+            "ok",
+            85,
+            None,
+        )?;
         store::proxy_call_log(
             c,
             "netcatty-external",
@@ -307,7 +315,17 @@ fn proxy_call_logs_audit_table_roundtrip() {
             .collect::<Result<Vec<_>, _>>()?;
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], ("netcatty-external".into(), "terminal_execute".into(), "stdio".into(), "ok".into(), 85, None));
+        assert_eq!(
+            rows[0],
+            (
+                "netcatty-external".into(),
+                "terminal_execute".into(),
+                "stdio".into(),
+                "ok".into(),
+                85,
+                None
+            )
+        );
         assert_eq!(rows[1].3, "error");
         assert_eq!(rows[1].5.as_deref(), Some("permission denied"));
 

@@ -104,3 +104,30 @@ All notable changes to this project will be documented in this file.
   （dsh 真机回归：server-everything 13 工具列出、echo 工具循环端到端通过）
 - 流式转换首字节含完整 SSE 流时未消费行缓冲的问题
 - Anthropic SSE 渲染缺失 `content_block_stop`、交错 tool_calls 顺序问题
+
+### Added
+- **统一 MCP 代理（M1）**：`/mcp` registry 动态聚合可代理 Server 的全部工具为
+  `<server>__<tool>` 命名（按首个双下划线分割，server 名可含下划线），dsh 只注册
+  `jai-registry` 一个入口即可发现并调用所有已配置 MCP 工具；网关显式转发
+  `tools/call` 到真实 Server（复用 mcp.rs 客户端），`description` 标注
+  `[proxy: <server>]`，30s TTL 缓存动态工具列表，单个 Server 拉取失败跳过不阻塞
+- **Skill 投递（M2）**：registry 动态生成 `skill__<name>` 工具，agent 按名调用即投递
+  Skill 全文（32KB 截断并注明），保持「目录 + 按名加载」拉取模式，不注入 system、
+  不代跑工具循环
+- **MCP 代理权限边界**：`mcp_servers.proxy_allowed` 开关（默认关，migration 0007），
+  未开启的 Server 工具不可见、不可调用；UI「MCP」页每行新增「代理」Switch
+
+### Changed
+- **MCP stdio 进程池**：`run_stdio_jsonrpc` 重构为「懒初始化 + 进程复用」——
+  每个 `(cmd,args,env)` 内容指纹维护一个可复用进程（env 值只哈希不落池防密钥泄漏），
+  首次调用 spawn+initialize、后续 tools/list、tools/call 复用（JSON-RPC id 递增）；
+  空闲超时回收（默认 30s，另挂 30s 后台清扫，Server 停用后不留孤儿进程）、
+  进程崩溃/无响应自动重建、每次调用超时保护（默认 120s，旧实现无限挂起）；
+  同连接请求锁串行化，不同 Server 独立连接。冷启动从每次 ~198ms 降到仅首次/回收后
+- **代理转发审计**：独立表 `proxy_call_logs`（migration 0008），每次代理调用记录
+  `{ts, server, tool, kind, status, duration_ms, error}`，失败也记、异步落库，
+  与 `request_logs` 的 `route_mode` CHECK / usage 聚合完全隔离
+
+### Fixed
+- `/v1/models` 暴露 `contextWindow`、usage 输出 cache 细分（prompt_tokens_details
+  cached_tokens）、解析 `choices:[]` 的 usage 末帧，修复 ctx 占用指标

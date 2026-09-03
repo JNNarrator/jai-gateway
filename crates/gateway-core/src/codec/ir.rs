@@ -443,24 +443,14 @@ mod tests {
         // agent 长会话历史重放：多条消息各 40 块、累计远超 64，不应被全局累计误伤
         let mut req = req_with_messages();
         for m in &mut req.messages {
-            m.blocks = vec![
-                Block::Text {
-                    text: "x".into(),
-                };
-                MAX_BLOCKS_PER_REQUEST - 24
-            ];
+            m.blocks = vec![Block::Text { text: "x".into() }; MAX_BLOCKS_PER_REQUEST - 24];
         }
         assert_eq!(req.messages[0].blocks.len(), 40);
         assert_eq!(req.messages.len(), 4);
         assert!(validate_guards(&req).is_ok(), "跨消息累计不应触发护栏");
 
         // 单条消息仍受 64 上限约束
-        req.messages[0].blocks = vec![
-            Block::Text {
-                text: "x".into(),
-            };
-            MAX_BLOCKS_PER_REQUEST + 1
-        ];
+        req.messages[0].blocks = vec![Block::Text { text: "x".into() }; MAX_BLOCKS_PER_REQUEST + 1];
         assert!(validate_guards(&req).is_err());
     }
 

@@ -1190,7 +1190,10 @@ mod tests {
         once.feed(joined.as_bytes());
         let v = once.finish();
         match &v {
-            Some(v) => println!("[chatcompletions once]: prompt={} completion={}", v["prompt_tokens"], v["completion_tokens"]),
+            Some(v) => println!(
+                "[chatcompletions once]: prompt={} completion={}",
+                v["prompt_tokens"], v["completion_tokens"]
+            ),
             None => println!("[chatcompletions once]: NONE"),
         }
         // 逐帧喂入（模拟真实网络分批）
@@ -1200,7 +1203,10 @@ mod tests {
         }
         let v2 = chunked.finish();
         match &v2 {
-            Some(v) => println!("[chatcompletions chunked]: prompt={} completion={}", v["prompt_tokens"], v["completion_tokens"]),
+            Some(v) => println!(
+                "[chatcompletions chunked]: prompt={} completion={}",
+                v["prompt_tokens"], v["completion_tokens"]
+            ),
             None => println!("[chatcompletions chunked]: NONE"),
         }
         assert!(v.is_some(), "ChatCompletions 形状整段喂入应捕获 usage");
@@ -1221,7 +1227,10 @@ mod tests {
         once.feed(joined.as_bytes());
         let v = once.finish();
         match &v {
-            Some(v) => println!("[responses once]: input={} output={}", v["input_tokens"], v["output_tokens"]),
+            Some(v) => println!(
+                "[responses once]: input={} output={}",
+                v["input_tokens"], v["output_tokens"]
+            ),
             None => println!("[responses once]: NONE"),
         }
         // 模拟真实网络分批：把 completed 帧切成多个小块喂入
@@ -1235,7 +1244,10 @@ mod tests {
         chunked.feed(b"\n\n");
         let v2 = chunked.finish();
         match &v2 {
-            Some(v) => println!("[responses chunked]: input={} output={}", v["input_tokens"], v["output_tokens"]),
+            Some(v) => println!(
+                "[responses chunked]: input={} output={}",
+                v["input_tokens"], v["output_tokens"]
+            ),
             None => println!("[responses chunked]: NONE"),
         }
         assert!(v.is_some(), "Responses 形状整段喂入应捕获 usage");
