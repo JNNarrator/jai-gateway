@@ -32,6 +32,9 @@ const SERVER_VERSION: &str = "0.1.0";
 /// 动态工具列表 TTL：避免每次 tools/list 都去 spawn MCP 子进程拉工具。
 const PROXY_TOOLS_TTL: Duration = Duration::from_secs(30);
 
+/// Skill 全文投递单次上限（超过截断并在结果尾部注明）。
+const SKILL_MAX_BYTES: usize = 32 * 1024;
+
 /// 进程内动态工具列表缓存（server 工具聚合）。`proxy_allowed` 配置变化由
 /// 签名比对感知：签名 = 可代理 server 的 (name, kind, command, url) 连接串。
 static PROXY_TOOLS_CACHE: Mutex<Option<ProxyToolsCache>> = Mutex::new(None);
@@ -122,6 +125,35 @@ async fn dynamic_tool_specs(ctx: &GatewayCtx) -> Vec<Value> {
         });
     }
     specs
+}
+
+/// 动态 Skill 工具（`skill__<name>`，仅返回 enabled=1 的）。skills 数量小、
+/// 变更少，每次直接查本地 SQLite 即可，无需缓存。
+async fn dynamic_skill_specs(ctx: &GatewayCtx) -> Vec<Value> {
+    let skills = tokio::task::spawn_blocking({
+        let db = ctx.db.clone();
+        move || db.with_any(|c| crate::store::skill_list(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("任务失败: {e}")));
+
+    let list = match skills {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("[registry] skill_list 失败: {e}");
+            return Vec::new();
+        }
+    };
+    list.into_iter()
+        .filter(|s| s.enabled)
+        .map(|s| {
+            json!({
+                "name": format!("skill__{}", s.name),
+                "description": format!("加载名为「{}」的技能全文并遵循（{}）", s.name, s.description),
+                "inputSchema": {"type": "object", "properties": {}}
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- 工具定义
@@ -354,6 +386,42 @@ async fn tool_skill_detail(ctx: &GatewayCtx, name: &str) -> Value {
     })
 }
 
+/// 投递 Skill 全文（`skill__<name>` 工具）。复用 `skill_list` 查找；
+/// 只投递给已启用（enabled=1）的技能，超长按 `SKILL_MAX_BYTES` 截断并注明。
+async fn deliver_skill(ctx: &GatewayCtx, name: &str) -> Result<Value, String> {
+    let skills = tokio::task::spawn_blocking({
+        let db = ctx.db.clone();
+        move || db.with_any(|c| crate::store::skill_list(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(|e| format!("任务失败: {e}"))??;
+
+    let Some(s) = skills.iter().find(|s| s.name == name) else {
+        return Err(format!("未找到名为「{name}」的技能，用 list_skills 查看现有登记"));
+    };
+    if !s.enabled {
+        return Err(format!("技能「{name}」未启用（enabled=0），暂不投递"));
+    }
+
+    let content = &s.content;
+    let truncated = content.len() > SKILL_MAX_BYTES;
+    let text = if truncated {
+        // 裁到不超过上限的字符边界，避免把 UTF-8 多字节字符切断
+        let mut t = content[..content.floor_char_boundary(SKILL_MAX_BYTES)].to_string();
+        t.push_str("\n\n……（技能全文超出 32KB，已截断）");
+        t
+    } else {
+        content.clone()
+    };
+
+    Ok(json!({
+        "skill": s.name,
+        "description": s.description,
+        "truncated": truncated,
+        "content": text,
+    }))
+}
+
 /// 解析 `server__tool` 命名（按第一个双下划线分割；server 名本身可含 `_`）。
 fn parse_proxy_name(name: &str) -> Option<(&str, &str)> {
     let (server, tool) = name.split_once("__")?;
@@ -382,7 +450,12 @@ async fn proxy_call_tool(ctx: &GatewayCtx, server_name: &str, tool_name: &str, a
 }
 
 async fn dispatch_tool(ctx: &GatewayCtx, name: &str, args: &Value) -> Result<Value, String> {
-    // 代理工具优先：命中 `server__tool` 且 server 可代理才转发
+    // Skill 投递优先：`skill__<name>` —— 必须先于 proxy 判断，
+    // 否则 `skill__code-review` 会被 parse_proxy_name 拆成 server="skill"。
+    if let Some(skill_name) = name.strip_prefix("skill__") {
+        return deliver_skill(ctx, skill_name).await;
+    }
+    // 代理工具：命中 `server__tool` 且 server 可代理才转发
     if let Some((server, tool)) = parse_proxy_name(name) {
         // 若与静态工具重名（如 "list_mcp_servers" 不含 __，不会走到这），
         // 直接按代理语义处理；server 校验在 proxy_call_tool 内完成。
@@ -449,8 +522,10 @@ async fn handle_rpc(ctx: &GatewayCtx, v: &Value) -> Option<Value> {
         "ping" => json!({}),
         "tools/list" => {
             // 静态只读工具 + 动态代理工具（可代理 server 的工具聚合，30s TTL）
+            // + 动态 Skill 工具（enabled=1 的 skill__<name>）
             let mut tools = tool_specs();
             tools.extend(dynamic_tool_specs(ctx).await);
+            tools.extend(dynamic_skill_specs(ctx).await);
             json!({"tools": tools})
         }
         "tools/call" => {
@@ -767,8 +842,15 @@ mod tests {
         let tools = resp["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"list_mcp_servers"));
-        // 没有可用代理 target 时，不应混入任何 `server__tool` 动态项
-        assert!(!names.iter().any(|n| n.contains("__")), "不应有动态代理工具: {names:?}");
+        // enabled=1 的 skill 会以 skill__<name> 暴露（M2 正常行为）
+        assert!(names.contains(&"skill__code-review"), "应暴露已启用 skill: {names:?}");
+        // 没有可用代理 target 时，不应混入任何 `server__tool` 动态代理项
+        let proxied: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| n.contains("__") && !n.starts_with("skill__"))
+            .collect();
+        assert!(proxied.is_empty(), "有不可达代理 target，不应出现 server__tool: {proxied:?}");
     }
 
     #[tokio::test]
@@ -776,5 +858,111 @@ mod tests {
         let ctx = test_ctx();
         let err = dispatch_tool(&ctx, "no_such_tool", &json!({})).await.unwrap_err();
         assert!(err.contains("未知工具"), "未知静态工具应报错: {err}");
+    }
+
+    #[tokio::test]
+    async fn skills_list_exposes_enabled_as_skill_tools() {
+        let ctx = test_ctx();
+        seed(&ctx);
+        let resp = handle_rpc(&ctx, &rpc("tools/list", json!({}), json!(9)))
+            .await
+            .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let skill_tools: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .filter(|n| n.starts_with("skill__"))
+            .collect();
+        // code-review enabled=1 → 暴露；其他 skill 不存在 → 仅此一个
+        assert_eq!(skill_tools, vec!["skill__code-review"]);
+    }
+
+    #[tokio::test]
+    async fn skill_delivery_returns_full_content() {
+        let ctx = test_ctx();
+        seed(&ctx);
+        let payload = dispatch_tool(&ctx, "skill__code-review", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(payload["skill"], "code-review");
+        assert_eq!(payload["truncated"], false);
+        assert_eq!(payload["content"], "按提交做评审。");
+    }
+
+    #[tokio::test]
+    async fn skill_delivery_rejects_disabled_or_missing() {
+        let ctx = test_ctx();
+        seed(&ctx);
+        // 先插入一个未启用的 skill
+        let now = store::now_ms();
+        ctx.db
+            .with(|c| {
+                store::skill_insert(
+                    c,
+                    &store::SkillRow {
+                        id: "k2".into(),
+                        name: "disabled-skill".into(),
+                        description: "未启用".into(),
+                        content: "不该被投递".into(),
+                        enabled: false,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+                Ok::<_, store::StoreError>(())
+            })
+            .unwrap();
+
+        let err = dispatch_tool(&ctx, "skill__disabled-skill", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("未启用"), "未启用 skill 应拒绝: {err}");
+
+        let err = dispatch_tool(&ctx, "skill__no-such", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("未找到"), "不存在的 skill 应报错: {err}");
+    }
+
+    #[tokio::test]
+    async fn skill_delivery_truncates_over_32kb() {
+        let ctx = test_ctx();
+        // 插入一个超大 skill（> 32KB）
+        let long = "长文内容-".repeat(5000); // ~50000 字节
+        assert!(long.len() > SKILL_MAX_BYTES);
+        let now = store::now_ms();
+        ctx.db
+            .with(|c| {
+                store::skill_insert(
+                    c,
+                    &store::SkillRow {
+                        id: "k-big".into(),
+                        name: "big-skill".into(),
+                        description: "超长技能".into(),
+                        content: long.clone(),
+                        enabled: true,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
+                .unwrap();
+                Ok::<_, store::StoreError>(())
+            })
+            .unwrap();
+
+        let payload = dispatch_tool(&ctx, "skill__big-skill", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(payload["truncated"], true);
+        let text = payload["content"].as_str().unwrap();
+        assert!(text.len() <= SKILL_MAX_BYTES + 64, "截断后仍超限: {}", text.len());
+        assert!(text.contains("已截断"), "应注明截断: {text}");
+        // 截断处不把多字节 UTF-8 切断：content 前缀（去掉尾部标记行）须为合法 UTF-8
+        if let Some(pos) = text.find("……（技能全文超出") {
+            let prefix = &text[..pos];
+            assert!(prefix.len() <= SKILL_MAX_BYTES, "截断边界超过上限: {}", prefix.len());
+            assert!(prefix.is_char_boundary(prefix.len()), "截断落在字符中间");
+        }
     }
 }
