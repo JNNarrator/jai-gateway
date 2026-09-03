@@ -944,6 +944,16 @@ pub fn parse_stream_event(raw: &[u8]) -> Result<Vec<crate::codec::ir::StreamEven
     if let Some(choices) = v.get("choices").and_then(Value::as_array) {
         if let Some(c) = choices.first() {
             if let Some(delta) = c.get("delta") {
+                // thinking 模型（deepseek 等）：reasoning_content 增量必须保留进 IR，
+                // 否则跨族出站丢思考、客户端历史缺 reasoning_content、下轮回传上游 400。
+                // 与 DeepSeek 流式顺序一致：reasoning_content 先于 content。
+                if let Some(rc) = delta.get("reasoning_content").and_then(Value::as_str) {
+                    if !rc.is_empty() {
+                        out.push(StreamEvent::ThinkingDelta {
+                            text: rc.to_string(),
+                        });
+                    }
+                }
                 if let Some(content) = delta.get("content").and_then(Value::as_str) {
                     if !content.is_empty() {
                         out.push(StreamEvent::TextDelta {
@@ -1467,6 +1477,40 @@ mod tests {
         )
         .unwrap();
         assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn parse_stream_event_reasoning_content_delta() {
+        // thinking 模型（deepseek 等）流式增量带 reasoning_content；
+        // 必须转成 ThinkingDelta 保留进 IR，否则跨族出站丢思考、
+        // 客户端历史缺 reasoning_content、下轮回传上游 400。
+        use crate::codec::ir::StreamEvent as Ev;
+        let evs = super::parse_stream_event(
+            br#"{"id":"c1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"reasoning_content":"step one"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            Ev::ThinkingDelta { text } => assert_eq!(text, "step one"),
+            other => panic!("应识别为 ThinkingDelta，得到 {other:?}"),
+        }
+
+        // 同时带 content 与 reasoning_content 时两者都产出
+        let evs = super::parse_stream_event(
+            br#"{"id":"c1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"reasoning_content":"think","content":"answer"}}]}"#,
+        )
+        .unwrap();
+        let kinds: Vec<String> = evs
+            .iter()
+            .map(|e| match e {
+                Ev::ThinkingDelta { .. } => "thinking".into(),
+                Ev::TextDelta { .. } => "text".into(),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["thinking", "text"]);
     }
 
     #[test]

@@ -34,6 +34,34 @@ pub fn error_body(message: &str, err_type: &str, code: Option<&str>) -> Value {
     })
 }
 
+/// 从 Responses reasoning item 提取推理文本，兼容三种形状：
+/// - OpenAI 标准：`summary` / `content` 数组（summary_text / reasoning_text 元素）
+/// - 旧式：`reasoning` 数组（含 `text` 字段）或字符串
+fn extract_reasoning_text(item: &Value) -> String {
+    let parts = |key: &str| -> String {
+        item.get(key)
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    };
+    // 空数组也要视为「无内容」继续尝试下一形状，不能阻断 fallthrough
+    for key in ["content", "summary", "reasoning"] {
+        let t = parts(key);
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    item.get("reasoning")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// 解码 `/v1/responses` 请求体 → CanonicalRequest。
 pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
     let v: Value = serde_json::from_slice(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
@@ -140,25 +168,12 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                 // reasoning 文本保留进 IR Thinking 块：thinking 模型
                                 // （如 deepseek）要求 assistant tool_calls 消息必须
                                 // 原样回传 reasoning_content，否则上游 400。
-                                if let Some(rs) = item.get("reasoning") {
-                                    let text: String = rs
-                                        .as_array()
-                                        .map(|arr| {
-                                            arr.iter()
-                                                .filter_map(|p| {
-                                                    p.get("text").and_then(Value::as_str)
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join("\n")
-                                        })
-                                        .or_else(|| rs.as_str().map(|s| s.to_string()))
-                                        .unwrap_or_default();
-                                    if !text.is_empty() {
-                                        blocks.push(Block::Thinking {
-                                            signature: None,
-                                            text,
-                                        });
-                                    }
+                                let rtext = extract_reasoning_text(item);
+                                if !rtext.is_empty() {
+                                    blocks.push(Block::Thinking {
+                                        signature: None,
+                                        text: rtext,
+                                    });
                                 }
                                 if let Some(fc) = item.get("function_call") {
                                     // function_call 可能是单对象（内嵌形态），也可能
@@ -267,21 +282,7 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                             // 独立 reasoning item：缓存文本，并入后续 assistant 消息的
                             // Thinking 块（thinking 模型要求原样回传 reasoning_content，
                             // 否则上游 400）。若其后没有 assistant 消息则自然丢弃。
-                            let text: String = item
-                                .get("reasoning")
-                                .and_then(Value::as_array)
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|p| p.get("text").and_then(Value::as_str))
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                })
-                                .or_else(|| {
-                                    item.get("reasoning")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_string)
-                                })
-                                .unwrap_or_default();
+                            let text = extract_reasoning_text(item);
                             if !text.is_empty() {
                                 pending_reasoning = text;
                             }
@@ -408,6 +409,17 @@ pub fn render_response(r: &CanonicalResponse) -> Value {
                     "role": "assistant",
                     "status": "completed",
                     "content": [{"type": "output_text", "text": text, "annotations": []}],
+                }));
+            }
+            Block::Thinking { text, .. } => {
+                // 推理内容以独立 reasoning item 下发，客户端（dsh 等）存进历史，
+                // 下轮回传原样带回（thinking 模型要求，否则上游 400）
+                output.push(json!({
+                    "type": "reasoning",
+                    "id": format!("rs_{}", r.id),
+                    "role": "assistant",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": text, "annotations": []}],
                 }));
             }
             Block::ToolUse { id, name, input } => {
@@ -844,6 +856,53 @@ data: {data}
                     }),
                 );
             }
+            Block::Thinking { text, .. } => {
+                // 推理内容独立 reasoning item（含 added/delta/done 生命周期）
+                let item_id = format!("rs_{}", resp.id);
+                let item = json!({
+                    "type":"reasoning",
+                    "id": item_id,
+                    "role":"assistant",
+                    "summary":[],
+                    "content":[],
+                });
+                push(
+                    &mut out,
+                    "response.output_item.added",
+                    json!({
+                        "type":"response.output_item.added",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                );
+                push(
+                    &mut out,
+                    "response.reasoning_text.delta",
+                    json!({
+                        "type":"response.reasoning_text.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "delta": text,
+                    }),
+                );
+                let done_item = json!({
+                    "type":"reasoning",
+                    "id": item_id,
+                    "role":"assistant",
+                    "summary":[],
+                    "content":[{"type":"reasoning_text","text":text,"annotations":[]}],
+                });
+                push(
+                    &mut out,
+                    "response.output_item.done",
+                    json!({
+                        "type":"response.output_item.done",
+                        "output_index": output_index,
+                        "item": done_item,
+                    }),
+                );
+            }
             Block::ToolUse { id, name, input } => {
                 let item_id = format!("fc_{id}");
                 let arguments = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
@@ -928,6 +987,10 @@ pub struct RenderState {
     pub item_started: bool,
     /// 当前文本 item 已累积的文本（用于 output_text.done / content_part.done）
     pub current_text: String,
+    /// 当前 reasoning item 是否已开（thinking 增量流）
+    pub reasoning_started: bool,
+    /// 当前 reasoning item 已累积的推理文本（用于 output_item.done 回填）
+    pub current_reasoning: String,
 }
 
 impl RenderState {
@@ -947,12 +1010,39 @@ impl RenderState {
 /// 返回 0..N 个 JSON payload；调用方负责包成 `data: {payload}\n\n`。
 pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String> {
     use crate::codec::ir::StreamEvent as Ev;
+    // 非 thinking 事件到来前，若 reasoning item 仍开着（上游 thinking 总是先于
+    // text/tool delta 到达），先关闭它并推进 output_index，避免与后续 item 撞号。
+    fn close_reasoning(st: &mut RenderState, out: &mut Vec<String>) {
+        if !st.reasoning_started {
+            return;
+        }
+        st.reasoning_started = false;
+        let text = std::mem::take(&mut st.current_reasoning);
+        let part = json!({"type": "reasoning_text", "text": text, "annotations": []});
+        out.push(
+            json!({
+                "type": "response.output_item.done",
+                "output_index": st.output_index,
+                "item": {
+                    "type": "reasoning",
+                    "id": format!("rs_{}", st.response_id),
+                    "role": "assistant",
+                    "summary": [],
+                    "content": [part],
+                },
+            })
+            .to_string(),
+        );
+        st.output_index += 1;
+    }
     match e {
         Ev::Start { model: _ } => {
             st.started = true;
             st.output_index = 0;
             st.item_started = false;
             st.current_text.clear();
+            st.reasoning_started = false;
+            st.current_reasoning.clear();
             vec![
                 json!({
                     "type": "response.created",
@@ -971,6 +1061,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                 return Vec::new();
             }
             let mut out = Vec::new();
+            close_reasoning(st, &mut out);
             if !st.item_started {
                 st.item_started = true;
                 st.current_text.clear();
@@ -1012,22 +1103,62 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             );
             out
         }
-        Ev::ThinkingDelta { .. } => Vec::new(),
+        Ev::ThinkingDelta { text } => {
+            if text.is_empty() {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            if !st.reasoning_started {
+                st.reasoning_started = true;
+                st.current_reasoning.clear();
+                out.push(
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": st.output_index,
+                        "item": {
+                            "type": "reasoning",
+                            "id": format!("rs_{}", st.response_id),
+                            "role": "assistant",
+                            "summary": [],
+                            "content": [],
+                        },
+                    })
+                    .to_string(),
+                );
+            }
+            st.current_reasoning.push_str(text);
+            out.push(
+                json!({
+                    "type": "response.reasoning_text.delta",
+                    "item_id": format!("rs_{}", st.response_id),
+                    "output_index": st.output_index,
+                    "content_index": 0,
+                    "delta": text,
+                })
+                .to_string(),
+            );
+            out
+        }
         Ev::ToolCallStart { index, id, name } => {
+            let mut out = Vec::new();
+            close_reasoning(st, &mut out);
             let item_id = format!("fc_{index}_{id}");
             st.item_started = true;
-            vec![json!({
-                "type": "response.output_item.added",
-                "output_index": st.output_index,
-                "item": {
-                    "type": "function_call",
-                    "id": item_id,
-                    "call_id": id,
-                    "name": name,
-                    "arguments": "",
-                },
-            })
-            .to_string()]
+            out.push(
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": st.output_index,
+                    "item": {
+                        "type": "function_call",
+                        "id": item_id,
+                        "call_id": id,
+                        "name": name,
+                        "arguments": "",
+                    },
+                })
+                .to_string(),
+            );
+            out
         }
         Ev::ToolCallArgsDelta {
             index,
@@ -1069,6 +1200,8 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
         }
         Ev::Finish { stop_reason, usage } => {
             let mut out = Vec::new();
+            // 纯 thinking 响应（无 text/tool）：先关闭 reasoning item 再收尾
+            close_reasoning(st, &mut out);
             if st.item_started {
                 let item_id = format!("msg_{}", st.response_id);
                 let text = std::mem::take(&mut st.current_text);
@@ -1340,6 +1473,156 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["reasoning_content"], "think step");
         assert!(msgs[0]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn decode_openai_standard_reasoning_item_shapes() {
+        // OpenAI Responses 官方 output 里 reasoning item 用 summary/content 数组
+        // （summary_text / reasoning_text 元素）；dsh（pi-ai）回传历史时按
+        // output_item.done 的 item 原样放回，故入站需兼容这两种形状。
+        let req = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+                    {"type":"reasoning","id":"rs_s1",
+                     "summary":[],
+                     "content":[{"type":"reasoning_text","text":"think via content"}]},
+                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &req.messages[1].blocks[0],
+            Block::Thinking { text, .. } if text == "think via content"
+        ));
+
+        let req2 = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"type":"reasoning","id":"rs_s2",
+                     "summary":[{"type":"summary_text","text":"brief"},{"type":"summary_text","text":"more"}],
+                     "content":[]},
+                    {"type":"message","role":"assistant","content":[],
+                     "function_call":{"call_id":"call_s2","name":"f","arguments":"{}"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &req2.messages[0].blocks[0],
+            Block::Thinking { text, .. } if text == "brief\nmore"
+        ));
+    }
+
+    #[test]
+    fn render_response_includes_reasoning_item() {
+        // 非流式出站：Thinking 块 → reasoning item（含 content 全文），
+        // 供客户端存历史、下轮回传（thinking 上游要求原样带 reasoning_content）
+        let r = CanonicalResponse {
+            id: "resp_think".into(),
+            model: "deepseek".into(),
+            output: vec![
+                Block::Thinking {
+                    signature: None,
+                    text: "deep thinking".into(),
+                },
+                Block::Text {
+                    text: "answer".into(),
+                },
+            ],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        };
+        let v = render_response(&r);
+        let out = v["output"].as_array().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["type"], "reasoning");
+        assert_eq!(out[0]["content"][0]["type"], "reasoning_text");
+        assert_eq!(out[0]["content"][0]["text"], "deep thinking");
+        assert_eq!(out[1]["type"], "message");
+        assert_eq!(out[1]["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn render_stream_thinking_events() {
+        // 流式出站：ThinkingDelta → reasoning item 的 added + reasoning_text.delta
+        // 事件；后续 text 到来前先 output_item.done 关闭 reasoning item。
+        use crate::codec::ir::StreamEvent as Ev;
+        let mut st = RenderState {
+            response_id: "resp_t".into(),
+            model: "deepseek".into(),
+            current_text: String::new(),
+            ..Default::default()
+        };
+        let _ = render_stream_event(
+            &Ev::Start {
+                model: "deepseek".into(),
+            },
+            &mut st,
+        );
+
+        let first = render_stream_event(
+            &Ev::ThinkingDelta {
+                text: "think step one".into(),
+            },
+            &mut st,
+        );
+        assert!(first[0].contains("response.output_item.added"));
+        assert!(first[0].contains("\"type\":\"reasoning\""));
+        assert!(first[0].contains("rs_resp_t"));
+        assert!(first[1].contains("response.reasoning_text.delta"));
+        assert!(first[1].contains("think step one"));
+
+        let second = render_stream_event(
+            &Ev::ThinkingDelta {
+                text: " step two".into(),
+            },
+            &mut st,
+        );
+        assert!(second[0].contains("response.reasoning_text.delta"));
+        assert!(second[0].contains("step two"));
+
+        // text 到来：先关 reasoning（done 含累计全文），再开文本 item
+        let txt = render_stream_event(&Ev::TextDelta { text: "hi".into() }, &mut st);
+        assert!(txt[0].contains("response.output_item.done"));
+        assert!(txt[0].contains("think step one step two"));
+        assert!(txt[0].contains("\"type\":\"reasoning\""));
+        assert!(txt.iter().any(|s| s.contains("response.output_text.delta")));
+        // reasoning item 已关闭：output_index 前进到 1（text item 用）
+        assert_eq!(st.output_index, 1);
+        assert!(!st.reasoning_started);
+
+        // 纯 thinking 响应（无 text）在 Finish 时也要关闭 reasoning item
+        let mut st2 = RenderState {
+            response_id: "resp_t2".into(),
+            model: "deepseek".into(),
+            ..Default::default()
+        };
+        let _ = render_stream_event(
+            &Ev::Start {
+                model: "deepseek".into(),
+            },
+            &mut st2,
+        );
+        let _ = render_stream_event(
+            &Ev::ThinkingDelta {
+                text: "only think".into(),
+            },
+            &mut st2,
+        );
+        let fin = render_stream_event(
+            &Ev::Finish {
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+            &mut st2,
+        );
+        assert!(fin[0].contains("response.output_item.done"));
+        assert!(fin[0].contains("only think"));
+        assert!(fin.iter().any(|s| s.contains("response.completed")));
     }
 
     #[test]

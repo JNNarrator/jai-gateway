@@ -1655,6 +1655,8 @@ async fn convert_streaming_response(
             output_index: 0,
             item_started: false,
             current_text: String::new(),
+            reasoning_started: false,
+            current_reasoning: String::new(),
         }),
     };
     // 渲染单个 IR 事件 → SSE 输出帧（一个 IR 事件可能展开多个 SSE 事件）
