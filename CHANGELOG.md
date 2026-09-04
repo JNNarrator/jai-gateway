@@ -2,9 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.6] — 2026-09-04
 
 ### Added
+- **能力声明 + 兼容性规划层**（`gateway-core::codec::capability`，借鉴 GodeX bridge）：协议族级
+  六面能力表（参数/工具/tool_choice/响应格式/reasoning/流式 usage）+ 四级决策
+  （supported/degraded/ignored/rejected），跨族转换先规划后编码，能力面拒绝统一收敛于此
+  （错误码 `response_format_not_supported` / `tools_limit_exceeded` / `tool_choice_not_supported`）
+- **json_schema 结构化输出降级执行**（决策翻转，见 docs/design/protocol-ir.md §3/§10）：
+  openai 系上游原生外传 `response_format`（含 Responses `text.format` 形状还原）；
+  anthropic/gemini 上游降级为「提示词指令注入 + 输出后 JSON 校验」（strict 时校验失败
+  返回 502 `structured_output_validation_failed`）；连降级都无法表达时才 400
+- **reasoning effort 完整闭环**：入站建模进 `SampleParams.reasoning_effort`（chat 的
+  `reasoning_effort`、Responses 的 `reasoning.effort`）；出站 Native 档原样透传、
+  anthropic 映射 `thinking` 开/关、无能力族忽略并 WARN
+- **工具声明上限护栏**：工具数超目标族上限（默认 128）→ 400 `tools_limit_exceeded`
+- **Codex 扩展工具折叠与还原**（§10 扩展工具降级矩阵）：shell / apply_patch / custom /
+  local_shell 声明与调用折叠为 function 工具（固定名或原名 + function input_schema），
+  Codex 客户端可经 JAI 接任意普通模型；回程按工具身份映射还原原始 item
+  （`shell_call` / `apply_patch_call` / `custom_tool_call` / `local_shell_call`，
+  含流式 item 类型与增量事件名还原）
+- **能力告警进结构化日志**：跨族能力面降级 / Lenient 丢弃 / 流式丢帧从控制台
+  `eprintln` 升级为 `emit_log`（error_kind `CapabilityWarn` / `SseParseWarn`），
+  UI 日志页可见，不再仅落终端
+- **协议标准字段静默忽略**：Responses 协议标准字段（`store` / `parallel_tool_calls` /
+  `stream_options` / `metadata` / `user` / `include` / `previous_response_id`）转换丢弃
+  属预期（如 `store` 请求服务端存储会话，转发网关不代管），不再刷 `CapabilityWarn`——
+  告警只保留给真正的降级与陌生字段，避免 dsh 等客户端常规请求淹没日志
+
+### Changed
 - **供应商官网字段**：供应商表单新增「官网」（可空），列表卡片一键跳转系统浏览器
   （tauri-plugin-opener）
 - **WebDAV 密码回显**：同步页密码框回显已保存密码（明文入库后与网关 Key 同级展示语义）
