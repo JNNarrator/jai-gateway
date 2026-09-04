@@ -54,7 +54,9 @@ async fn pid_of(server: &McpServerRow) -> u32 {
 #[tokio::test]
 async fn reuses_process_across_calls() {
     let _g = SERIAL.lock().await;
-    let s = row("reuse", None);
+    // FAKE_TEST_ID 参与池键：本文件测试各自独立连接，避免跨 runtime 复用
+    // （#[tokio::test] 每个测试独立 runtime，全局池连接归属首个创建它的 runtime）
+    let s = row("reuse", Some(r#"{"FAKE_TEST_ID":"reuse"}"#));
 
     let p1 = pid_of(&s).await;
     let p2 = pid_of(&s).await;
@@ -74,7 +76,7 @@ async fn reuses_process_across_calls() {
 #[tokio::test]
 async fn rebuilds_after_crash() {
     let _g = SERIAL.lock().await;
-    let s = row("crash", None);
+    let s = row("crash", Some(r#"{"FAKE_TEST_ID":"crash"}"#));
 
     let p1 = pid_of(&s).await;
     // crash 工具收到请求即退出：本次调用应报传输错误
@@ -89,7 +91,7 @@ async fn rebuilds_after_crash() {
 #[tokio::test]
 async fn rebuilds_when_process_dies_after_response() {
     let _g = SERIAL.lock().await;
-    let s = row("die-after-resp", None);
+    let s = row("die-after-resp", Some(r#"{"FAKE_TEST_ID":"die"}"#));
 
     let p1 = pid_of(&s).await;
     // 回包后进程退出：本次调用成功，但连接已死
@@ -107,7 +109,7 @@ async fn rebuilds_when_process_dies_after_response() {
 async fn timeout_discards_connection() {
     let _g = SERIAL.lock().await;
     std::env::set_var("JAI_MCP_POOL_CALL_TIMEOUT_MS", "100");
-    let s = row("timeout", None);
+    let s = row("timeout", Some(r#"{"FAKE_TEST_ID":"timeout"}"#));
 
     // fake slow 工具 300ms 响应 > 100ms 超时
     let r = mcp::call_tool(&s, "slow", json!({})).await;
@@ -124,7 +126,7 @@ async fn timeout_discards_connection() {
 async fn idle_reclaim_reaps_process() {
     let _g = SERIAL.lock().await;
     std::env::set_var("JAI_MCP_POOL_IDLE_MS", "100");
-    let s = row("idle", None);
+    let s = row("idle", Some(r#"{"FAKE_TEST_ID":"idle"}"#));
 
     let p1 = pid_of(&s).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -158,7 +160,7 @@ async fn env_participates_in_pool_key() {
 #[tokio::test]
 async fn concurrent_calls_serialize_on_one_process() {
     let _g = SERIAL.lock().await;
-    let s = row("concurrent", None);
+    let s = row("concurrent", Some(r#"{"FAKE_TEST_ID":"concurrent"}"#));
     let p = pid_of(&s).await;
 
     // 同连接并发 8 次调用：锁串行化，全部成功且不串帧
