@@ -37,12 +37,24 @@ pub fn error_body(message: &str, err_type: &str, code: Option<&str>) -> Value {
 /// 从 Responses reasoning item 提取推理文本，兼容三种形状：
 /// - OpenAI 标准：`summary` / `content` 数组（summary_text / reasoning_text 元素）
 /// - 旧式：`reasoning` 数组（含 `text` 字段）或字符串
+///
+/// 只认推理类 part（reasoning_text/summary_text/无 type 的 text），
+/// 不抓 output_text/input_text 正文（否则 message 正文会被误当推理）。
 fn extract_reasoning_text(item: &Value) -> String {
     let parts = |key: &str| -> String {
         item.get(key)
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
+                    .filter(|p| {
+                        // 只收集推理类 part：明确带 type 的必须是 reasoning_text/
+                        // summary_text；不带 type 的按 text 容错（旧式形状）。
+                        match p.get("type").and_then(Value::as_str) {
+                            Some("reasoning_text" | "summary_text") => true,
+                            Some(_) => false,
+                            None => true,
+                        }
+                    })
                     .filter_map(|p| p.get("text").and_then(Value::as_str))
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -62,9 +74,48 @@ fn extract_reasoning_text(item: &Value) -> String {
         .to_string()
 }
 
+/// 把当前累积的 assistant 轮次 flush 成一条消息。
+/// dsh 等 agent 把一轮 assistant 输出拆成独立 item（reasoning/message/function_call），
+/// 必须合并回同一条 IR 消息，出站才会是带 reasoning_content + tool_calls 的
+/// 同一条 chat 消息（thinking 上游要求，否则 400）。
+/// `pending` 是该轮前置的独立 reasoning 文本，作为 Thinking 块放在最前。
+fn flush_assistant_round(
+    messages: &mut Vec<CanonMessage>,
+    cur: &mut Vec<Block>,
+    pending: &mut String,
+) {
+    if cur.is_empty() {
+        // 无宿主 assistant 消息，独立的 reasoning 自然丢弃
+        pending.clear();
+        return;
+    }
+    let mut blocks = Vec::with_capacity(cur.len() + 1);
+    if !pending.is_empty() {
+        blocks.push(Block::Thinking {
+            signature: None,
+            text: std::mem::take(pending),
+        });
+    }
+    blocks.append(cur);
+    messages.push(CanonMessage {
+        role: Role::Assistant,
+        blocks,
+    });
+}
+
 /// 解码 `/v1/responses` 请求体 → CanonicalRequest。
 pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
     let v: Value = serde_json::from_slice(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
+
+    // 临时诊断：JAI_DEBUG_RESPONSES_INPUT=1 时打印 input 数组结构（定位 reasoning 丢失）
+    if std::env::var("JAI_DEBUG_RESPONSES_INPUT").is_ok() {
+        if let Some(input) = v.get("input") {
+            eprintln!(
+                "[debug] responses input:\n{}",
+                serde_json::to_string_pretty(input).unwrap_or_default()
+            );
+        }
+    }
 
     let model = v
         .get("model")
@@ -95,11 +146,16 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
         match input {
             Value::String(s) => messages.push(CanonMessage::text(Role::User, s)),
             Value::Array(items) => {
-                // OpenAI Responses 里独立 reasoning item 先于其所属 assistant message 出现
-                // （dsh 等 agent 的真实历史格式）。推理内容必须并入后续 assistant 消息一起
-                // 回传上游（deepseek 等 thinking 模型要求 tool_calls 消息原样带
-                // reasoning_content，否则上游 400）—— 这里缓存到遇到下一条 assistant。
+                // OpenAI Responses 里一轮 assistant 输出可能拆成多个独立 item：
+                //   reasoning → message(output_text) → function_call
+                // （dsh 等 agent 把流式 output_item 原样存历史）。这三者属于同一轮，
+                // 必须合并成一条 IR assistant 消息（Thinking+Text+ToolUse），出站
+                // chat 才会是带 reasoning_content + tool_calls 的同一条消息——
+                // deepseek 等 thinking 模型要求 tool_calls 消息原样回传
+                // reasoning_content，否则上游 400。
                 let mut pending_reasoning = String::new();
+                // 当前 assistant 轮次的累积块（尚未 flush）
+                let mut cur_asst: Vec<Block> = Vec::new();
                 for item in items {
                     let typ = item.get("type").and_then(Value::as_str).unwrap_or_default();
                     // OpenAI 官方 input item 常省略顶层 type（直接 role+content），
@@ -110,14 +166,6 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                         _ if is_message => {
                             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                             let mut blocks = Vec::new();
-                            // 前置独立 reasoning item 并入本消息（需在 text/tool 块之前，出站
-                            // 编码按 assistant 消息聚合 reason内容时才会连同 tool_calls 一起回传）
-                            if role == "assistant" && !pending_reasoning.is_empty() {
-                                blocks.push(Block::Thinking {
-                                    signature: None,
-                                    text: std::mem::take(&mut pending_reasoning),
-                                });
-                            }
                             if let Some(content) = item.get("content").and_then(Value::as_array) {
                                 for part in content {
                                     let ptype = part
@@ -162,12 +210,9 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                     }
                                 }
                             }
-                            // OpenAI Responses 消息内嵌形态：assistant 消息顶层
-                            // 直接带 function_call（推理模型的真实历史格式）。
                             if role == "assistant" {
-                                // reasoning 文本保留进 IR Thinking 块：thinking 模型
-                                // （如 deepseek）要求 assistant tool_calls 消息必须
-                                // 原样回传 reasoning_content，否则上游 400。
+                                // 消息内嵌 reasoning 字段（OpenAI 标准形状）或内嵌
+                                // function_call（推理模型的真实历史格式）都并入本轮。
                                 let rtext = extract_reasoning_text(item);
                                 if !rtext.is_empty() {
                                     blocks.push(Block::Thinking {
@@ -202,37 +247,42 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                         blocks.push(Block::ToolUse { id, name, input });
                                     }
                                 }
-                            } else if let Some(fco) = item.get("function_call_output") {
-                                let call_id = fco
-                                    .get("call_id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let output = fco
-                                    .get("output")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                blocks.push(Block::ToolResult {
-                                    call_id,
-                                    content: if output.is_empty() {
-                                        vec![]
-                                    } else {
-                                        vec![Block::Text { text: output }]
-                                    },
-                                    is_error: false,
-                                });
-                            }
-                            if !blocks.is_empty() {
-                                let r = if role == "assistant" {
-                                    Role::Assistant
-                                } else {
-                                    Role::User
-                                };
-                                messages.push(CanonMessage { role: r, blocks });
+                                cur_asst.extend(blocks);
+                            } else {
+                                // user 消息：先 flush 上一轮 assistant 累积
+                                flush_assistant_round(&mut messages, &mut cur_asst, &mut pending_reasoning);
+                                if let Some(fco) = item.get("function_call_output") {
+                                    let call_id = fco
+                                        .get("call_id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let output = fco
+                                        .get("output")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    blocks.push(Block::ToolResult {
+                                        call_id,
+                                        content: if output.is_empty() {
+                                            vec![]
+                                        } else {
+                                            vec![Block::Text { text: output }]
+                                        },
+                                        is_error: false,
+                                    });
+                                }
+                                if !blocks.is_empty() {
+                                    messages.push(CanonMessage {
+                                        role: Role::User,
+                                        blocks,
+                                    });
+                                }
                             }
                         }
                         "function_call" => {
+                            // 独立 function_call item：属于当前 assistant 轮次，
+                            // 累积进 cur_asst（与前置 reasoning/文本合并）
                             let id = item
                                 .get("call_id")
                                 .or_else(|| item.get("id"))
@@ -249,24 +299,12 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                 .and_then(Value::as_str)
                                 .and_then(|s| serde_json::from_str(s).ok())
                                 .unwrap_or_else(|| json!({}));
-                            // 独立 reasoning item 也可能挂在 function_call 之前（dsh 等
-                            // 客户端把流式 output_item 原样存历史）。Thinking 必须并入
-                            // 同一条 assistant 消息的 ToolUse 一并回传，否则跨族出站
-                            // 缺 reasoning_content、thinking 上游校验 400。
-                            let mut blocks = Vec::new();
-                            if !pending_reasoning.is_empty() {
-                                blocks.push(Block::Thinking {
-                                    signature: None,
-                                    text: std::mem::take(&mut pending_reasoning),
-                                });
-                            }
-                            blocks.push(Block::ToolUse { id, name, input });
-                            messages.push(CanonMessage {
-                                role: Role::Assistant,
-                                blocks,
-                            });
+                            cur_asst.push(Block::ToolUse { id, name, input });
                         }
                         "function_call_output" => {
+                            // tool 结果：flush 当前 assistant 轮次（含 reasoning），
+                            // 再作为 user ToolResult 落一条
+                            flush_assistant_round(&mut messages, &mut cur_asst, &mut pending_reasoning);
                             let call_id = item
                                 .get("call_id")
                                 .and_then(Value::as_str)
@@ -291,9 +329,9 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                             });
                         }
                         "reasoning" => {
-                            // 独立 reasoning item：缓存文本，并入后续 assistant 消息的
-                            // Thinking 块（thinking 模型要求原样回传 reasoning_content，
-                            // 否则上游 400）。若其后没有 assistant 消息则自然丢弃。
+                            // 独立 reasoning item：缓存文本，随本轮 assistant flush
+                            // 时作为 Thinking 块放在最前（thinking 模型要求原样回传
+                            // reasoning_content，否则上游 400）。
                             let text = extract_reasoning_text(item);
                             if !text.is_empty() {
                                 pending_reasoning = text;
@@ -306,6 +344,8 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                         }
                     }
                 }
+                // 收尾：flush 最后累积的 assistant 轮次
+                flush_assistant_round(&mut messages, &mut cur_asst, &mut pending_reasoning);
             }
             _ => {}
         }
@@ -1567,6 +1607,56 @@ mod tests {
         let last = &msgs[msgs.len() - 1];
         assert_eq!(last["reasoning_content"], "think before call");
         assert!(last["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn decode_dsh_split_round_merges_reasoning_text_tool() {
+        // dsh 76cb5093 实测真实形状：同一轮 assistant 输出被拆成三个独立 item：
+        //   reasoning → message(output_text) → function_call → function_call_output
+        // 旧实现把 reasoning 并入 message(文本)，导致带 tool_calls 的 assistant 消息
+        // 缺 reasoning_content，上游 litellm 400；且 extract_reasoning_text 把
+        // output_text 正文误当 reasoning，产生重复 Thinking。
+        let req = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+                    {"type":"reasoning","id":"rs_d1","role":"assistant","summary":[],
+                     "content":[{"type":"reasoning_text","text":"think step","annotations":[]}]},
+                    {"type":"message","id":"msg_d1","role":"assistant","status":"completed",
+                     "content":[{"type":"output_text","text":"let me search","annotations":[]}]},
+                    {"type":"function_call","id":"fc_d1","call_id":"call_d1","name":"bash",
+                     "arguments":"{\"command\":\"ls\"}"},
+                    {"type":"function_call_output","call_id":"call_d1","output":"(no output)"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        // reasoning + message + function_call 合并成一条 assistant，后跟 tool 结果
+        assert_eq!(req.messages.len(), 3);
+        let asst = &req.messages[1];
+        assert_eq!(asst.role, Role::Assistant);
+        let kinds: Vec<&str> = asst
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::Thinking { .. } => "thinking",
+                Block::Text { .. } => "text",
+                Block::ToolUse { .. } => "tooluse",
+                _ => "other",
+            })
+            .collect();
+        // 思考在前、正文次之、工具调用同消息（不重复、不丢失）
+        assert_eq!(kinds, vec!["thinking", "text", "tooluse"], "blocks: {:?}", asst.blocks);
+        assert!(matches!(&asst.blocks[0], Block::Thinking { text, .. } if text == "think step"));
+
+        // 跨族出站：一条 assistant 消息同时带 reasoning_content + content + tool_calls
+        let encoded = crate::codec::openai::encode_request(&req).unwrap();
+        let msgs = encoded["messages"].as_array().unwrap();
+        let asst = &msgs[1];
+        assert_eq!(asst["reasoning_content"], "think step");
+        assert_eq!(asst["content"], "let me search");
+        assert!(asst["tool_calls"].is_array(), "tool_calls 缺失: {asst}");
     }
 
     #[test]
