@@ -1011,7 +1011,10 @@ mod tests {
         let plan = plan_compatibility(&req, caps_of(Family::OpenAiCompat));
         let outcome = plan.resolve(&mut req);
         assert!(outcome.rejection.is_none());
-        assert!(outcome.warnings.iter().any(|w| w.contains("future_field_xyz")));
+        assert!(outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("future_field_xyz")));
     }
 
     #[test]
