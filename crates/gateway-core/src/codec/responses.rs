@@ -249,9 +249,21 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                 .and_then(Value::as_str)
                                 .and_then(|s| serde_json::from_str(s).ok())
                                 .unwrap_or_else(|| json!({}));
+                            // 独立 reasoning item 也可能挂在 function_call 之前（dsh 等
+                            // 客户端把流式 output_item 原样存历史）。Thinking 必须并入
+                            // 同一条 assistant 消息的 ToolUse 一并回传，否则跨族出站
+                            // 缺 reasoning_content、thinking 上游校验 400。
+                            let mut blocks = Vec::new();
+                            if !pending_reasoning.is_empty() {
+                                blocks.push(Block::Thinking {
+                                    signature: None,
+                                    text: std::mem::take(&mut pending_reasoning),
+                                });
+                            }
+                            blocks.push(Block::ToolUse { id, name, input });
                             messages.push(CanonMessage {
                                 role: Role::Assistant,
-                                blocks: vec![Block::ToolUse { id, name, input }],
+                                blocks,
                             });
                         }
                         "function_call_output" => {
@@ -1515,6 +1527,46 @@ mod tests {
             &req2.messages[0].blocks[0],
             Block::Thinking { text, .. } if text == "brief\nmore"
         ));
+    }
+
+    #[test]
+    fn decode_standalone_function_call_keeps_pending_reasoning() {
+        // dsh（pi-ai）的真实历史形状：reasoning 与 function_call 是两个独立
+        // output item（流式 output_item.added/done 原样存回）。旧实现 function_call
+        // 分支不消费 pending_reasoning → IR assistant 消息只有 ToolUse 无 Thinking →
+        // 跨族出站缺 reasoning_content → thinking 上游校验 400（76cb5093 实测）。
+        let req = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+                    {"type":"reasoning","id":"rs_f1",
+                     "summary":[],
+                     "content":[{"type":"reasoning_text","text":"think before call"}]},
+                    {"type":"function_call","call_id":"call_f1","name":"lookup","arguments":"{\"k\":\"v\"}"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(req.messages.len(), 2);
+        let asst = &req.messages[1];
+        assert_eq!(asst.role, Role::Assistant);
+        // Thinking 必须并入 function_call 同一条 assistant 消息（在 ToolUse 前）
+        assert!(matches!(
+            &asst.blocks[0],
+            Block::Thinking { text, .. } if text == "think before call"
+        ), "pending_reasoning 丢失: {asst:?}");
+        assert!(matches!(
+            &asst.blocks[1],
+            Block::ToolUse { id, name, .. } if id == "call_f1" && name == "lookup"
+        ));
+
+        // 跨族出站（Responses→openai_compat）：tool_calls 消息必须带 reasoning_content
+        let encoded = crate::codec::openai::encode_request(&req).unwrap();
+        let msgs = encoded["messages"].as_array().unwrap();
+        let last = &msgs[msgs.len() - 1];
+        assert_eq!(last["reasoning_content"], "think before call");
+        assert!(last["tool_calls"].is_array());
     }
 
     #[test]
