@@ -17,6 +17,7 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::codec::capability::{restore_tool_type, ToolIdentity};
 use crate::codec::ir::{
     Block, CanonMessage, CanonicalRequest, CanonicalResponse, Role, SampleParams, StopReason,
     StreamEvent, ToolChoice, ToolSpec, Usage,
@@ -32,6 +33,110 @@ pub fn error_body(message: &str, err_type: &str, code: Option<&str>) -> Value {
             "code": code,
         }
     })
+}
+
+// ---------------------------------------------------------------- 扩展工具折叠（§10）
+// Codex 扩展工具（shell/apply_patch/custom/local_shell）→ function 降级：
+// 声明折叠为 function（固定名/原名），调用折叠为 ToolUse（arguments 与上游对称），
+// 渲染时按工具身份映射还原为原始 item 类型。
+
+/// shell / local_shell 折叠声明的 function input_schema（模型按此生成 arguments）。
+fn shell_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Command to run"},
+            "env": {"type": "object", "additionalProperties": {"type": "string"}},
+            "timeout_ms": {"type": "integer"},
+            "user": {"type": "string"}
+        },
+        "required": ["command"]
+    })
+}
+
+/// custom 工具折叠声明的 input_schema（input_format: json → {input:{type,value}}）。
+fn custom_input_schema(input_format: Option<&str>) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["json", "text"]},
+                    "value": if input_format == Some("text") {
+                        json!({"type": "string"})
+                    } else {
+                        json!({})
+                    }
+                },
+                "required": ["type"]
+            }
+        },
+        "required": ["input"]
+    })
+}
+
+/// tool 结果输出文本（字符串或 content parts 数组）。
+fn tool_output_text(output: &Value) -> String {
+    match output {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// 扩展工具 call item 折叠为 IR ToolUse（arguments JSON 形状与上游 function 对称）。
+fn fold_extended_call(call_id: &str, name: &str, input: Value) -> Block {
+    Block::ToolUse {
+        id: call_id.to_string(),
+        name: name.to_string(),
+        input,
+    }
+}
+
+/// 按还原后的 item 类型构造 Responses item（arguments 为上游 function 返回的 JSON 字符串）。
+fn extended_tool_item(
+    id: &str,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    item_type: &str,
+) -> Value {
+    let parsed: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+    match item_type {
+        "shell_call" | "local_shell_call" => json!({
+            "type": item_type,
+            "id": id,
+            "call_id": call_id,
+            "name": name,
+            "action": parsed,
+        }),
+        "apply_patch_call" => json!({
+            "type": item_type,
+            "id": id,
+            "call_id": call_id,
+            "name": name,
+            "operation": parsed.get("operation").and_then(Value::as_str).unwrap_or_default(),
+        }),
+        "custom_tool_call" => json!({
+            "type": item_type,
+            "id": id,
+            "call_id": call_id,
+            "name": name,
+            "input": parsed.get("input").cloned().unwrap_or(Value::Null),
+        }),
+        _ => json!({
+            "type": "function_call",
+            "id": id,
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        }),
+    }
 }
 
 /// 从 Responses reasoning item 提取推理文本，兼容三种形状：
@@ -250,7 +355,11 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                 cur_asst.extend(blocks);
                             } else {
                                 // user 消息：先 flush 上一轮 assistant 累积
-                                flush_assistant_round(&mut messages, &mut cur_asst, &mut pending_reasoning);
+                                flush_assistant_round(
+                                    &mut messages,
+                                    &mut cur_asst,
+                                    &mut pending_reasoning,
+                                );
                                 if let Some(fco) = item.get("function_call_output") {
                                     let call_id = fco
                                         .get("call_id")
@@ -304,7 +413,11 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                         "function_call_output" => {
                             // tool 结果：flush 当前 assistant 轮次（含 reasoning），
                             // 再作为 user ToolResult 落一条
-                            flush_assistant_round(&mut messages, &mut cur_asst, &mut pending_reasoning);
+                            flush_assistant_round(
+                                &mut messages,
+                                &mut cur_asst,
+                                &mut pending_reasoning,
+                            );
                             let call_id = item
                                 .get("call_id")
                                 .and_then(Value::as_str)
@@ -337,6 +450,186 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                 pending_reasoning = text;
                             }
                         }
+                        // ---- Codex 扩展工具折叠（§10）：call 累积进本轮，output 落 tool 结果 ----
+                        "shell_call" | "local_shell_call" => {
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let name = if typ == "shell_call" {
+                                "shell"
+                            } else {
+                                "local_shell"
+                            };
+                            let action = item.get("action").cloned().unwrap_or_else(|| json!({}));
+                            cur_asst.push(fold_extended_call(&call_id, name, action));
+                        }
+                        "apply_patch_call" => {
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let operation = item
+                                .get("operation")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            cur_asst.push(fold_extended_call(
+                                &call_id,
+                                "apply_patch",
+                                json!({"operation": operation}),
+                            ));
+                        }
+                        "custom_tool_call" => {
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let name = item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let input = item.get("input").cloned().unwrap_or(Value::Null);
+                            cur_asst.push(fold_extended_call(
+                                &call_id,
+                                &name,
+                                json!({"input": input}),
+                            ));
+                        }
+                        "shell_call_output" => {
+                            flush_assistant_round(
+                                &mut messages,
+                                &mut cur_asst,
+                                &mut pending_reasoning,
+                            );
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let text = item
+                                .get("output")
+                                .and_then(Value::as_array)
+                                .map(|chunks| {
+                                    chunks
+                                        .iter()
+                                        .map(|c| {
+                                            let outcome = c
+                                                .get("outcome")
+                                                .and_then(Value::as_object)
+                                                .map(|o| {
+                                                    if o.get("type").and_then(Value::as_str)
+                                                        == Some("exit")
+                                                    {
+                                                        format!(
+                                                            "exit {}",
+                                                            o.get("exit_code")
+                                                                .and_then(Value::as_u64)
+                                                                .unwrap_or(0)
+                                                        )
+                                                    } else {
+                                                        o.get("type")
+                                                            .and_then(Value::as_str)
+                                                            .unwrap_or("unknown")
+                                                            .to_string()
+                                                    }
+                                                })
+                                                .unwrap_or_else(|| "unknown".into());
+                                            let stdout = c
+                                                .get("stdout")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("");
+                                            let stderr = c
+                                                .get("stderr")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("");
+                                            format!(
+                                                "[{outcome}]\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_default();
+                            messages.push(CanonMessage {
+                                role: Role::User,
+                                blocks: vec![Block::ToolResult {
+                                    call_id,
+                                    content: if text.is_empty() {
+                                        vec![]
+                                    } else {
+                                        vec![Block::Text { text }]
+                                    },
+                                    is_error: false,
+                                }],
+                            });
+                        }
+                        "apply_patch_call_output" => {
+                            flush_assistant_round(
+                                &mut messages,
+                                &mut cur_asst,
+                                &mut pending_reasoning,
+                            );
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let status = item
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let output = item
+                                .get("output")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let text = if output.is_empty() {
+                                status.to_string()
+                            } else {
+                                format!("{status}: {output}")
+                            };
+                            messages.push(CanonMessage {
+                                role: Role::User,
+                                blocks: vec![Block::ToolResult {
+                                    call_id,
+                                    content: if text.is_empty() {
+                                        vec![]
+                                    } else {
+                                        vec![Block::Text { text }]
+                                    },
+                                    is_error: false,
+                                }],
+                            });
+                        }
+                        "custom_tool_call_output" | "local_shell_call_output" => {
+                            flush_assistant_round(
+                                &mut messages,
+                                &mut cur_asst,
+                                &mut pending_reasoning,
+                            );
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let text = tool_output_text(item.get("output").unwrap_or(&Value::Null));
+                            messages.push(CanonMessage {
+                                role: Role::User,
+                                blocks: vec![Block::ToolResult {
+                                    call_id,
+                                    content: if text.is_empty() {
+                                        vec![]
+                                    } else {
+                                        vec![Block::Text { text }]
+                                    },
+                                    is_error: false,
+                                }],
+                            });
+                        }
                         other => {
                             extensions
                                 .entry(format!("input_item:{other}"))
@@ -354,21 +647,57 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
     let mut tools: Vec<ToolSpec> = Vec::new();
     if let Some(arr) = v.get("tools").and_then(Value::as_array) {
         for t in arr {
+            let r#type = t.get("type").and_then(Value::as_str).unwrap_or("function");
             let name = t.get("name").and_then(Value::as_str).unwrap_or_default();
-            if name.is_empty() {
-                continue;
+            let description = t
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            match r#type {
+                // Codex 扩展工具声明 → function 折叠（§10 降级矩阵）：
+                // 固定名 + function input_schema，使普通模型能响应工具调用
+                "shell" => tools.push(ToolSpec {
+                    name: "shell".into(),
+                    description: description.or_else(|| Some("Execute shell commands".into())),
+                    input_schema: shell_input_schema(),
+                }),
+                "local_shell" => tools.push(ToolSpec {
+                    name: "local_shell".into(),
+                    description: description
+                        .or_else(|| Some("Run a command on the local machine".into())),
+                    input_schema: shell_input_schema(),
+                }),
+                "apply_patch" => tools.push(ToolSpec {
+                    name: "apply_patch".into(),
+                    description: description
+                        .or_else(|| Some("Apply a patch (add/edit/delete operations)".into())),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {"operation": {"type": "string"}},
+                        "required": ["operation"]
+                    }),
+                }),
+                "custom" if !name.is_empty() => tools.push(ToolSpec {
+                    name: name.to_string(),
+                    description,
+                    input_schema: custom_input_schema(
+                        t.get("input_format").and_then(Value::as_str),
+                    ),
+                }),
+                _ => {
+                    if name.is_empty() {
+                        continue;
+                    }
+                    tools.push(ToolSpec {
+                        name: name.to_string(),
+                        description,
+                        input_schema: t
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| json!({"type":"object"})),
+                    });
+                }
             }
-            tools.push(ToolSpec {
-                name: name.to_string(),
-                description: t
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                input_schema: t
-                    .get("parameters")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type":"object"})),
-            });
         }
     }
 
@@ -418,23 +747,49 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
             .and_then(Value::as_f64)
             .map(|f| f as f32),
         seed: v.get("seed").and_then(Value::as_i64),
+        reasoning_effort: v
+            .get("reasoning")
+            .and_then(Value::as_object)
+            .and_then(|r| r.get("effort"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
     };
 
-    // 未建模字段 Lenient 收集
+    // 未建模字段 Lenient 收集（reasoning 已建模为 SampleParams.reasoning_effort，不收集）
     for k in [
         "parallel_tool_calls",
         "stream_options",
         "store",
         "metadata",
         "user",
-        "reasoning",
-        "text",
         "include",
         "previous_response_id",
     ] {
         if v.get(k).is_some() {
             extensions.entry(k.to_string()).or_insert(Value::Null);
         }
+    }
+
+    // text.format → 统一 response_format（chat 形状：json_schema 包进 json_schema 子对象），
+    // 供 capability 规划层裁决（原生支持 / 降级指令注入），见 capability.rs
+    if let Some(format) = v
+        .get("text")
+        .and_then(Value::as_object)
+        .and_then(|t| t.get("format"))
+    {
+        let normalized = match format.get("type").and_then(Value::as_str) {
+            Some("json_schema") => {
+                let mut js = serde_json::Map::new();
+                for key in ["name", "description", "schema", "strict"] {
+                    if let Some(val) = format.get(key) {
+                        js.insert(key.to_string(), val.clone());
+                    }
+                }
+                json!({ "type": "json_schema", "json_schema": Value::Object(js) })
+            }
+            _ => format.clone(),
+        };
+        extensions.insert("response_format".into(), normalized);
     }
 
     Ok(CanonicalRequest {
@@ -475,13 +830,13 @@ pub fn render_response(r: &CanonicalResponse) -> Value {
                 }));
             }
             Block::ToolUse { id, name, input } => {
-                output.push(json!({
-                    "type": "function_call",
-                    "id": format!("fc_{id}"),
-                    "call_id": id,
-                    "name": name,
-                    "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
-                }));
+                output.push(extended_tool_item(
+                    &format!("fc_{id}"),
+                    id,
+                    name,
+                    &serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
+                    "function_call",
+                ));
             }
             _ => {}
         }
@@ -496,6 +851,39 @@ pub fn render_response(r: &CanonicalResponse) -> Value {
         "output": output,
         "usage": usage,
     })
+}
+
+/// 非流式响应后处理：按工具身份映射把 function_call 还原为扩展 item
+/// （shell_call / apply_patch_call / custom_tool_call / local_shell_call，§10）。
+pub fn restore_extended_items(mut value: Value, identities: &[ToolIdentity]) -> Value {
+    if identities.is_empty() {
+        return value;
+    }
+    if let Some(output) = value.get_mut("output").and_then(Value::as_array_mut) {
+        for item in output.iter_mut() {
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                continue;
+            }
+            let Some(name) = item.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let item_type = restore_tool_type(name, identities);
+            if item_type == "function_call" {
+                continue;
+            }
+            let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            *item = extended_tool_item(id, call_id, name, arguments, item_type);
+        }
+    }
+    value
 }
 
 /// 把 IR Usage 渲染成 Responses 协议 usage 对象。
@@ -661,8 +1049,39 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                 .collect(),
         );
     }
+    // 结构化输出 → text.format（capability 规划层已裁决：Supported 原样 / Degraded 覆写）
+    // json_schema 转 Responses 形状（name/description/schema/strict 平铺，与 chat 系包装不同）
+    if let Some(format) = req.extensions.get("response_format") {
+        if let Some(t) = format.get("type").and_then(Value::as_str) {
+            let text = match t {
+                "json_schema" => {
+                    let js = format.get("json_schema").cloned().unwrap_or(Value::Null);
+                    let mut tf = json!({ "type": "json_schema" });
+                    if let Some(n) = js.get("name").and_then(Value::as_str) {
+                        tf["name"] = json!(n);
+                    }
+                    if let Some(d) = js.get("description").and_then(Value::as_str) {
+                        tf["description"] = json!(d);
+                    }
+                    if let Some(s) = js.get("schema") {
+                        tf["schema"] = s.clone();
+                    }
+                    if let Some(strict) = js.get("strict").and_then(Value::as_bool) {
+                        tf["strict"] = json!(strict);
+                    }
+                    tf
+                }
+                other => json!({ "type": other }),
+            };
+            body["text"] = json!({ "format": text });
+        }
+    }
     if req.stream {
         body["stream"] = json!(true);
+    }
+    // reasoning effort（Native 档）：原样透传
+    if let Some(effort) = &p.reasoning_effort {
+        body["reasoning"] = json!({ "effort": effort });
     }
 
     Ok(body)
@@ -1043,6 +1462,10 @@ pub struct RenderState {
     pub reasoning_started: bool,
     /// 当前 reasoning item 已累积的推理文本（用于 output_item.done 回填）
     pub current_reasoning: String,
+    /// 扩展工具身份映射（§10 折叠还原用；空 = 纯 function 工具）
+    pub tool_identities: Vec<ToolIdentity>,
+    /// 当前活跃 tool call 的还原类型（function_call / shell_call / …）
+    pub active_tool_type: String,
 }
 
 impl RenderState {
@@ -1196,17 +1619,15 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             close_reasoning(st, &mut out);
             let item_id = format!("fc_{index}_{id}");
             st.item_started = true;
+            // 扩展工具折叠还原（§10）：按上游 function 名还原 item 类型
+            let item_type = restore_tool_type(name, &st.tool_identities);
+            st.active_tool_type = item_type.to_string();
+            let item = extended_tool_item(&item_id, id, name, "", item_type);
             out.push(
                 json!({
                     "type": "response.output_item.added",
                     "output_index": st.output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": item_id,
-                        "call_id": id,
-                        "name": name,
-                        "arguments": "",
-                    },
+                    "item": item,
                 })
                 .to_string(),
             );
@@ -1217,8 +1638,14 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             args_fragment,
             ..
         } => {
+            // 扩展工具（custom）的增量事件名不同（§10）
+            let event = if st.active_tool_type == "custom_tool_call" {
+                "response.custom_tool_call_input.delta"
+            } else {
+                "response.function_call_arguments.delta"
+            };
             vec![json!({
-                "type": "response.function_call_arguments.delta",
+                "type": event,
                 "item_id": format!("fc_{index}_{}", "pending"),
                 "output_index": st.output_index,
                 "delta": args_fragment,
@@ -1232,17 +1659,22 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                 "output_index": st.output_index,
             })
             .to_string()];
+            let mut item_type = std::mem::take(&mut st.active_tool_type);
+            if item_type.is_empty() {
+                item_type = "function_call".to_string();
+            }
+            let item = extended_tool_item(
+                &format!("fc_{index}_{}", "pending"),
+                &format!("call_{index}"),
+                "",
+                "",
+                &item_type,
+            );
             out.push(
                 json!({
                     "type": "response.output_item.done",
                     "output_index": st.output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": format!("fc_{index}_{}", "pending"),
-                        "call_id": format!("call_{index}"),
-                        "name": "",
-                        "arguments": "",
-                    },
+                    "item": item,
                 })
                 .to_string(),
             );
@@ -1528,6 +1960,156 @@ mod tests {
     }
 
     #[test]
+    fn decode_extended_tool_declarations_fold_to_function() {
+        let req = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":"run it",
+                "tools":[
+                    {"type":"shell","description":"run shell"},
+                    {"type":"apply_patch","description":"patch files"},
+                    {"type":"custom","name":"search","description":"search web","input_format":"json"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(req.tools.len(), 3);
+        assert_eq!(req.tools[0].name, "shell");
+        assert!(req.tools[0].input_schema.get("properties").is_some());
+        assert_eq!(req.tools[1].name, "apply_patch");
+        assert_eq!(
+            req.tools[1]
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|a| a.len()),
+            Some(1)
+        );
+        assert_eq!(req.tools[2].name, "search");
+    }
+
+    #[test]
+    fn decode_extended_calls_fold_to_tool_use() {
+        let req = decode_request(
+            br#"{
+                "model":"gpt-4o",
+                "input":[
+                    {"type":"shell_call","call_id":"call_s1","name":"bash","action":{"command":"ls -la"}},
+                    {"type":"shell_call_output","call_id":"call_s1","output":[
+                        {"outcome":{"type":"exit","exit_code":0},"stdout":"src","stderr":""}
+                    ]},
+                    {"type":"apply_patch_call","call_id":"call_p1","name":"apply_patch","operation":"--- a\n+++ b\n"},
+                    {"type":"apply_patch_call_output","call_id":"call_p1","status":"success","output":"applied"},
+                    {"type":"custom_tool_call","call_id":"call_c1","name":"search","input":{"type":"json","value":{"q":"jai"}}},
+                    {"type":"custom_tool_call_output","call_id":"call_c1","output":"results here"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        // shell_call → ToolUse(name=shell, input=action)
+        assert!(matches!(
+            &req.messages[0].blocks[0],
+            Block::ToolUse { id, name, input }
+                if id == "call_s1" && name == "shell" && input.get("command").and_then(Value::as_str) == Some("ls -la")
+        ));
+        // shell_call_output → ToolResult 文本含 exit/stdout
+        assert!(matches!(
+            &req.messages[1].blocks[0],
+            Block::ToolResult { call_id, content, .. }
+                if call_id == "call_s1" && content.iter().filter_map(|b| b.as_text()).collect::<Vec<_>>().join("").contains("exit 0")
+        ));
+        // apply_patch_call → ToolUse(name=apply_patch, input.operation)
+        assert!(matches!(
+            &req.messages[2].blocks[0],
+            Block::ToolUse { id, name, input }
+                if id == "call_p1" && name == "apply_patch" && input.get("operation").and_then(Value::as_str).is_some()
+        ));
+        // custom_tool_call → ToolUse(name=search, input 包 input)
+        assert!(matches!(
+            &req.messages[4].blocks[0],
+            Block::ToolUse { id, name, input }
+                if id == "call_c1" && name == "search" && input.get("input").and_then(|i| i.get("value")).and_then(Value::as_object).is_some()
+        ));
+    }
+
+    #[test]
+    fn render_response_restores_extended_items() {
+        let resp = CanonicalResponse {
+            id: "resp_1".into(),
+            model: "gpt-4o".into(),
+            output: vec![Block::ToolUse {
+                id: "call_s1".into(),
+                name: "shell".into(),
+                input: json!({"command": "ls"}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        };
+        let identities = vec![crate::codec::capability::ToolIdentity {
+            requested_type: "shell".into(),
+            requested_name: "shell".into(),
+            provider_name: "shell".into(),
+        }];
+        let v = render_response(&resp);
+        let restored = restore_extended_items(v, &identities);
+        assert_eq!(restored["output"][0]["type"], "shell_call");
+        assert_eq!(restored["output"][0]["action"]["command"], "ls");
+        // 无身份映射时保持 function_call
+        let v2 = render_response(&resp);
+        assert_eq!(v2["output"][0]["type"], "function_call");
+    }
+
+    #[test]
+    fn render_stream_restores_extended_tool_type() {
+        let mut st = RenderState {
+            response_id: "resp_1".into(),
+            model: "gpt-4o".into(),
+            tool_identities: vec![crate::codec::capability::ToolIdentity {
+                requested_type: "shell".into(),
+                requested_name: "shell".into(),
+                provider_name: "shell".into(),
+            }],
+            ..Default::default()
+        };
+        let events = render_stream_event(
+            &StreamEvent::ToolCallStart {
+                index: 0,
+                id: "call_s1".into(),
+                name: "shell".into(),
+            },
+            &mut st,
+        );
+        let added = events
+            .iter()
+            .find(|p| p.contains("response.output_item.added"))
+            .expect("output_item.added 事件");
+        let v: Value = serde_json::from_str(added).unwrap();
+        assert_eq!(v["item"]["type"], "shell_call");
+        assert_eq!(st.active_tool_type, "shell_call");
+
+        // 参数增量事件名随类型（custom 用 custom_tool_call_input）
+        let mut st2 = RenderState {
+            response_id: "resp_1".into(),
+            model: "gpt-4o".into(),
+            tool_identities: vec![crate::codec::capability::ToolIdentity {
+                requested_type: "custom".into(),
+                requested_name: "search".into(),
+                provider_name: "search".into(),
+            }],
+            active_tool_type: "custom_tool_call".into(),
+            ..Default::default()
+        };
+        let delta = render_stream_event(
+            &StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                args_fragment: "{\"q\":\"x\"}".into(),
+            },
+            &mut st2,
+        );
+        assert!(delta[0].contains("response.custom_tool_call_input.delta"));
+    }
+
+    #[test]
     fn decode_openai_standard_reasoning_item_shapes() {
         // OpenAI Responses 官方 output 里 reasoning item 用 summary/content 数组
         // （summary_text / reasoning_text 元素）；dsh（pi-ai）回传历史时按
@@ -1592,10 +2174,13 @@ mod tests {
         let asst = &req.messages[1];
         assert_eq!(asst.role, Role::Assistant);
         // Thinking 必须并入 function_call 同一条 assistant 消息（在 ToolUse 前）
-        assert!(matches!(
-            &asst.blocks[0],
-            Block::Thinking { text, .. } if text == "think before call"
-        ), "pending_reasoning 丢失: {asst:?}");
+        assert!(
+            matches!(
+                &asst.blocks[0],
+                Block::Thinking { text, .. } if text == "think before call"
+            ),
+            "pending_reasoning 丢失: {asst:?}"
+        );
         assert!(matches!(
             &asst.blocks[1],
             Block::ToolUse { id, name, .. } if id == "call_f1" && name == "lookup"
@@ -1647,7 +2232,12 @@ mod tests {
             })
             .collect();
         // 思考在前、正文次之、工具调用同消息（不重复、不丢失）
-        assert_eq!(kinds, vec!["thinking", "text", "tooluse"], "blocks: {:?}", asst.blocks);
+        assert_eq!(
+            kinds,
+            vec!["thinking", "text", "tooluse"],
+            "blocks: {:?}",
+            asst.blocks
+        );
         assert!(matches!(&asst.blocks[0], Block::Thinking { text, .. } if text == "think step"));
 
         // 跨族出站：一条 assistant 消息同时带 reasoning_content + content + tool_calls
@@ -1797,6 +2387,60 @@ mod tests {
         assert_eq!(v["output"][1]["type"], "function_call");
         assert_eq!(v["output"][1]["call_id"], "call_1");
         assert_eq!(v["usage"]["input_tokens"], 10);
+    }
+
+    #[test]
+    fn encode_response_format_emits_text_format() {
+        // 规划层裁决后：json_schema 平铺为 Responses text.format；json_object 直传
+        let mut req = CanonicalRequest {
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        req.extensions.insert(
+            "response_format".into(),
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "weather",
+                    "description": "weather reply",
+                    "schema": {"type": "object", "properties": {"temp": {"type": "number"}}},
+                    "strict": true
+                }
+            }),
+        );
+        let v = encode_request(&req).unwrap();
+        let tf = &v["text"]["format"];
+        assert_eq!(tf.get("type").and_then(Value::as_str), Some("json_schema"));
+        assert_eq!(tf.get("name").and_then(Value::as_str), Some("weather"));
+        assert_eq!(
+            tf.get("description").and_then(Value::as_str),
+            Some("weather reply")
+        );
+        assert!(tf.get("schema").is_some());
+        assert_eq!(tf.get("strict").and_then(Value::as_bool), Some(true));
+
+        let mut req2 = CanonicalRequest {
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        req2.extensions
+            .insert("response_format".into(), json!({"type": "json_object"}));
+        let v2 = encode_request(&req2).unwrap();
+        assert_eq!(
+            v2["text"]["format"].get("type").and_then(Value::as_str),
+            Some("json_object")
+        );
+    }
+
+    #[test]
+    fn encode_reasoning_effort_emits_reasoning() {
+        let mut req = CanonicalRequest {
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        req.params.reasoning_effort = Some("high".into());
+        let v = encode_request(&req).unwrap();
+        assert_eq!(v["reasoning"]["effort"], "high");
     }
 
     #[test]

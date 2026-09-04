@@ -1151,34 +1151,52 @@ async fn try_converted_candidate(
         ));
     }
 
-    // 2.5) 跨族不支持的能力面：response_format(json_schema) → 400（仅 OpenAI 入站有该字段）
-    if wire == InboundWire::OpenAi && req.extensions.contains_key("response_format") {
-        let msg =
-            "response_format（json_schema）在跨协议转换中不支持；支持子集：无。请改用提示词约束输出";
-        emit_log(
-            &ctx.logs,
-            wire.log_family(),
-            Some(peeked),
-            Some(cand.provider_id.as_str()),
-            cand.upstream_model_id.clone(),
-            400,
-            ms_since(started),
-            peeked.stream,
-            None,
-            Some("InvalidRequest".into()),
-            Some(msg.into()),
+    // 2.5) 能力声明 + 兼容性规划（capability.rs）：降级执行 / Lenient WARN / 能力面 400
+    // 取代原 response_format 硬编码 400 与 extension_warn_note 汇总，拒绝语义与错误码保持
+    if let Some(family) = crate::codec::Family::from_db_str(&cand.family) {
+        let plan = crate::codec::capability::plan_compatibility(
+            &req,
+            crate::codec::capability::caps_of(family),
         );
-        return Attempt::Delivered(wire.error_response(
-            StatusCode::BAD_REQUEST,
-            msg,
-            "invalid_request_error",
-            Some("response_format_not_supported"),
-        ));
-    }
-
-    // 2.6) 未建模字段：Lenient 丢弃 + 单条 WARN 汇总（§7）
-    if let Some(note) = crate::codec::ir::extension_warn_note(&req) {
-        eprintln!("[convert] {note}");
+        let outcome = plan.resolve(&mut req);
+        if let Some((msg, code)) = outcome.rejection {
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(cand.provider_id.as_str()),
+                cand.upstream_model_id.clone(),
+                400,
+                ms_since(started),
+                peeked.stream,
+                None,
+                Some("InvalidRequest".into()),
+                Some(msg.clone()),
+            );
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_REQUEST,
+                &msg,
+                "invalid_request_error",
+                code,
+            ));
+        }
+        if !outcome.warnings.is_empty() {
+            // 能力面降级 / Lenient 丢弃 WARN 进结构化日志（UI 日志页可见），
+            // 不再仅落控制台
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(cand.provider_id.as_str()),
+                cand.upstream_model_id.clone(),
+                200,
+                ms_since(started),
+                peeked.stream,
+                None,
+                Some("CapabilityWarn".into()),
+                Some(outcome.warnings.join("；")),
+            );
+        }
     }
 
     // 3) 按上游协议族编码
@@ -1427,9 +1445,16 @@ async fn try_converted_candidate(
             resp,
             up_status,
             started,
+            crate::codec::capability::tool_identities_of(&req),
         )
         .await
     } else {
+        // 结构化输出降级校验标志（capability 规划层写入 extensions）
+        let validate_output = req
+            .extensions
+            .get("__jai_validate_output")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         convert_plain_response(
             ctx.clone(),
             wire,
@@ -1438,12 +1463,15 @@ async fn try_converted_candidate(
             resp,
             up_status,
             started,
+            validate_output,
+            crate::codec::capability::tool_identities_of(&req),
         )
         .await
     }
 }
 
 /// 转换路径：非流式解析 + 渲染为入站形状。
+#[allow(clippy::too_many_arguments)] // 与 convert_streaming_response（7 参）同族，保持平铺
 async fn convert_plain_response(
     ctx: GatewayCtx,
     wire: InboundWire,
@@ -1452,6 +1480,8 @@ async fn convert_plain_response(
     resp: reqwest::Response,
     status: StatusCode,
     started: Instant,
+    validate_output: bool,
+    tool_identities: Vec<crate::codec::capability::ToolIdentity>,
 ) -> Attempt {
     let bytes = match tokio::time::timeout(NONSTREAM_READ_TIMEOUT, resp.bytes()).await {
         Ok(Ok(b)) => b,
@@ -1545,6 +1575,42 @@ async fn convert_plain_response(
         }
     }
 
+    // 结构化输出降级：非流式校验上游输出为合法 JSON（capability 规划层标记，
+    // 仅降级路径；原生 json_schema 上游保证格式）
+    if validate_output {
+        let text = resp
+            .output
+            .iter()
+            .filter_map(|b| match b {
+                crate::codec::ir::Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if serde_json::from_str::<Value>(&text).is_err() {
+            let msg = "上游未遵守 JSON 结构化输出约束（降级校验失败）";
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(&peeked),
+                Some(&cand.provider_id),
+                cand.upstream_model_id.clone(),
+                502,
+                ms_since(started),
+                false,
+                None,
+                Some("ProviderOther".into()),
+                Some(format!("[convert] {msg}")),
+            );
+            return Attempt::Delivered(wire.error_response(
+                StatusCode::BAD_GATEWAY,
+                msg,
+                "api_error",
+                Some("structured_output_validation_failed"),
+            ));
+        }
+    }
+
     let usage = &resp.usage;
     let uval = json!({
         "prompt_tokens": usage.input_tokens,
@@ -1570,7 +1636,11 @@ async fn convert_plain_response(
             crate::codec::openai::render_response(&resp).to_string()
         }
         InboundWire::Anthropic => crate::codec::anthropic::render_response(&resp).to_string(),
-        InboundWire::Responses => crate::codec::responses::render_response(&resp).to_string(),
+        InboundWire::Responses => {
+            // 扩展工具折叠还原（§10）：function_call → shell_call 等原始 item
+            let value = crate::codec::responses::render_response(&resp);
+            crate::codec::responses::restore_extended_items(value, &tool_identities).to_string()
+        }
     };
     Response::builder()
         .status(status)
@@ -1581,6 +1651,7 @@ async fn convert_plain_response(
 }
 
 /// 转换路径：流式。逐 SSE 事件 parse → IR StreamEvent → render 回入站 SSE。
+#[allow(clippy::too_many_arguments)] // 与 convert_plain_response（9 参）同族，保持平铺
 async fn convert_streaming_response(
     ctx: GatewayCtx,
     wire: InboundWire,
@@ -1589,6 +1660,7 @@ async fn convert_streaming_response(
     resp: reqwest::Response,
     status: StatusCode,
     started: Instant,
+    tool_identities: Vec<crate::codec::capability::ToolIdentity>,
 ) -> Attempt {
     let mut upstream_stream = resp.bytes_stream();
 
@@ -1657,6 +1729,8 @@ async fn convert_streaming_response(
             current_text: String::new(),
             reasoning_started: false,
             current_reasoning: String::new(),
+            tool_identities,
+            active_tool_type: String::new(),
         }),
     };
     // 渲染单个 IR 事件 → SSE 输出帧（一个 IR 事件可能展开多个 SSE 事件）
@@ -1730,7 +1804,19 @@ async fn convert_streaming_response(
                                     match crate::codec::anthropic::parse_stream_event(payload) {
                                         Ok(v) => v,
                                         Err(e) => {
-                                            eprintln!("[convert] anthropic SSE: {e}");
+                                            emit_log(
+                                                &ctx2.logs,
+                                                wire2.log_family(),
+                                                Some(&peeked2),
+                                                Some(&pid),
+                                                None,
+                                                200,
+                                                t0.elapsed().as_millis() as i64,
+                                                true,
+                                                None,
+                                                Some("SseParseWarn".into()),
+                                                Some(format!("[convert] anthropic SSE 帧解析失败已跳过: {e}")),
+                                            );
                                             continue;
                                         }
                                     }
@@ -1738,7 +1824,19 @@ async fn convert_streaming_response(
                                 "gemini" => match crate::codec::gemini::parse_stream_event(payload) {
                                     Ok(v) => v,
                                     Err(e) => {
-                                        eprintln!("[convert] gemini SSE: {e}");
+                                        emit_log(
+                                            &ctx2.logs,
+                                            wire2.log_family(),
+                                            Some(&peeked2),
+                                            Some(&pid),
+                                            None,
+                                            200,
+                                            t0.elapsed().as_millis() as i64,
+                                            true,
+                                            None,
+                                            Some("SseParseWarn".into()),
+                                            Some(format!("[convert] gemini SSE 帧解析失败已跳过: {e}")),
+                                        );
                                         continue;
                                     }
                                 },
@@ -1746,14 +1844,38 @@ async fn convert_streaming_response(
                                 {
                                     Ok(v) => v,
                                     Err(e) => {
-                                        eprintln!("[convert] openai SSE: {e}");
+                                        emit_log(
+                                            &ctx2.logs,
+                                            wire2.log_family(),
+                                            Some(&peeked2),
+                                            Some(&pid),
+                                            None,
+                                            200,
+                                            t0.elapsed().as_millis() as i64,
+                                            true,
+                                            None,
+                                            Some("SseParseWarn".into()),
+                                            Some(format!("[convert] openai SSE 帧解析失败已跳过: {e}")),
+                                        );
                                         continue;
                                     }
                                 },
                                 "openai_responses" => {
                                     // Responses 上游的 SSE 尚未支持流式转换；
                                     // 若上游返回 SSE，暂时按无法解析处理。
-                                    eprintln!("[convert] openai_responses SSE 暂不支持流式转换");
+                                    emit_log(
+                                        &ctx2.logs,
+                                        wire2.log_family(),
+                                        Some(&peeked2),
+                                        Some(&pid),
+                                        None,
+                                        200,
+                                        t0.elapsed().as_millis() as i64,
+                                        true,
+                                        None,
+                                        Some("SseParseWarn".into()),
+                                        Some("[convert] openai_responses SSE 暂不支持流式转换".into()),
+                                    );
                                     continue;
                                 }
                                 _ => continue,

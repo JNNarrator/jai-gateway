@@ -179,6 +179,10 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                 .collect(),
         );
     }
+    // reasoning effort（Boolean 档）：effort≠none → thinking enabled（budget_tokens 不注入）
+    if let Some(effort) = &p.reasoning_effort {
+        body["thinking"] = json!({ "type": if effort == "none" { "disabled" } else { "enabled" } });
+    }
 
     // tools + tool_choice
     if !req.tools.is_empty() {
@@ -620,6 +624,23 @@ mod tests {
     }
 
     #[test]
+    fn encode_reasoning_effort_maps_to_thinking() {
+        let mut req = basic_req();
+        req.params.reasoning_effort = Some("high".into());
+        let v = encode_request(&req).unwrap();
+        assert_eq!(v["thinking"]["type"], "enabled");
+
+        let mut req2 = basic_req();
+        req2.params.reasoning_effort = Some("none".into());
+        let v2 = encode_request(&req2).unwrap();
+        assert_eq!(v2["thinking"]["type"], "disabled");
+
+        // 未指定 effort 时不下发 thinking 参数（保持默认）
+        let v3 = encode_request(&basic_req()).unwrap();
+        assert!(v3.get("thinking").is_none());
+    }
+
+    #[test]
     fn encode_user_tool_result_block() {
         let mut req = basic_req();
         req.messages = vec![CanonMessage {
@@ -904,6 +925,7 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
         frequency_penalty: None,
         presence_penalty: None,
         seed: None,
+        reasoning_effort: None, // Anthropic 入站无 effort 概念（thinking 为内容块）
     };
 
     // 未建模字段（§7 Lenient；stream 已建模不收集）

@@ -290,18 +290,8 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
         return Err("缺少 model 字段".into());
     }
 
-    // 拒绝跨族不支持的能力面（protocol-ir §3）
-    if let Some(n) = v.get("n").and_then(Value::as_u64) {
-        if n > 1 {
-            return Err("n>1（多候选）跨协议转换不支持；请使用 n=1".into());
-        }
-    }
-    if v.get("logprobs")
-        .or_else(|| v.get("top_logprobs"))
-        .is_some()
-    {
-        return Err("logprobs/top_logprobs 跨协议转换不支持".into());
-    }
+    // 能力面字段（n>1 / logprobs 等）统一收集进 extensions，由 capability 规划层
+    // 决策拒绝（decode 层只做结构解析，见 capability.rs plan_extension_fields）
     if let Some(stream) = v.get("stream").and_then(Value::as_bool) {
         if !stream && v.get("stream_options").is_some() {
             let _ = stream; // 忽略 stream_options（非流式场景无意义）
@@ -482,6 +472,10 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
             .and_then(Value::as_f64)
             .map(|f| f as f32),
         seed: v.get("seed").and_then(Value::as_i64),
+        reasoning_effort: v
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     };
 
     // 未建模字段（§7 Lenient 收集）
@@ -491,6 +485,9 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
         "user",
         "logit_bias",
         "repetition_penalty",
+        "n",
+        "logprobs",
+        "top_logprobs",
     ] {
         if v.get(k).is_some() {
             let _ = extensions
@@ -801,6 +798,14 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
     }
     if let Some(seed) = p.seed {
         body["seed"] = json!(seed);
+    }
+    // 结构化输出（capability 规划层已裁决：Supported 原样 / Degraded 已覆写为 json_object）
+    if let Some(format) = req.extensions.get("response_format") {
+        body["response_format"] = format.clone();
+    }
+    // reasoning effort（Native 档）：原样透传
+    if let Some(effort) = &p.reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
     }
     if req.stream {
         body["stream"] = json!(true);
@@ -1377,10 +1382,86 @@ mod tests {
 
     #[test]
     fn decode_rejects_cross_family_unsupported() {
-        assert!(super::decode_request(
-            br#"{"model":"m","n":2,"messages":[{"role":"user","content":"x"}]}"#
+        // decode 层只做结构解析：n>1 收集进 extensions，由能力规划层拒绝（capability.rs）
+        let req = super::decode_request(
+            br#"{"model":"m","n":2,"messages":[{"role":"user","content":"x"}]}"#,
         )
-        .is_err());
+        .expect("decode 不应直接拒绝 n>1");
+        assert!(req.extensions.contains_key("n"));
+
+        // anthropic 族（不支持多候选）→ 规划层 Rejected
+        let plan = crate::codec::capability::plan_compatibility(
+            &req,
+            crate::codec::capability::caps_of(crate::codec::Family::Anthropic),
+        );
+        let mut req2 = req.clone();
+        let outcome = plan.resolve(&mut req2);
+        let (msg, _code) = outcome.rejection.expect("n>1 应被规划层拒绝");
+        assert!(msg.contains("n>1"));
+
+        // n=1 不拒绝
+        let ok = super::decode_request(
+            br#"{"model":"m","n":1,"messages":[{"role":"user","content":"x"}]}"#,
+        )
+        .expect("n=1 正常");
+        assert!(ok.extensions.contains_key("n"));
+    }
+
+    #[test]
+    fn encode_response_format_external() {
+        // 规划层裁决后，response_format 从 extensions 外传给 openai_compat 上游
+        let mut req = CanonicalRequest {
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        req.extensions.insert(
+            "response_format".into(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "weather",
+                    "schema": {"type": "object", "properties": {"temp": {"type": "number"}}},
+                    "strict": true
+                }
+            }),
+        );
+        let v = super::encode_request(&req).unwrap();
+        let rf = v.get("response_format").expect("response_format 应外传");
+        assert_eq!(rf.get("type").and_then(Value::as_str), Some("json_schema"));
+        assert_eq!(
+            rf.get("json_schema")
+                .and_then(|s| s.get("name"))
+                .and_then(Value::as_str),
+            Some("weather")
+        );
+
+        // 降级路径（json_object）：原样外传
+        let mut req2 = CanonicalRequest {
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        req2.extensions.insert(
+            "response_format".into(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        let v2 = super::encode_request(&req2).unwrap();
+        assert_eq!(
+            v2.get("response_format")
+                .and_then(|f| f.get("type"))
+                .and_then(Value::as_str),
+            Some("json_object")
+        );
+    }
+
+    #[test]
+    fn encode_reasoning_effort_passthrough() {
+        let mut req = CanonicalRequest {
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        req.params.reasoning_effort = Some("high".into());
+        let v = super::encode_request(&req).unwrap();
+        assert_eq!(v["reasoning_effort"], "high");
     }
 
     #[test]

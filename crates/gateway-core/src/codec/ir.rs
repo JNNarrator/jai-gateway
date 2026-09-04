@@ -108,6 +108,10 @@ pub struct SampleParams {
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub seed: Option<i64>,
+    /// reasoning effort（OpenAI 系档位：none/minimal/low/medium/high；值原样透传，
+    /// 族差异由 capability 规划层声明 + 各 encoder 映射，见 capability.rs）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// 单条消息：role + 内容块。
@@ -127,7 +131,7 @@ impl CanonMessage {
 }
 
 /// 规范化请求。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CanonicalRequest {
     pub model: String,
     /// 多条 system 按序合并，渲染时以 \n\n 连接

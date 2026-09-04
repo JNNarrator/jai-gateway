@@ -130,8 +130,8 @@ enum StreamEvent {
 | --- | --- |
 | `n > 1`（多候选） | 三方均需流式多路复用，复杂度不值 |
 | `logprobs` / `top_logprobs` | 仅 OpenAI 有；直通路径不受影响，跨族拒绝 |
-| `response_format`(json_schema)，目标为跨族时 | 用户已拍板：报错而非指令注入（OpenAI 族目标仍透传） |
-| `reasoning_effort`、`verbosity` 等 o 系列参数 | 随 Thinking 支持一起后置 |
+| `response_format`(json_schema)，目标为跨族时 | **已翻转（v2 决策）**：降级执行——openai 系上游原生外传 `response_format`（text/json_object/json_schema），anthropic/gemini 上游降级为「提示词指令注入 + 输出后 JSON 校验」；连降级都无法表达时 400。见 §10 |
+| `reasoning_effort` | **已实现（v2）**：建模进 `SampleParams.reasoning_effort`；Native 档（openai 系）原样透传、Boolean 档（anthropic）映射 `thinking` 开/关、无能力族忽略并 WARN。见 §10 |
 | 音频输入/输出、视频输入 | 超出本期范围 |
 
 ## 4. 请求参数逐字段映射表
@@ -264,7 +264,70 @@ enum RouteDecision {
 3. **直通回归**：直通路径断言「body 未被触碰」（哈希对比）。
 4. 本地各协议 mock server（写入 fixtures 的重放脚本），CI 不打真实供应商 API。
 
-## 10. 已知边界与未决项
+## 10. 能力声明与兼容性规划（v2 新增）
+
+实现：`gateway-core::codec::capability`（借鉴 GodeX bridge 的 ProviderSpec capabilities + planner）。
+能力表是**协议族级**静态声明；模型级差异（§8 注释的 `target_model_capabilities`）是后续维度。
+
+### 六面能力声明（`Capabilities`）
+
+| 面 | 内容 | openai_compat / openai_responses | anthropic | gemini |
+| --- | --- | --- | --- | --- |
+| `parameters` | 支持的请求参数名（文档性声明） | stream/temperature/top_p/max_output_tokens/stop/penalties/seed/reasoning_effort/response_format | max/temperature/top_p/top_k/stop | max/temperature/top_p/top_k/stop/seed |
+| `tools` / `max_tools` | 工具声明类型 + 上限 | function / 128 | function / 128 | function / 128 |
+| `tool_choice` | auto/none/required/specific | ✓ 全 | ✓ 全 | ✓ 全 |
+| `response_formats` | 原生响应格式 | text/json_object/json_schema | text | text |
+| `degraded_formats` | 无法原生表达 → 降级方式 | — | json_object/json_schema → 指令注入 | 同左 |
+| `reasoning` | effort 能力档位 | Native | Boolean | None |
+| `streaming_usage` | 流式 usage | true | true | false |
+
+### 扩展工具降级矩阵（v2.1 新增）
+
+Codex 扩展工具（shell/apply_patch/custom/local_shell）对普通模型不可表达 → 折叠为
+function 工具（所有出站族统一，`tools_degraded` 表）：
+
+| 请求工具类型 | 折叠 function 名 | 声明 input_schema | 调用折叠（arguments） | 回程还原 item |
+| --- | --- | --- | --- | --- |
+| `shell` | `shell` | `{command, env, timeout_ms, user}` | action 原样 | `shell_call`（`action`） |
+| `local_shell` | `local_shell` | 同 shell | action 原样 | `local_shell_call`（`action`） |
+| `apply_patch` | `apply_patch` | `{operation}` | `{"operation": …}` | `apply_patch_call`（`operation`） |
+| `custom` | 原名（重名加 `_2` 后缀） | `{input:{type,value}}`（按 input_format） | `{"input": …}` | `custom_tool_call`（`input`） |
+
+- 折叠身份映射（`ToolIdentity {requested_type, requested_name, provider_name}`）随请求存
+  `extensions["__jai_tool_identities"]`，渲染侧按 provider 名还原 item 类型。
+- 输出折叠：`shell_call_output` 折叠为 `[exit N]\nstdout:\n…\nstderr:\n…` 文本；
+  `apply_patch_call_output` 为 `{status}: {output}`；custom/local_shell 取输出文本。
+- 流式还原：item 类型随 `output_item.added/done` 还原；参数增量事件名随类型
+  （`response.function_call_arguments.delta` / `response.custom_tool_call_input.delta`）。
+
+### 四级决策（`DecisionAction`）与处理
+
+| 决策 | 含义 | proxy 处理 |
+| --- | --- | --- |
+| `Supported` | 目标族原生支持 | 原样交给 encoder |
+| `Degraded` | 可降级执行 | 应用 `OutputContract`（指令注入 `req.system` 末条 / `response_format` 覆写）+ WARN |
+| `Ignored` | 目标族不消费（Lenient） | 丢弃 + WARN 汇总（原 §7 extension_warn_note 通道收敛于此） |
+| `Rejected` | 连降级都无法表达 | 400（错误码：`response_format_not_supported` / `tools_limit_exceeded` / `tool_choice_not_supported`） |
+
+### json_schema 降级矩阵
+
+| 入站 | 目标族 | 行为 |
+| --- | --- | --- |
+| `response_format: json_schema` | openai_compat / openai_responses | 原生外传（chat：`response_format`；responses：`text.format` 平铺还原） |
+| 同上 | anthropic / gemini | 降级：GodeX 风格指令（schema 名/描述/「只输出合法 JSON」规则/schema JSON/strict 覆盖句）合并进末条 system；`strict:true` 时非流式响应做输出 JSON 校验（失败 502 `structured_output_validation_failed`） |
+| `response_format: json_object` | openai 系 | 原生外传 |
+| 同上 | anthropic / gemini | 降级：纯「只输出合法 JSON」指令注入（无 schema 段） |
+
+### reasoning effort 映射
+
+| 目标族能力 | effort 值 | 出站 |
+| --- | --- | --- |
+| Native | 任意 | 原样透传（chat：`reasoning_effort`；responses：`reasoning:{effort}`） |
+| Boolean | ≠ none | `thinking:{type:"enabled"}`（budget_tokens 不注入） |
+| Boolean | none | `thinking:{type:"disabled"}` |
+| None | 任意 | 忽略 + WARN |
+
+## 11. 已知边界与未决项
 
 | # | 事项 | 当前决策/说明 |
 | --- | --- | --- |

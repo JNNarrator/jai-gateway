@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod anthropic;
+pub mod capability;
 pub mod gemini;
 pub mod ir;
 pub mod openai;
