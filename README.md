@@ -6,7 +6,7 @@
 
 > 开箱即用的本地 AI API 网关：把官方与第三方中转的杂牌 token 来源，收敛成一个稳定的本机入口（`127.0.0.1:1314`），并让多设备（macOS / Windows）配置随 WebDAV 保持同步。
 
-**状态**：M0–M9 全部里程碑完成 · UI 2.0（阶段 0–6）已落地 · v0.1.3
+**状态**：M0–M9 全部里程碑完成 · UI 2.0（阶段 0–6）已落地 · v0.1.6
 
 ---
 
@@ -30,7 +30,8 @@ JAI 是 Tauri 2 本地应用，分三层：**React 前端 → Tauri 桌面壳 �
 ┌──────────────────────▼───────────────────────────────────┐
 │ gateway-core（Rust 网关核心库）                           │
 │  server   Axum 网关：入站协议线 / 安全中间件 / 代理       │
-│  codec    协议中间表示（IR）+ 各协议适配器               │
+│  codec    协议中间表示（IR）+ 各协议适配器                │
+│  capability 能力声明 + 兼容性规划（四级决策：降级/忽略/拒绝）│
 │  router   多渠道路由：优先级故障转移 / 负载均衡           │
 │  store    SQLite 唯一事实源（供应商/模型/密钥/日志）      │
 │  discover 上游模型自动发现 · sync WebDAV 拉取推送        │
@@ -47,6 +48,7 @@ JAI 是 Tauri 2 本地应用，分三层：**React 前端 → Tauri 桌面壳 �
 
 - **同族直通**：入站协议族与出站供应商同族时走**字节级直通**——只改写上游 URL 与鉴权头，body 原样转发。零损耗，缓存控制、citations 等未建模特性原样保留。
 - **跨族转换**：解码 → 统一中间表示（IR）→ 编码。IR 先归一三大结构性差异：system 提示词位置、tool 结果载体、stop reason 枚举，使任意客户端协议都能组合任意上游模型（含 tool calling）。
+- **能力声明 + 兼容性规划**（[protocol-ir §10](docs/design/protocol-ir.md)）：每个出站协议族声明六面能力表（参数/工具/tool_choice/响应格式/reasoning/流式 usage），跨族转换前先规划——原生支持直传、可降级执行、无法表达才 400 拒绝；降级与 Lenient 丢弃进结构化日志（`CapabilityWarn`，UI 日志页可见）。
 - 日志采集在直通路径上做旁路轻量扫描（抓 usage 数字），不做语义级解析。
 
 ### 桌面壳关键机制
@@ -80,6 +82,9 @@ JAI 是 Tauri 2 本地应用，分三层：**React 前端 → Tauri 桌面壳 �
 - 同名模型多渠道路由：按优先级自动故障转移 + 健康感知排序 + 同优先级权重负载均衡
 - 模型别名/映射：每个模型可配置发给上游的真实模型 ID
 - 跨协议转换（含 tool calling）：让任意客户端组合任意上游模型
+  - **结构化输出降级执行**：客户端请求 `response_format(json_schema)` 时——openai 系上游原生外传；anthropic/gemini 上游降级为「提示词指令注入 + 输出 JSON 校验」（strict 校验失败返回 502）
+  - **reasoning effort 闭环**：入站 `reasoning_effort` / `reasoning.effort` 建模后按目标族映射——Native 透传、Anthropic 转 `thinking` 开/关、无能力族忽略并 WARN
+  - **Codex 扩展工具折叠还原**（[protocol-ir §10](docs/design/protocol-ir.md)）：`shell` / `apply_patch` / `custom` / `local_shell` 声明与调用折叠为 function 工具（Codex 客户端可接任意普通模型），回程按工具身份映射还原原始 item（含流式 item 类型与增量事件名）
 - 上游模型自动发现：从供应商 `/models` 拉取模型并入库，自动填上下文窗口/最大输出缺省值
 - MCP / 技能（Skill）管理：网关内登记 MCP Server 与技能（连通检查、工具查看、ZIP 批量导入、Markdown 导出）；MCP 配置导入自动识别三种格式——`{"mcpServers":{...}}` JSON、`codex mcp add` 命令行、Codex `[mcp_servers.*]` TOML 片段
 - 应用内更新：设置页一键检查 / 下载 / 安装 GitHub Releases 最新版本（minisign 签名校验，重启生效）
