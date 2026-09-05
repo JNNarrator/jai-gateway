@@ -913,23 +913,8 @@ async fn webdav_preview(core: State<'_, AppCore>) -> Result<WebDavPreview, Strin
     let remote_text = sync::pull(&core.http, &cfg, &password).await?;
     let local_text = export_config_json(core.clone()).await?;
 
-    let count = |text: &str| -> Result<(usize, usize), String> {
-        let v: serde_json::Value =
-            serde_json::from_str(text).map_err(|e| format!("配置 JSON 解析失败: {e}"))?;
-        let providers = v
-            .get("providers")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let models = v
-            .get("models")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
-        Ok((providers, models))
-    };
-    let (rp, rm) = count(&remote_text)?;
-    let (lp, lm) = count(&local_text)?;
+    let (rp, rm) = sync::export_counts(&remote_text)?;
+    let (lp, lm) = sync::export_counts(&local_text)?;
     let changed = rp != lp || rm != lm;
     Ok(WebDavPreview {
         remote_providers: rp,
@@ -976,6 +961,26 @@ async fn push_now(core: &AppCore) -> Result<(), String> {
     .map_err(join_err)??;
 
     sync::push(&core.http, &cfg, &password, export_text).await
+}
+
+/// 自动推送专用入口：护栏检查（本地空配置不覆盖远端备份）→ 常规推送。
+///
+/// 2026-09 数据丢失修复：远端已有完整配置而本机为空时，自动推送会让位，
+/// 原因写入上次自动推送状态（同步页可见）；手动推送不受此护栏限制。
+async fn auto_push_guarded(core: &AppCore) -> Result<(), String> {
+    let cfg = get_webdav_config(core).await?;
+    let password = get_webdav_password(core).await?;
+    let db = core.db.clone();
+    let local_text = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    let remote = sync::try_pull(&core.http, &cfg, &password).await?;
+    if let Some(reason) = sync::should_protect_remote(&local_text, remote.as_deref()) {
+        return Err(reason);
+    }
+    push_now(core).await
 }
 
 #[derive(serde::Serialize)]
@@ -1043,7 +1048,7 @@ fn spawn_autopush(core: AppCore) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let res = push_now(&core).await;
+            let res = auto_push_guarded(&core).await;
             let st = match &res {
                 Ok(()) => AutoPushStatus {
                     at_ms: at,

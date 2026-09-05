@@ -4,13 +4,14 @@
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Method, Uri};
 use axum::response::Response;
 use axum::routing::{any, get, put};
 use axum::Router;
 use gateway_core::store::{self, Db};
 use gateway_core::sync::{self, WebDavConfig};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
@@ -77,29 +78,34 @@ async fn spawn_dav_mock_missing() -> u16 {
     addr.port()
 }
 
-async fn spawn_dav_mock() -> (u16, Arc<Mutex<Option<String>>>) {
+/// 有状态 mock：按路径存取（GET 200/404，PUT 201），支持配置文件与时间戳备份
+/// 共存的真实 WebDAV 行为。
+async fn spawn_dav_mock() -> (u16, Arc<Mutex<HashMap<String, String>>>) {
     #[derive(Clone)]
-    struct DavState(Arc<Mutex<Option<String>>>);
-    let state = DavState(Arc::new(Mutex::new(None)));
+    struct DavState(Arc<Mutex<HashMap<String, String>>>);
+    let state = DavState(Arc::new(Mutex::new(HashMap::new())));
     let state2 = state.clone();
     let app = Router::new()
-        .route(
-            "/jai-config.json",
-            get(move |State(st): State<DavState>| async move {
-                let body = st.0.lock().unwrap().clone().unwrap_or_else(|| "{}".into());
-                Response::builder()
-                    .status(200)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body))
-                    .unwrap()
-            }),
-        )
-        .route(
-            "/jai-config.json",
-            put(move |State(st): State<DavState>, body: String| async move {
-                *st.0.lock().unwrap() = Some(body);
-                Response::builder().status(201).body(Body::empty()).unwrap()
-            }),
+        .fallback(
+            move |State(st): State<DavState>, uri: Uri, method: Method, body: String| async move {
+                let path = uri.path().to_string();
+                let mut map = st.0.lock().unwrap();
+                match method {
+                    Method::GET => match map.get(&path).cloned() {
+                        Some(b) => Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(Body::from(b))
+                            .unwrap(),
+                        None => Response::builder().status(404).body(Body::empty()).unwrap(),
+                    },
+                    Method::PUT => {
+                        map.insert(path, body);
+                        Response::builder().status(201).body(Body::empty()).unwrap()
+                    }
+                    _ => Response::builder().status(404).body(Body::empty()).unwrap(),
+                }
+            },
         )
         .with_state(state2);
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -150,7 +156,14 @@ async fn webdav_push_pull_roundtrip() {
     sync::push(&client, &cfg, "pw", payload.clone())
         .await
         .unwrap();
-    assert_eq!(remote.lock().unwrap().as_deref(), Some(payload.as_str()));
+    assert_eq!(
+        remote
+            .lock()
+            .unwrap()
+            .get("/jai-config.json")
+            .map(String::as_str),
+        Some(payload.as_str())
+    );
 
     let pulled = sync::pull(&client, &cfg, "pw").await.unwrap();
     assert_eq!(pulled, payload);
@@ -166,7 +179,10 @@ async fn webdav_pull_imports_into_db() {
         ],
         "models":[{"id":"m9","providerId":"p9","modelName":"gpt-4o-mini","upstreamModelId":null,"contextWindow":128000,"maxOutputTokens":4096,"enabled":true}]
     });
-    *remote.lock().unwrap() = Some(export.to_string());
+    remote
+        .lock()
+        .unwrap()
+        .insert("/jai-config.json".to_string(), export.to_string());
 
     let cfg = WebDavConfig {
         url: format!("http://127.0.0.1:{port}"),
@@ -240,6 +256,53 @@ async fn pull_404_hints_missing_remote_file() {
 
     let e = sync::pull(&client, &cfg, "pw").await.unwrap_err();
     assert!(e.contains("HTTP 404") && e.contains("远端尚无"), "{e}");
+}
+
+/// 数据丢失回归：远端已有完整配置时再推送，旧版必须留存为时间戳备份，
+/// 主文件才被新内容覆盖（2026-09 备份消失事件根因修复）。
+#[tokio::test(flavor = "multi_thread")]
+async fn push_backs_up_existing_remote_before_overwrite() {
+    let (port, remote) = spawn_dav_mock().await;
+    let full =
+        r#"{"format":"jai-export/v1","providers":[{"id":"p1","name":"A"}],"models":[{"id":"m1"}]}"#
+            .to_string();
+    remote
+        .lock()
+        .unwrap()
+        .insert("/jai-config.json".to_string(), full.clone());
+
+    let cfg = WebDavConfig {
+        url: format!("http://127.0.0.1:{port}"),
+        username: "u".into(),
+        directory: String::new(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
+    };
+    let client = reqwest::Client::new();
+    let empty = r#"{"format":"jai-export/v1","providers":[],"models":[]}"#.to_string();
+    sync::push(&client, &cfg, "pw", empty.clone())
+        .await
+        .unwrap();
+
+    let map = remote.lock().unwrap();
+    // 主文件被新内容覆盖
+    assert_eq!(
+        map.get("/jai-config.json").map(String::as_str),
+        Some(empty.as_str())
+    );
+    // 旧版必须留存在同目录时间戳备份中（永不丢失）
+    let backups: Vec<String> = map
+        .keys()
+        .filter(|k| {
+            k.starts_with("/jai-config.") && k.ends_with(".json") && *k != "/jai-config.json"
+        })
+        .cloned()
+        .collect();
+    assert_eq!(backups.len(), 1, "应留存一份远端旧版备份: {map:?}");
+    assert_eq!(
+        map.get(backups[0].as_str()).map(String::as_str),
+        Some(full.as_str())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

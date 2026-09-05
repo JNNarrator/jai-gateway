@@ -272,7 +272,8 @@ export function SyncPage() {
           </CardTitle>
           <CardDescription>
             手动推/拉：推送使用本机当前配置覆盖远端；拉取使用远端配置覆盖本机（last-write-wins）。
-            推送前会在本地留存一份快照。
+            推送前会自动把远端上一版留存为 <code className="font-mono text-xs">jai-config.&lt;时间戳&gt;.json</code> 备份，
+            并在本地留存一份快照。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -356,6 +357,7 @@ export function SyncPage() {
                 <div className="text-sm font-medium">自动推送</div>
                 <div className="text-xs leading-relaxed text-muted-foreground">
                   配置变更后防抖 30 秒推送一次，并按所选间隔定时推送。以本机为准，直接覆盖远端。
+                  护栏：本机配置为空而远端有内容时自动跳过（避免覆盖远端备份），需手动推送。
                 </div>
               </div>
               <Switch

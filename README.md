@@ -82,7 +82,7 @@ JAI 是 Tauri 2 本地应用，分三层：**React 前端 → Tauri 桌面壳 �
 ## 核心特性
 
 - 多供应商管理：OpenAI 兼容 / OpenAI Responses / Anthropic / Gemini 四族渠道；凭据明文存本地 SQLite（与网关 Key 同级安全模型，安全性依赖数据目录文件权限）
-- **配置随 WebDAV 同步**：供应商 API Key、网关 Key、WebDAV 密码随导出同步，换机器拉取即用（客户端零改动）；手动重新生成网关 Key 自动更新远端；推送前快照 + last-write-wins
+- **配置随 WebDAV 同步**：供应商 API Key、网关 Key、WebDAV 密码随导出同步，换机器拉取即用（客户端零改动）；手动重新生成网关 Key 自动更新远端；推送前自动留存远端上一版时间戳备份 + 本地快照，自动推送带「空配置不覆盖远端」护栏（last-write-wins）
 - 对外暴露统一网关入口（`127.0.0.1:1314`），支持多条入站协议线：
   - OpenAI `POST /v1/chat/completions` 与旧版 `POST /v1/completions`
   - OpenAI Responses API `POST /v1/responses`
