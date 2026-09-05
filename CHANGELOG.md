@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-05
+
 ### Added
 - **能力声明 + 兼容性规划层**（`gateway-core::codec::capability`，借鉴 GodeX bridge）：协议族级
   六面能力表（参数/工具/tool_choice/响应格式/reasoning/流式 usage）+ 四级决策
