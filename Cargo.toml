@@ -26,6 +26,8 @@ keyring = { version = "3", features = [
     "sync-secret-service",
 ] }
 uuid = { version = "1", features = ["v7"] }
+url = "2"
+quick-xml = "0.31"
 rand = "0.8"
 sha2 = "0.10"
 futures-util = "0.3"

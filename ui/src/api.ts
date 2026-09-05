@@ -14,6 +14,7 @@ import type {
   SkillRow,
   UsageStatRow,
   WebDavAutoPushStatus,
+  WebDavBackupItem,
   WebDavConfigDto,
   WebDavSnapshotInfo,
 } from "./types";
@@ -120,12 +121,18 @@ export const api = {
       willOverwrite: boolean;
       message: string;
     }>("webdav_preview"),
-  webdavPush: () => invoke<void>("webdav_push"),
+  webdavPush: (force?: boolean) =>
+    invoke<void>("webdav_push", { force: force ?? false }),
   webdavPull: () => invoke<ImportReport>("webdav_pull"),
   webdavSnapshotInfo: () =>
     invoke<WebDavSnapshotInfo>("webdav_snapshot_info"),
   webdavSnapshotRestore: () =>
     invoke<ImportReport>("webdav_snapshot_restore"),
+  webdavBackupsList: () => invoke<WebDavBackupItem[]>("webdav_backups_list"),
+  webdavBackupRestore: (name: string) =>
+    invoke<ImportReport>("webdav_backup_restore", { name }),
+  webdavBackupDelete: (name: string) =>
+    invoke<void>("webdav_backup_delete", { name }),
 
   // MCP 管理
   mcpList: () => invoke<McpServerRow[]>("mcp_list"),

@@ -29,6 +29,21 @@ All notable changes to this project will be documented in this file.
   `stream_options` / `metadata` / `user` / `include` / `previous_response_id`）转换丢弃
   属预期（如 `store` 请求服务端存储会话，转发网关不代管），不再刷 `CapabilityWarn`——
   告警只保留给真正的降级与陌生字段，避免 dsh 等客户端常规请求淹没日志
+- **WebDAV 远端备份管理**（`webdav_backups_list` / `webdav_backup_restore` /
+  `webdav_backup_delete`）：同步页新增「远端备份（WebDAV 目录）」区——PROPFIND 列出
+  同目录 `jai-config.<时间戳>.json` 备份（时间/大小），可恢复指定版本到本地
+  （与拉取同回声抑制，并把自动拉取基线对齐远端当前版本，防止恢复结果立刻被拉回去）、
+  可删除（仅时间戳备份名，当前配置与无关文件拒绝；404 幂等）
+- **远端路径透明化**：目录字段按 URL 语义百分号编码（空格/中文不再拼出非法地址），
+  同步页新增「远端配置文件地址」实时预览 + 一键复制
+- **自动同步失败系统通知**：自动推送/拉取失败时发系统通知（错误摘要 140 字符截断）
+
+### Changed
+- **推送前差异预警**：手动推送若远端有本机没有的供应商/模型，首次调用返回可读提示并在
+  前端弹「仍然推送」确认框——防止多设备场景无意覆盖掉另一台设备刚加的内容；
+  `webdav_push` 新增 `force` 参数（true 跳过预警）
+- **远端备份保留策略**：`BACKUP_KEEP=10`，备份解析/清理只认 `jai-config.<digits>.json`
+  形态（防误删，当前配置永不列入）
 
 ### Added
 - **WebDAV 从本地快照恢复**：同步页新增「本地推送前快照」卡片与「从快照恢复」按钮

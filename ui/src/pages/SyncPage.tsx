@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeftRight,
   ClipboardPaste,
@@ -7,7 +7,12 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { api } from "../api";
-import type { WebDavAutoPushStatus, WebDavSnapshotInfo } from "../types";
+import type {
+  WebDavAutoPushStatus,
+  WebDavBackupItem,
+  WebDavSnapshotInfo,
+} from "../types";
+import { CopyField } from "@/components/common/CopyField";
 import { toast } from "../lib/toast";
 import { PageHeader } from "@/components/common/PageHeader";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
@@ -52,11 +57,31 @@ export function SyncPage() {
   const [lastAutoPull, setLastAutoPull] = useState<WebDavAutoPushStatus | null>(null);
   const [snapInfo, setSnapInfo] = useState<WebDavSnapshotInfo | null>(null);
   const [confirmRestore, setConfirmRestore] = useState(false);
+  const [backups, setBackups] = useState<WebDavBackupItem[] | null>(null);
+  const [loadingBackups, setLoadingBackups] = useState(false);
+  const [confirmRestoreBackup, setConfirmRestoreBackup] =
+    useState<WebDavBackupItem | null>(null);
+  const [confirmDeleteBackup, setConfirmDeleteBackup] =
+    useState<WebDavBackupItem | null>(null);
+  const [pushBlockInfo, setPushBlockInfo] = useState("");
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
   const [confirmImport, setConfirmImport] = useState(false);
   const [overwriteInfo, setOverwriteInfo] = useState("");
+
+  // 远端配置文件地址实时预览（与后端 join_remote_file 语义一致：目录各路径段编码）
+  const remoteConfigUrl = useMemo(() => {
+    const base = cfg.url.trim().replace(/\/+$/, "");
+    if (!base) return "";
+    const dir = cfg.directory.trim().replace(/^\/+|\/+$/g, "");
+    const segments = dir
+      .split("/")
+      .filter(Boolean)
+      .map((s) => encodeURIComponent(s))
+      .join("/");
+    return segments ? `${base}/${segments}/jai-config.json` : `${base}/jai-config.json`;
+  }, [cfg.url, cfg.directory]);
 
   useEffect(() => {
     api
@@ -73,12 +98,57 @@ export function SyncPage() {
     api.webdavAutopushStatus().then(setLastAuto).catch(() => {});
     api.webdavAutopullStatus().then(setLastAutoPull).catch(() => {});
     api.webdavSnapshotInfo().then(setSnapInfo).catch(() => {});
+    loadBackups();
     const t = setInterval(() => {
       api.webdavAutopushStatus().then(setLastAuto).catch(() => {});
       api.webdavAutopullStatus().then(setLastAutoPull).catch(() => {});
     }, 60_000);
     return () => clearInterval(t);
   }, []);
+
+  async function loadBackups() {
+    setLoadingBackups(true);
+    try {
+      setBackups(await api.webdavBackupsList());
+    } catch (e) {
+      setErr(String(e));
+      setBackups([]);
+    } finally {
+      setLoadingBackups(false);
+    }
+  }
+
+  async function doBackupRestore(b: WebDavBackupItem) {
+    setBusy("backup-restore");
+    setErr("");
+    setConfirmRestoreBackup(null);
+    try {
+      const r = await api.webdavBackupRestore(b.name);
+      setMsg(
+        `已从远端备份 ${b.name} 恢复：供应商 ${r.providersImported}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
+      );
+      void loadBackups();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function doBackupDelete(b: WebDavBackupItem) {
+    setBusy("backup-delete");
+    setErr("");
+    setConfirmDeleteBackup(null);
+    try {
+      await api.webdavBackupDelete(b.name);
+      setMsg(`已删除远端备份 ${b.name}`);
+      void loadBackups();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
 
   async function doImport() {
     setErr("");
@@ -211,8 +281,32 @@ export function SyncPage() {
     setBusy("push");
     setErr("");
     try {
-      await api.webdavPush();
-      setMsg("已推送到 WebDAV，推送前本地快照已留存");
+      await api.webdavPush(false);
+      setMsg("已推送到 WebDAV，推送前本地快照与远端旧版备份均已留存");
+      void loadBackups();
+      void api.webdavSnapshotInfo().then(setSnapInfo).catch(() => {});
+    } catch (e) {
+      const text = String(e);
+      if (text.includes("仍然推送")) {
+        // 差异预警：远端有本机没有的内容，弹确认框由用户决定
+        setPushBlockInfo(text);
+      } else {
+        setErr(text);
+      }
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function doPushForce() {
+    setPushBlockInfo("");
+    setBusy("push");
+    setErr("");
+    try {
+      await api.webdavPush(true);
+      setMsg("已推送到 WebDAV（以本机为准覆盖），推送前远端旧版已留存为备份");
+      void loadBackups();
+      void api.webdavSnapshotInfo().then(setSnapInfo).catch(() => {});
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -229,6 +323,7 @@ export function SyncPage() {
       setMsg(
         `拉取并导入完成：新增供应商 ${r.providersImported}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
       );
+      void loadBackups();
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -246,6 +341,7 @@ export function SyncPage() {
         `已从快照恢复：新增供应商 ${r.providersImported}，重复跳过 ${r.providersSkippedDuplicate}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
       );
       api.webdavSnapshotInfo().then(setSnapInfo).catch(() => {});
+      void loadBackups();
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -352,6 +448,17 @@ export function SyncPage() {
                 value={cfg.directory}
                 onChange={(e) => setCfg({ ...cfg, directory: e.target.value })}
                 placeholder="jai/backups"
+              />
+            </FormField>
+            <FormField
+              label="远端配置文件地址"
+              htmlFor="dav-remote-url"
+              className="md:col-span-2"
+            >
+              <CopyField
+                value={remoteConfigUrl}
+                display={remoteConfigUrl || "尚未填写 WebDAV 根地址"}
+                copyDisabled={!remoteConfigUrl}
               />
             </FormField>
             <FormField
@@ -493,6 +600,81 @@ export function SyncPage() {
               {busy === "restore" ? "恢复中…" : "从快照恢复"}
             </Button>
           </div>
+
+          <div className="space-y-2 rounded-md border bg-muted/30 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-sm font-medium">远端备份（WebDAV 目录）</div>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7"
+                disabled={loadingBackups || !!busy}
+                onClick={() => void loadBackups()}
+              >
+                {loadingBackups ? "加载中…" : "刷新"}
+              </Button>
+            </div>
+            <div className="text-xs leading-relaxed text-muted-foreground">
+              每次推送前会把远端上一版留存为时间戳备份（同目录
+              <code className="font-mono">jai-config.&lt;时间戳&gt;.json</code>），可在此恢复
+              指定版本到本地或删除。
+            </div>
+            {backups === null ? (
+              <div className="text-xs text-muted-foreground">未加载（请先配置 WebDAV）</div>
+            ) : backups.length === 0 ? (
+              <div className="text-xs text-muted-foreground">
+                远端目录暂无文件——首次推送后此处会出现备份列表。
+              </div>
+            ) : (
+              <ul className="divide-y rounded-md border bg-background/60 text-xs">
+                {backups.map((b) => (
+                  <li
+                    key={b.name}
+                    className="flex items-center justify-between gap-2 px-3 py-2"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate font-mono">
+                        {b.name}
+                        {b.isCurrent && (
+                          <span className="ml-2 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+                            当前
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-muted-foreground">
+                        {b.ts
+                          ? new Date(b.ts).toLocaleString("zh-CN", { hour12: false })
+                          : "—"}
+                        {b.size != null && ` · ${(b.size / 1024).toFixed(1)} KB`}
+                      </div>
+                    </div>
+                    {!b.isCurrent && (
+                      <div className="flex shrink-0 gap-1">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7"
+                          disabled={busy === "backup-restore"}
+                          onClick={() => setConfirmRestoreBackup(b)}
+                        >
+                          恢复
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 text-destructive"
+                          disabled={busy === "backup-delete"}
+                          onClick={() => setConfirmDeleteBackup(b)}
+                        >
+                          删除
+                        </Button>
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </CardContent>
       </Card>
 
@@ -519,6 +701,38 @@ export function SyncPage() {
         description="将用上次推送前的完整快照覆盖本地当前配置（含供应商、模型、网关 Key 与 WebDAV 配置），用于误操作回退。若已开启自动推送，恢复结果随后会防抖同步回远端。"
         confirmText="恢复"
         onConfirm={doRestore}
+      />
+      <ConfirmDialog
+        open={!!pushBlockInfo}
+        onOpenChange={(o) => !o && setPushBlockInfo("")}
+        title="推送将覆盖远端内容"
+        description={pushBlockInfo}
+        confirmText="仍然推送"
+        onConfirm={doPushForce}
+      />
+      <ConfirmDialog
+        open={!!confirmRestoreBackup}
+        onOpenChange={(o) => !o && setConfirmRestoreBackup(null)}
+        title={`从远端备份恢复本地配置？`}
+        description={
+          confirmRestoreBackup
+            ? `将用远端备份 ${confirmRestoreBackup.name}（${confirmRestoreBackup.ts ? new Date(confirmRestoreBackup.ts).toLocaleString("zh-CN", { hour12: false }) : "时间未知"}）覆盖本地当前配置（含供应商、模型、网关 Key 与 WebDAV 配置）。`
+            : ""
+        }
+        confirmText="恢复"
+        onConfirm={() => confirmRestoreBackup && void doBackupRestore(confirmRestoreBackup)}
+      />
+      <ConfirmDialog
+        open={!!confirmDeleteBackup}
+        onOpenChange={(o) => !o && setConfirmDeleteBackup(null)}
+        title="删除远端备份？"
+        description={
+          confirmDeleteBackup
+            ? `将从 WebDAV 永久删除备份 ${confirmDeleteBackup.name}（本地不受影响）。`
+            : ""
+        }
+        confirmText="删除"
+        onConfirm={() => confirmDeleteBackup && void doBackupDelete(confirmDeleteBackup)}
       />
     </div>
   );

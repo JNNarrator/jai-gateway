@@ -90,8 +90,8 @@ async fn spawn_dav_mock() -> (u16, Arc<Mutex<HashMap<String, String>>>) {
             move |State(st): State<DavState>, uri: Uri, method: Method, body: String| async move {
                 let path = uri.path().to_string();
                 let mut map = st.0.lock().unwrap();
-                match method {
-                    Method::GET => match map.get(&path).cloned() {
+                match method.as_str() {
+                    "GET" => match map.get(&path).cloned() {
                         Some(b) => Response::builder()
                             .status(200)
                             .header("content-type", "application/json")
@@ -99,9 +99,38 @@ async fn spawn_dav_mock() -> (u16, Arc<Mutex<HashMap<String, String>>>) {
                             .unwrap(),
                         None => Response::builder().status(404).body(Body::empty()).unwrap(),
                     },
-                    Method::PUT => {
+                    "PUT" => {
                         map.insert(path, body);
                         Response::builder().status(201).body(Body::empty()).unwrap()
+                    }
+                    "PROPFIND" => {
+                        // Depth:1 列表：全部条目（含目录内备份），multistatus XML
+                        let mut xml = String::from(
+                            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n",
+                        );
+                        let mut keys: Vec<&String> = map.keys().collect();
+                        keys.sort();
+                        for k in keys {
+                            let size = map.get(k).map(|v| v.len()).unwrap_or(0);
+                            xml.push_str(&format!(
+                                "  <D:response>\n    <D:href>{k}</D:href>\n    \
+                                 <D:propstat>\n      <D:prop><D:getcontentlength>{size}</D:getcontentlength></D:prop>\n      \
+                                 <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n  </D:response>\n"
+                            ));
+                        }
+                        xml.push_str("</D:multistatus>");
+                        Response::builder()
+                            .status(207)
+                            .header("content-type", "application/xml")
+                            .body(Body::from(xml))
+                            .unwrap()
+                    }
+                    "DELETE" => {
+                        if map.remove(&path).is_some() {
+                            Response::builder().status(204).body(Body::empty()).unwrap()
+                        } else {
+                            Response::builder().status(404).body(Body::empty()).unwrap()
+                        }
                     }
                     _ => Response::builder().status(404).body(Body::empty()).unwrap(),
                 }
@@ -334,4 +363,78 @@ async fn probe_404_hints_bad_path() {
     };
     let err = sync::probe(&client, &cfg, "pw").await.unwrap_err();
     assert!(err.contains("路径不存在"), "{err}");
+}
+
+/// T2 回归：远端备份列表（PROPFIND）过滤/排序、读取、删除与防误删。
+#[tokio::test(flavor = "multi_thread")]
+async fn webdav_backups_list_restore_delete_roundtrip() {
+    let (port, remote) = spawn_dav_mock().await;
+    let cfg = WebDavConfig {
+        url: format!("http://127.0.0.1:{port}"),
+        username: "u".into(),
+        directory: String::new(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
+        auto_pull_enabled: false,
+    };
+    {
+        let mut m = remote.lock().unwrap();
+        m.insert(
+            "/jai-config.json".into(),
+            r#"{"providers":[{"id":"cur"}]}"#.into(),
+        );
+        m.insert(
+            "/jai-config.100.json".into(),
+            r#"{"providers":[{"id":"old"}]}"#.into(),
+        );
+        m.insert(
+            "/jai-config.200.json".into(),
+            r#"{"providers":[{"id":"older"}]}"#.into(),
+        );
+        m.insert("/readme.txt".into(), "x".into());
+    }
+    let client = reqwest::Client::new();
+
+    // 列表：只保留当前配置 + 时间戳备份，无关文件剔除，按时间戳升序（当前配置排最后）
+    let items = sync::list_backups(&client, &cfg, "pw").await.unwrap();
+    let names: Vec<String> = items.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "jai-config.100.json",
+            "jai-config.200.json",
+            "jai-config.json"
+        ]
+    );
+    let b100 = items
+        .iter()
+        .find(|b| b.name == "jai-config.100.json")
+        .unwrap();
+    assert_eq!(
+        b100.size,
+        Some(r#"{"providers":[{"id":"old"}]}"#.len() as u64)
+    );
+
+    // 读取备份内容
+    let text = sync::fetch_backup(&client, &cfg, "pw", "jai-config.100.json")
+        .await
+        .unwrap();
+    assert!(text.contains("\"id\":\"old\""), "{text}");
+    // 当前配置名不可作为备份读取
+    assert!(sync::fetch_backup(&client, &cfg, "pw", "jai-config.json")
+        .await
+        .is_err());
+
+    // 删除备份；当前配置拒绝删除；404 幂等
+    sync::delete_backup(&client, &cfg, "pw", "jai-config.100.json")
+        .await
+        .unwrap();
+    assert!(remote.lock().unwrap().get("/jai-config.100.json").is_none());
+    assert!(sync::delete_backup(&client, &cfg, "pw", "jai-config.json")
+        .await
+        .is_err());
+    sync::delete_backup(&client, &cfg, "pw", "jai-config.100.json")
+        .await
+        .unwrap(); // 已删 → 幂等成功
+    assert!(remote.lock().unwrap().contains_key("/jai-config.json"));
 }

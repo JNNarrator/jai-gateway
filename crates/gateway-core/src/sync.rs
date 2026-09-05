@@ -37,14 +37,10 @@ pub const AUTO_PUSH_INTERVAL_DEFAULT: u32 = 60;
 pub const AUTO_PUSH_INTERVAL_ALLOWED: [u32; 3] = [30, 60, 360];
 
 impl WebDavConfig {
+    /// 配置文件完整远端地址（目录各路径段按 URL 语义百分号编码，
+    /// 空格/中文等不再拼出非法 URL）。
     pub fn config_url(&self) -> String {
-        let base = self.url.trim_end_matches('/');
-        let dir = self.directory.trim_matches('/');
-        if dir.is_empty() {
-            format!("{base}/{CONFIG_FILE_NAME}")
-        } else {
-            format!("{base}/{dir}/{CONFIG_FILE_NAME}")
-        }
+        join_remote_file(&self.url, &self.directory, CONFIG_FILE_NAME)
     }
 
     /// 非法值回退默认 60 分钟。
@@ -56,20 +52,56 @@ impl WebDavConfig {
         }
     }
 
-    /// 配置文件所在远端目录（不含文件名）。
-    fn config_dir(&self) -> String {
+    /// 配置文件所在远端目录（不含文件名；路径段已编码）。
+    pub fn config_dir(&self) -> String {
         let base = self.url.trim_end_matches('/');
         let dir = self.directory.trim_matches('/');
         if dir.is_empty() {
             base.to_string()
         } else {
-            format!("{base}/{dir}")
+            join_path(base, dir)
         }
     }
 
     /// 覆盖前留存远端旧版的备份地址（与配置文件同目录，时间戳后缀）。
     pub fn backup_url(&self, now_ms: i64) -> String {
-        format!("{}/jai-config.{now_ms}.json", self.config_dir())
+        join_remote_file(
+            &self.url,
+            &self.directory,
+            &format!("jai-config.{now_ms}.json"),
+        )
+    }
+}
+
+/// 把目录拼到 base 后（各路径段按 URL 语义编码）。base 无法解析（如
+/// 非 http(s) 前缀）时回退裸字符串拼接，保持旧行为不抛错。
+fn join_path(base: &str, dir: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let mut u = match url::Url::parse(base) {
+        Ok(u) => u,
+        Err(_) => return format!("{base}/{dir}"),
+    };
+    if u.cannot_be_a_base() {
+        return format!("{base}/{dir}");
+    }
+    {
+        let mut segs = u.path_segments_mut().expect("cannot_be_a_base 已排除");
+        segs.pop_if_empty();
+        for s in dir.split('/').filter(|s| !s.is_empty()) {
+            segs.push(s); // url crate 自动对每段做百分号编码
+        }
+    }
+    u.to_string()
+}
+
+/// 远端配置文件地址 = base + 目录段 + 文件名。
+fn join_remote_file(base: &str, dir: &str, file: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let dir = dir.trim_matches('/');
+    if dir.is_empty() {
+        join_path(base, file)
+    } else {
+        format!("{}/{}", join_path(base, dir), file)
     }
 }
 
@@ -267,6 +299,290 @@ pub fn export_counts(text: &str) -> Result<(usize, usize), String> {
     Ok((providers, models))
 }
 
+/// 解析备份文件名 `jai-config.<unix_ms>.json` 的时间戳；不匹配返回 None。
+pub fn backup_timestamp(name: &str) -> Option<i64> {
+    let stem = name.strip_prefix("jai-config.")?;
+    let digits = stem.strip_suffix(".json")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok()
+}
+
+/// 远端备份保留份数（推送后滚动清理时保留最近 N 份时间戳备份）。
+pub const BACKUP_KEEP: usize = 10;
+
+/// 备份保留策略：给定远端目录下全部文件名（含当前配置），返回应删除的最老备份
+/// 文件名列表。只识别 `jai-config.<digits>.json` 形态，当前配置文件与无关文件
+/// 永不列入；不足 `keep` 份时不删任何备份。
+pub fn backup_evict_candidates(names: &[String], keep: usize) -> Vec<String> {
+    let mut cands: Vec<(i64, String)> = names
+        .iter()
+        .filter_map(|n| backup_timestamp(n).map(|ts| (ts, n.clone())))
+        .collect();
+    cands.sort_by_key(|(ts, _)| *ts);
+    cands
+        .iter()
+        .take(cands.len().saturating_sub(keep))
+        .map(|(_, n)| n.clone())
+        .collect()
+}
+
+/// 远端备份信息（PROPFIND 列表结果）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupInfo {
+    /// 文件名（如 `jai-config.123.json`；当前配置为 `jai-config.json`）
+    pub name: String,
+    /// 完整远端路径（GET/DELETE 用）
+    pub href: String,
+    /// 字节大小（服务器未返回时为 None）
+    pub size: Option<u64>,
+}
+
+/// 备份文件名 → 其完整远端地址。仅接受 `jai-config.<digits>.json` 形态。
+pub fn backup_href(cfg: &WebDavConfig, name: &str) -> Result<String, String> {
+    if backup_timestamp(name).is_none() {
+        return Err(format!("非法备份文件名: {name}"));
+    }
+    Ok(format!("{}/{}", cfg.config_dir(), name))
+}
+
+/// PROPFIND（Depth:1）列出远端目录下全部条目，仅保留当前配置与时间戳备份。
+pub async fn list_backups(
+    http: &reqwest::Client,
+    cfg: &WebDavConfig,
+    password: &str,
+) -> Result<Vec<BackupInfo>, String> {
+    let dir_url = cfg.config_dir();
+    let resp = http
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND 合法"),
+            &dir_url,
+        )
+        .basic_auth(&cfg.username, Some(password))
+        .header("Depth", "1")
+        .header("Content-Type", "application/xml")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("WebDAV 备份列表请求失败: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let hint = match status.as_u16() {
+            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码）",
+            404 => "（目录不存在：请检查根地址与目录设置）",
+            _ => "",
+        };
+        return Err(format!("WebDAV 备份列表失败 HTTP {status}{hint}: {text}"));
+    }
+    let xml = resp
+        .text()
+        .await
+        .map_err(|e| format!("WebDAV 备份列表响应读取失败: {e}"))?;
+    let mut out: Vec<BackupInfo> = parse_multistatus(&xml)?
+        .into_iter()
+        .filter(|b| b.name == CONFIG_FILE_NAME || backup_timestamp(&b.name).is_some())
+        .collect();
+    out.sort_by_key(|b| backup_timestamp(&b.name).unwrap_or(i64::MAX));
+    Ok(out)
+}
+
+/// GET 指定备份的配置文本。
+pub async fn fetch_backup(
+    http: &reqwest::Client,
+    cfg: &WebDavConfig,
+    password: &str,
+    name: &str,
+) -> Result<String, String> {
+    let url = backup_href(cfg, name)?;
+    let resp = http
+        .get(&url)
+        .basic_auth(&cfg.username, Some(password))
+        .send()
+        .await
+        .map_err(|e| format!("WebDAV 备份读取请求失败: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let hint = match status.as_u16() {
+            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码）",
+            404 => "（备份不存在：可能已被清理）",
+            _ => "",
+        };
+        return Err(format!("WebDAV 备份读取失败 HTTP {status}{hint}: {text}"));
+    }
+    resp.text()
+        .await
+        .map_err(|e| format!("WebDAV 备份响应读取失败: {e}"))
+}
+
+/// DELETE 指定备份（仅允许时间戳备份名）。
+pub async fn delete_backup(
+    http: &reqwest::Client,
+    cfg: &WebDavConfig,
+    password: &str,
+    name: &str,
+) -> Result<(), String> {
+    let url = backup_href(cfg, name)?;
+    let resp = http
+        .delete(&url)
+        .basic_auth(&cfg.username, Some(password))
+        .send()
+        .await
+        .map_err(|e| format!("WebDAV 备份删除请求失败: {e}"))?;
+    if resp.status().as_u16() == 404 {
+        return Ok(()); // 已不存在，幂等成功
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let hint = match status.as_u16() {
+            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码）",
+            _ => "",
+        };
+        return Err(format!("WebDAV 备份删除失败 HTTP {status}{hint}: {text}"));
+    }
+    Ok(())
+}
+
+/// 解析 PROPFIND multistatus XML：抽取 href + getcontentlength。
+fn parse_multistatus(xml: &str) -> Result<Vec<BackupInfo>, String> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.trim_text(true);
+    let mut out = Vec::new();
+    let mut cur_href: Option<String> = None;
+    let mut cur_size: Option<u64> = None;
+    let mut last_tag: Vec<u8> = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                last_tag = e.name().as_ref().to_vec();
+                if last_tag.ends_with(b"response") {
+                    cur_href = None;
+                    cur_size = None;
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                last_tag = e.name().as_ref().to_vec();
+                if last_tag.ends_with(b"href") {
+                    cur_href = e
+                        .attributes()
+                        .flatten()
+                        .find(|a| a.key.as_ref().ends_with(b"href"))
+                        .and_then(|a| a.unescape_value().ok())
+                        .map(|s| s.trim().to_string());
+                }
+            }
+            Ok(quick_xml::events::Event::Text(t)) => {
+                let text = t.unescape().unwrap_or_default();
+                let text = text.trim().to_string();
+                if last_tag.ends_with(b"href") && !text.is_empty() {
+                    cur_href = Some(text);
+                } else if last_tag.ends_with(b"getcontentlength") {
+                    cur_size = text.parse::<u64>().ok();
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                let name = e.name();
+                let name = name.as_ref();
+                if name.ends_with(b"response") {
+                    if let Some(href) = cur_href.take() {
+                        let file = href.rsplit('/').next().unwrap_or(&href).to_string();
+                        out.push(BackupInfo {
+                            name: file,
+                            href,
+                            size: cur_size.take(),
+                        });
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(format!("PROPFIND 响应解析失败: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(out)
+}
+
+/// 推送前差异预警结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushDiff {
+    pub remote_exists: bool,
+    /// 远端有、本地没有的供应商数（推送覆盖后将丢失）
+    pub remote_only_providers: usize,
+    /// 远端有、本地没有的模型数（推送覆盖后将丢失）
+    pub remote_only_models: usize,
+}
+
+impl PushDiff {
+    /// 是否需要用户确认（远端存在本机没有的内容）。
+    pub fn blocks(&self) -> bool {
+        self.remote_only_providers > 0 || self.remote_only_models > 0
+    }
+}
+
+/// 导出键集：供应商 (name, base_url) 与模型 (providerId, modelName)。
+type ExportKeys = (
+    std::collections::HashSet<(String, String)>,
+    std::collections::HashSet<(String, String)>,
+);
+
+/// 提取导出 JSON 的供应商 (name, base_url) 与模型 (providerId, modelName) 键集。
+fn export_keys(text: &str) -> Result<ExportKeys, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("配置 JSON 解析失败: {e}"))?;
+    let mut providers = std::collections::HashSet::new();
+    if let Some(arr) = v.get("providers").and_then(Value::as_array) {
+        for p in arr {
+            providers.insert((
+                p.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                p.get("base_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ));
+        }
+    }
+    let mut models = std::collections::HashSet::new();
+    if let Some(arr) = v.get("models").and_then(Value::as_array) {
+        for m in arr {
+            models.insert((
+                m.get("providerId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                m.get("modelName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ));
+        }
+    }
+    Ok((providers, models))
+}
+
+/// 推送前差异：远端有而本地没有的供应商/模型（推送覆盖会丢掉它们）。
+pub fn push_diff(local: &str, remote: Option<&str>) -> Result<PushDiff, String> {
+    let Some(remote) = remote else {
+        return Ok(PushDiff {
+            remote_exists: false,
+            ..Default::default()
+        });
+    };
+    let (lp, lm) = export_keys(local)?;
+    let (rp, rm) = export_keys(remote)?;
+    Ok(PushDiff {
+        remote_exists: true,
+        remote_only_providers: rp.difference(&lp).count(),
+        remote_only_models: rm.difference(&lm).count(),
+    })
+}
+
 /// 自动推送护栏：本地为空（0 供应商或 0 模型）而远端有内容时返回跳过原因。
 ///
 /// 2026-09 数据丢失修复：空配置的自动推送会覆盖远端完整备份；护栏让自动推送
@@ -430,11 +746,142 @@ mod tests {
     }
 
     #[test]
+    fn config_url_percent_encodes_directory_segments() {
+        // 空格与中文目录：各路径段按 URL 语义百分号编码，不再拼出非法 URL
+        let cfg = mk_cfg("https://dav.example.com/", "u", "jai 备份/子 目录");
+        assert_eq!(
+            cfg.config_url(),
+            "https://dav.example.com/jai%20%E5%A4%87%E4%BB%BD/%E5%AD%90%20%E7%9B%AE%E5%BD%95/jai-config.json"
+        );
+        assert_eq!(
+            cfg.backup_url(7),
+            "https://dav.example.com/jai%20%E5%A4%87%E4%BB%BD/%E5%AD%90%20%E7%9B%AE%E5%BD%95/jai-config.7.json"
+        );
+        // 无法解析的 base 回退裸拼接（不抛错）
+        let odd = mk_cfg("not a url", "u", "a b");
+        assert_eq!(odd.config_url(), "not a url/a b/jai-config.json");
+    }
+
+    #[test]
     fn export_counts_parse() {
         let full = r#"{"format":"jai-export/v1","providers":[{"id":"a"}],"models":[{"id":"m"}]}"#;
         assert_eq!(export_counts(full).unwrap(), (1, 1));
         assert_eq!(export_counts("{}").unwrap(), (0, 0));
         assert!(export_counts("not json").is_err());
+    }
+
+    #[test]
+    fn backup_timestamp_parse() {
+        assert_eq!(backup_timestamp("jai-config.123.json"), Some(123));
+        assert_eq!(backup_timestamp("jai-config.0007.json"), Some(7));
+        assert_eq!(backup_timestamp("jai-config.json"), None); // 当前配置名
+        assert_eq!(backup_timestamp("jai-config.x.json"), None);
+        assert_eq!(backup_timestamp("other.json"), None);
+        assert_eq!(backup_timestamp("jai-config.12.json.bak"), None);
+    }
+
+    #[test]
+    fn backup_evict_keeps_newest_n() {
+        let names: Vec<String> = (1..=12).map(|i| format!("jai-config.{i}.json")).collect();
+        // 12 份保留 10 → 删最老 2 份
+        let evict = backup_evict_candidates(&names, 10);
+        assert_eq!(
+            evict,
+            vec![
+                "jai-config.1.json".to_string(),
+                "jai-config.2.json".to_string()
+            ]
+        );
+        // 恰好 10 份 → 不删
+        let names10: Vec<String> = (1..=10).map(|i| format!("jai-config.{i}.json")).collect();
+        assert!(backup_evict_candidates(&names10, 10).is_empty());
+        // 仅 2 份备份 + keep=1 → 删最老 1 份；当前配置与无关文件永不列入
+        let mixed = vec![
+            "jai-config.1.json".into(),
+            "jai-config.2.json".into(),
+            "jai-config.json".into(),
+            "readme.txt".into(),
+        ];
+        assert_eq!(
+            backup_evict_candidates(&mixed, 1),
+            vec!["jai-config.1.json".to_string()]
+        );
+        // keep=0 语义：全部备份都可删（当前配置文件不在候选内）
+        assert_eq!(backup_evict_candidates(&names, 0).len(), 12);
+    }
+
+    #[test]
+    fn parse_multistatus_extracts_href_and_size() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/dav/files/u/jai/jai-config.json</D:href>
+    <D:propstat>
+      <D:prop><D:getcontentlength>1200</D:getcontentlength></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/dav/files/u/jai/jai-config.111.json</D:href>
+    <D:propstat>
+      <D:prop><D:getcontentlength>900</D:getcontentlength></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/dav/files/u/jai/readme.txt</D:href>
+    <D:propstat>
+      <D:prop><D:getcontentlength>10</D:getcontentlength></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+        let items = parse_multistatus(xml).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].name, "jai-config.json");
+        assert_eq!(items[0].size, Some(1200));
+        assert_eq!(items[1].name, "jai-config.111.json");
+        assert_eq!(items[1].href, "/dav/files/u/jai/jai-config.111.json");
+        assert_eq!(items[2].name, "readme.txt");
+        // 垃圾输入：不 panic，解析结果为空（quick-xml 对不完整 XML 宽容）
+        assert_eq!(parse_multistatus("<unclosed").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn backup_href_validates_name() {
+        let cfg = mk_cfg("https://dav.example.com/", "u", "jai/backups");
+        assert_eq!(
+            backup_href(&cfg, "jai-config.5.json").unwrap(),
+            "https://dav.example.com/jai/backups/jai-config.5.json"
+        );
+        // 当前配置名 / 路径穿越 / 无关文件一律拒绝
+        assert!(backup_href(&cfg, "jai-config.json").is_err());
+        assert!(backup_href(&cfg, "../evil.json").is_err());
+        assert!(backup_href(&cfg, "readme.txt").is_err());
+    }
+
+    #[test]
+    fn push_diff_detects_remote_only_content() {
+        let local = r#"{"format":"jai-export/v1","providers":[{"id":"p1","name":"A","base_url":"https://a/v1"}],"models":[{"id":"m1","providerId":"p1","modelName":"gpt-4o"}]}"#;
+        let remote = r#"{"format":"jai-export/v1","providers":[{"id":"p1","name":"A","base_url":"https://a/v1"},{"id":"p2","name":"B","base_url":"https://b/v1"}],"models":[{"id":"m1","providerId":"p1","modelName":"gpt-4o"},{"id":"m2","providerId":"p2","modelName":"claude-3"}]}"#;
+        // 远端多出 1 供应商 + 1 模型 → 阻断
+        let diff = push_diff(local, Some(remote)).unwrap();
+        assert!(diff.remote_exists);
+        assert_eq!(diff.remote_only_providers, 1);
+        assert_eq!(diff.remote_only_models, 1);
+        assert!(diff.blocks());
+        // 远端不存在 → 不阻断
+        let none = push_diff(local, None).unwrap();
+        assert!(!none.remote_exists);
+        assert!(!none.blocks());
+        // 本地与远端等价 → 不阻断
+        let eq = push_diff(local, Some(local)).unwrap();
+        assert_eq!(eq.remote_only_providers, 0);
+        assert!(!eq.blocks());
+        // 本地 ⊇ 远端 → 不阻断
+        let local_full = r#"{"format":"jai-export/v1","providers":[{"id":"p1","name":"A","base_url":"https://a/v1"},{"id":"p2","name":"B","base_url":"https://b/v1"}],"models":[{"id":"m1","providerId":"p1","modelName":"gpt-4o"},{"id":"m2","providerId":"p2","modelName":"claude-3"}]}"#;
+        let less = push_diff(local_full, Some(remote)).unwrap();
+        assert!(!less.blocks(), "本地更全应放行: {less:?}");
     }
 
     #[test]

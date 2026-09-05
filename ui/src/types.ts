@@ -95,6 +95,14 @@ export interface WebDavSnapshotInfo {
   chars: number;
 }
 
+export interface WebDavBackupItem {
+  name: string;
+  href: string;
+  size?: number | null;
+  ts?: number | null;
+  isCurrent: boolean;
+}
+
 export interface ImportReport {
   providersImported: number;
   providersSkippedDuplicate: number;

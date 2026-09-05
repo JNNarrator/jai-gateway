@@ -942,10 +942,32 @@ async fn webdav_preview(core: State<'_, AppCore>) -> Result<WebDavPreview, Strin
     })
 }
 
+/// 手动推送。`force` 为 true 时跳过推送前差异预警（用户已确认覆盖）。
+///
+/// 差异预警（T3）：远端有本机没有的供应商/模型时，首次调用返回可读错误提示，
+/// 前端弹确认框后以 force=true 重试——防止多设备场景无意覆盖掉另一台设备刚加的内容。
 #[tauri::command]
-async fn webdav_push(core: State<'_, AppCore>) -> Result<(), String> {
+async fn webdav_push(core: State<'_, AppCore>, force: Option<bool>) -> Result<(), String> {
     // 与自动推送互斥：手动推送期间自动轮跳过
     let _guard = core.autopush.push_lock.lock().await;
+    if !force.unwrap_or(false) {
+        let cfg = get_webdav_config(&core).await?;
+        let password = get_webdav_password(&core).await?;
+        let db = core.db.clone();
+        let local_text = tokio::task::spawn_blocking(move || {
+            db.with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
+        })
+        .await
+        .map_err(join_err)??;
+        let remote = sync::try_pull(&core.http, &cfg, &password).await?;
+        let diff = sync::push_diff(&local_text, remote.as_deref()).map_err(|e| e.to_string())?;
+        if diff.blocks() {
+            return Err(format!(
+                "远端有 {} 个供应商 / {} 个模型是本机没有的，推送将覆盖掉它们。如确认以本机为准，请再次点击「仍然推送」。",
+                diff.remote_only_providers, diff.remote_only_models
+            ));
+        }
+    }
     push_now(&core).await
 }
 
@@ -1074,6 +1096,94 @@ async fn webdav_snapshot_info(core: State<'_, AppCore>) -> Result<WebDavSnapshot
     })
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavBackupDto {
+    pub name: String,
+    pub href: String,
+    pub size: Option<u64>,
+    pub ts: Option<i64>,
+    /// 是否为当前配置文件（jai-config.json）
+    pub is_current: bool,
+}
+
+/// 远端备份列表（PROPFIND Depth:1，仅当前配置与时间戳备份）。
+#[tauri::command]
+async fn webdav_backups_list(core: State<'_, AppCore>) -> Result<Vec<WebDavBackupDto>, String> {
+    let cfg = get_webdav_config(&core).await?;
+    let password = get_webdav_password(&core).await?;
+    let items = sync::list_backups(&core.http, &cfg, &password).await?;
+    Ok(items
+        .into_iter()
+        .map(|b| {
+            let is_current = b.name == sync::CONFIG_FILE_NAME;
+            WebDavBackupDto {
+                ts: if is_current {
+                    None
+                } else {
+                    sync::backup_timestamp(&b.name)
+                },
+                name: b.name,
+                href: b.href,
+                size: b.size,
+                is_current,
+            }
+        })
+        .collect())
+}
+
+/// 恢复指定远端备份到本地（GET 备份 → apply_import；与手动拉取同回声抑制，
+/// 并把自动拉取基线对齐到远端当前版本，防止自动拉取立刻把恢复结果覆盖回去）。
+#[tauri::command]
+async fn webdav_backup_restore(
+    core: State<'_, AppCore>,
+    name: String,
+) -> Result<import::ImportReport, String> {
+    let _guard = core.autopush.push_lock.lock().await;
+    let cfg = get_webdav_config(&core).await?;
+    let password = get_webdav_password(&core).await?;
+    let text = sync::fetch_backup(&core.http, &cfg, &password, &name).await?;
+    let db = core.db.clone();
+    let value = text.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| import::apply_import(c, &value, false).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    // 防回声：恢复后 40s 内抑制变更触发的自动推送
+    core.autopush
+        .suppress
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let hub = core.autopush.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        hub.suppress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    });
+    // 自动拉取基线对齐远端当前 exportedAt（防止把刚恢复的旧版又拉回去）
+    if let Ok(Some(remote_text)) = sync::try_pull(&core.http, &cfg, &password).await {
+        if let Some(ts) = sync::exported_at(&remote_text) {
+            let db = core.db.clone();
+            tokio::task::spawn_blocking(move || {
+                db.with(|c| sync::last_sync_put(c, ts))
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(join_err)??;
+        }
+    }
+    Ok(out)
+}
+
+/// 删除指定远端备份（仅时间戳备份名；当前配置与无关文件拒绝）。
+#[tauri::command]
+async fn webdav_backup_delete(core: State<'_, AppCore>, name: String) -> Result<(), String> {
+    let _guard = core.autopush.push_lock.lock().await;
+    let cfg = get_webdav_config(&core).await?;
+    let password = get_webdav_password(&core).await?;
+    sync::delete_backup(&core.http, &cfg, &password, &name).await
+}
+
 /// 用「推送前快照」恢复本地配置（last-write-wins 误操作回退入口）。
 ///
 /// 快照是上次推送前的完整导出（含供应商/模型/网关 Key/WebDAV 配置），
@@ -1101,7 +1211,7 @@ async fn webdav_snapshot_restore(core: State<'_, AppCore>) -> Result<import::Imp
 /// - 变更触发：防抖 30s 后自动推送（带「空配置不覆盖远端」护栏）
 /// - 定时触发：开启自动拉取则先按 exportedAt 时间戳拉取远端更新（last-write-wins，
 ///   空远端/不比本地新不拉），再按需自动推送
-fn spawn_autopush(core: AppCore) {
+fn spawn_autopush(core: AppCore, app: AppHandle) {
     // setup 闭包不在 tokio runtime 上下文内，必须经 tauri 托管 runtime spawn
     tauri::async_runtime::spawn(async move {
         let mut rx = core.autopush.tx.subscribe();
@@ -1170,6 +1280,9 @@ fn spawn_autopush(core: AppCore) {
                     if st.ok { "ok" } else { "err" },
                     st.message
                 );
+                if !st.ok {
+                    notify_autosync(&app, "WebDAV 自动拉取失败".to_string(), st.message.clone());
+                }
                 *core.autopush.last_pull.lock().await = Some(st);
             }
             // 变更唤醒或定时且开启自动推送：推送本机配置（带护栏）
@@ -1193,6 +1306,9 @@ fn spawn_autopush(core: AppCore) {
                     if st.ok { "ok" } else { "err" },
                     st.message
                 );
+                if !st.ok {
+                    notify_autosync(&app, "WebDAV 自动推送失败".to_string(), st.message.clone());
+                }
                 *core.autopush.last.lock().await = Some(st);
             }
         }
@@ -1411,6 +1527,20 @@ async fn health_round(core: &AppCore, app: &AppHandle, first_round: bool) -> Res
 fn notify_health(app: &AppHandle, title: String, body: String) {
     if let Err(e) = app.notification().builder().title(title).body(body).show() {
         eprintln!("[health] 通知发送失败: {e}");
+    }
+}
+
+/// 自动同步（推送/拉取）失败通知：标题 + 错误摘要（140 字符截断）。
+fn notify_autosync(app: &AppHandle, title: String, body: String) {
+    let summary: String = body.chars().take(HEALTH_NOTIFY_SUMMARY_CHARS).collect();
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(summary)
+        .show()
+    {
+        eprintln!("[autosync] 通知发送失败: {e}");
     }
 }
 
@@ -2309,8 +2439,8 @@ fn main() {
             };
             ensure_gateway_key(&core)?;
 
-            // WebDAV 自动推送循环（变更防抖 + 定时；未启用时低速轮询配置）
-            spawn_autopush(core.clone());
+            // WebDAV 自动同步循环（变更防抖 + 定时；未启用时低速轮询配置）
+            spawn_autopush(core.clone(), app.handle().clone());
 
             // 供应商定时健康检查（10 分钟/轮；状态跃迁发系统通知，首轮不通知）
             spawn_health_check(core.clone(), app.handle().clone());
@@ -2430,6 +2560,9 @@ fn main() {
             webdav_autopull_status,
             webdav_snapshot_info,
             webdav_snapshot_restore,
+            webdav_backups_list,
+            webdav_backup_restore,
+            webdav_backup_delete,
             mcp_list,
             mcp_create,
             mcp_update,
