@@ -15,12 +15,13 @@ use super::{
 };
 
 /// 导入 meta 的白名单键（同步契约：仅连接配置与凭据，端口/CORS 等本机设置不迁移）。
-const META_IMPORT_WHITELIST: [&str; 6] = [
+const META_IMPORT_WHITELIST: [&str; 7] = [
     "webdav_url",
     "webdav_username",
     "webdav_directory",
     "webdav_auto_push_enabled",
     "webdav_auto_push_interval_min",
+    "webdav_auto_pull_enabled",
     "webdav_password",
 ];
 

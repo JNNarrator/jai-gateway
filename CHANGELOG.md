@@ -30,6 +30,14 @@ All notable changes to this project will be documented in this file.
   属预期（如 `store` 请求服务端存储会话，转发网关不代管），不再刷 `CapabilityWarn`——
   告警只保留给真正的降级与陌生字段，避免 dsh 等客户端常规请求淹没日志
 
+### Added
+- **WebDAV 从本地快照恢复**：同步页新增「本地推送前快照」卡片与「从快照恢复」按钮
+  （`webdav_snapshot_info` / `webdav_snapshot_restore`），推送前快照（`webdav_last_snapshot`）
+  终于有回退入口；恢复后如开启自动推送，防抖会将其同步回远端
+- **WebDAV 自动拉取 / 双向同步**：同步页新增「自动拉取」开关——与自动推送共用间隔，
+  按导出 `exportedAt` 时间戳 last-write-wins（远端非空且比上次成功同步更新才导入；
+  空远端不拉取，防远端空配置清空本机）；新增「上次自动拉取」状态显示
+
 ### Changed
 - **供应商官网字段**：供应商表单新增「官网」（可空），列表卡片一键跳转系统浏览器
   （tauri-plugin-opener）
@@ -56,6 +64,10 @@ All notable changes to this project will be documented in this file.
      （备份失败即中止推送，不盲覆盖），远端备份永不丢失；
   2. **自动推送护栏**——本地为 0 供应商/0 模型而远端有内容时，自动推送跳过并把原因写入
      「上次自动推送」状态（同步页可见），改由用户手动推送（手动推送不受限）
+- **流式转换无终止标记上游流的缓冲护栏**（roadmap 稳定性 finding 修复）：转换路径 SSE 行缓冲
+  加双重护栏——①单行超限（>1MiB 无换行刷流）立即断开并落日志，防无界内存；
+  ②持续收字节但长时间（90s，`JAI_SSE_LINE_HOLD_SECS` 可覆盖）无完整行时断开，
+  防「零字节挂起」拖死下游；passthrough 不受影响（逐块转发无缓冲）
 - **日志「输入/输出」token 数恒空**：修复流式 usage 抽取器两处缺陷——
   `"usage":null` 后 32 字节窗口误命中下一 SSE 行触发错误收集且线索被丢弃
   （glm-5.3-flash 中转流 17 个 null + 末尾 usage 帧实测恒空）；现在 `null` 显式跳过、

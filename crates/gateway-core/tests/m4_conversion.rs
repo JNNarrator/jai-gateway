@@ -77,6 +77,35 @@ async fn spawn_gemini_mock(mode: &'static str) -> u16 {
             post(
                 |State(st): State<GemSt>, query: axum::extract::Query<Value>| async move {
                     let is_sse = query.get("alt").and_then(Value::as_str) == Some("sse");
+                    // 行缓冲护栏回归：flood（无换行大块刷流）/ trickle（慢速无终止标记流）
+                    if is_sse && matches!(st.mode, "flood" | "trickle") {
+                        let body = if st.mode == "flood" {
+                            let mut raw = String::from("data: ");
+                            raw.push_str(
+                                &"x".repeat(gateway_core::server::proxy::MAX_SSE_LINE_BYTES + 8192),
+                            );
+                            Body::from(raw)
+                        } else {
+                            let stream = futures_util::stream::unfold(0u32, |i| async move {
+                                if i >= 20 {
+                                    return None;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                Some((
+                                    Ok::<_, std::io::Error>(axum::body::Bytes::from(format!(
+                                        "frag{i:04}"
+                                    ))),
+                                    i + 1,
+                                ))
+                            });
+                            Body::from_stream(stream)
+                        };
+                        return Response::builder()
+                            .status(200)
+                            .header("content-type", "text/event-stream")
+                            .body(body)
+                            .unwrap();
+                    }
                     let payload: Value = match st.mode {
                         "text" => json!({
                             "candidates":[{"content":{"parts":[{"text":"converted-from-gemini"}]},
@@ -389,4 +418,42 @@ async fn converted_upstream_429_renders_oai_error() {
     assert_eq!(status, 502);
     assert!(body.get("error").is_some(), "应返回 OpenAI 错误形状");
     assert!(body["error"]["type"].is_string());
+}
+
+/// B4 回归：上游无换行大块刷流 → 转换路径行缓冲超限即断开（防无界内存）。
+#[tokio::test(flavor = "multi_thread")]
+async fn conversion_disconnects_on_newline_flood_upstream() {
+    let fx = fixture("gemini", "flood").await;
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "stream": true,
+        "messages": [{"role":"user","content":"hi"}]
+    });
+    let (status, text) = fx.post_chat_raw(body).await;
+    assert_eq!(status, 200);
+    assert!(
+        text.contains("单行超限"),
+        "应收到行缓冲超限错误帧，实际开头: {}",
+        text.chars().take(200).collect::<String>()
+    );
+}
+
+/// B4 回归：上游一直吐字节但从不给换行/终止标记 → hold 护栏断开，不无限挂起。
+#[tokio::test(flavor = "multi_thread")]
+async fn conversion_disconnects_on_terminationless_slow_stream() {
+    // 缩短 hold 阈值到 1s（进程级 env；本二进制内其他流式测试的流均正常成行，不受影响）
+    std::env::set_var("JAI_SSE_LINE_HOLD_SECS", "1");
+    let fx = fixture("gemini", "trickle").await;
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "stream": true,
+        "messages": [{"role":"user","content":"hi"}]
+    });
+    let (status, text) = fx.post_chat_raw(body).await;
+    assert_eq!(status, 200);
+    assert!(
+        text.contains("未完成"),
+        "应收到 SSE 行超时错误帧，实际开头: {}",
+        text.chars().take(200).collect::<String>()
+    );
 }

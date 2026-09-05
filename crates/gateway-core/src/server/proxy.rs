@@ -44,6 +44,20 @@ pub const NONSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 /// 上游错误体读取上限（原样转发用）
 const MAX_ERROR_BODY: usize = 1024 * 1024;
+/// SSE 转换路径单行缓冲上限：上游无换行刷流时断开，防无界内存
+/// （roadmap 稳定性 finding「无终止标记流」修复）。
+pub const MAX_SSE_LINE_BYTES: usize = 1 << 20; // 1 MiB
+/// SSE 行长时间未完成（一直收字节但无换行/终止标记）断开阈值；
+/// 可用环境变量 `JAI_SSE_LINE_HOLD_SECS` 覆盖（集成测试提速用）。
+pub const SSE_LINE_HOLD_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn sse_line_hold_timeout() -> Duration {
+    std::env::var("JAI_SSE_LINE_HOLD_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(SSE_LINE_HOLD_TIMEOUT)
+}
 
 // ---------------------------------------------------------------- 入站线（wire）
 
@@ -1783,12 +1797,14 @@ async fn convert_streaming_response(
             let mut line_buf: Vec<u8> = first_lines;
             // IR 累计的 usage：Finish 事件携带，自然结束时透传落库（修复日志输入/输出恒空）
             let mut last_usage: Option<crate::codec::ir::Usage> = None;
+            // 行缓冲护栏计时：line_buf 非空且长时间无完整行 → 断开（防无终止标记流拖死下游）
+            let mut last_drain_at = Instant::now();
+            let line_hold = sse_line_hold_timeout();
 
             // 解析并发送当前行缓冲（首字节可能已包含整个 SSE 流）
             macro_rules! drain_sse_lines {
                 () => {{
-                    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
-                        let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {                        let line: Vec<u8> = line_buf.drain(..=pos).collect();
                         let line = line.strip_suffix(b"\r").unwrap_or(&line);
                         let line: &[u8] = line;
                         if !line.starts_with(b"data:") {
@@ -1916,7 +1932,35 @@ async fn convert_streaming_response(
                     }
                 }};
             }
+            // 断开辅助：发错误帧 + 落日志 + 关通道（由调用方决定 break/return）
+            macro_rules! abort_sse_stream {
+                ($msg:expr) => {{
+                    let msg: String = $msg;
+                    let _ = tx.send(Ok(error_sse_frame(wire2, &msg))).await;
+                    emit_log(
+                        &ctx2.logs,
+                        wire2.log_family(),
+                        Some(&peeked2),
+                        Some(&pid),
+                        None,
+                        status.as_u16() as i64,
+                        ms_since(t0),
+                        true,
+                        None,
+                        Some("Overloaded".into()),
+                        Some(format!("[convert] {msg}")),
+                    );
+                    drop(tx);
+                }};
+            }
             drain_sse_lines!();
+            // 首块即超限（如整流挤在一块无换行数据里）→ 直接断开
+            if line_buf.len() > MAX_SSE_LINE_BYTES {
+                abort_sse_stream!(format!(
+                    "上游 SSE 单行超限(>{MAX_SSE_LINE_BYTES}B)且无换行，已断开（疑似无终止标记流）"
+                ));
+                return;
+            }
 
             loop {
                 let nxt = tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream_stream.next());
@@ -1945,7 +1989,24 @@ async fn convert_streaming_response(
                     }
                     Ok(Some(Ok(chunk))) => {
                         line_buf.extend_from_slice(&chunk);
+                        // 缓冲护栏 1：单行超限（无换行刷流）→ 断开，防无界内存
+                        if line_buf.len() > MAX_SSE_LINE_BYTES {
+                            abort_sse_stream!(format!(
+                                "上游 SSE 单行超限(>{MAX_SSE_LINE_BYTES}B)且无换行，已断开（疑似无终止标记流）"
+                            ));
+                            break;
+                        }
                         drain_sse_lines!();
+                        // 缓冲护栏 2：一直收字节但长时间无完整行（无终止标记流）→ 断开
+                        if line_buf.is_empty() {
+                            last_drain_at = Instant::now();
+                        } else if last_drain_at.elapsed() > line_hold {
+                            abort_sse_stream!(format!(
+                                "上游 SSE 行 {}s 未完成（疑似无终止标记流），已断开",
+                                line_hold.as_secs()
+                            ));
+                            break;
+                        }
                     }
                     Ok(Some(Err(e))) => {
                         let msg = format!("stream aborted by upstream: {e}");

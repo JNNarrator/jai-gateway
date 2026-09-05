@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
-import { ArrowLeftRight, ClipboardPaste, CloudUpload, Download } from "lucide-react";
+import {
+  ArrowLeftRight,
+  ClipboardPaste,
+  CloudUpload,
+  Download,
+  RotateCcw,
+} from "lucide-react";
 import { api } from "../api";
-import type { WebDavAutoPushStatus } from "../types";
+import type { WebDavAutoPushStatus, WebDavSnapshotInfo } from "../types";
 import { toast } from "../lib/toast";
 import { PageHeader } from "@/components/common/PageHeader";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
@@ -41,7 +47,11 @@ export function SyncPage() {
   const [pw, setPw] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [autoPush, setAutoPush] = useState({ enabled: false, intervalMin: 60 });
+  const [autoPull, setAutoPull] = useState(false);
   const [lastAuto, setLastAuto] = useState<WebDavAutoPushStatus | null>(null);
+  const [lastAutoPull, setLastAutoPull] = useState<WebDavAutoPushStatus | null>(null);
+  const [snapInfo, setSnapInfo] = useState<WebDavSnapshotInfo | null>(null);
+  const [confirmRestore, setConfirmRestore] = useState(false);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
@@ -56,14 +66,17 @@ export function SyncPage() {
           setCfg(c);
           setPw(c.password ?? "");
           setAutoPush({ enabled: c.autoPushEnabled, intervalMin: c.autoPushIntervalMin });
+          setAutoPull(c.autoPullEnabled);
         }
       })
       .catch(() => {});
     api.webdavAutopushStatus().then(setLastAuto).catch(() => {});
-    const t = setInterval(
-      () => api.webdavAutopushStatus().then(setLastAuto).catch(() => {}),
-      60_000,
-    );
+    api.webdavAutopullStatus().then(setLastAutoPull).catch(() => {});
+    api.webdavSnapshotInfo().then(setSnapInfo).catch(() => {});
+    const t = setInterval(() => {
+      api.webdavAutopushStatus().then(setLastAuto).catch(() => {});
+      api.webdavAutopullStatus().then(setLastAutoPull).catch(() => {});
+    }, 60_000);
     return () => clearInterval(t);
   }, []);
 
@@ -111,6 +124,27 @@ export function SyncPage() {
       });
       setAutoPush(next);
       setMsg(next.enabled ? "自动推送已开启" : "自动推送已关闭");
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  async function saveAutoPull(enabled: boolean) {
+    setErr("");
+    if (!cfg.url.trim()) {
+      setErr("请先填写并保存 WebDAV 连接配置");
+      return;
+    }
+    try {
+      await api.webdavConfigSet({
+        url: cfg.url,
+        username: cfg.username,
+        directory: cfg.directory,
+        password: null,
+        autoPullEnabled: enabled,
+      });
+      setAutoPull(enabled);
+      setMsg(enabled ? "自动拉取已开启" : "自动拉取已关闭");
     } catch (e) {
       setErr(String(e));
     }
@@ -195,6 +229,23 @@ export function SyncPage() {
       setMsg(
         `拉取并导入完成：新增供应商 ${r.providersImported}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
       );
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function doRestore() {
+    setBusy("restore");
+    setErr("");
+    setConfirmRestore(false);
+    try {
+      const r = await api.webdavSnapshotRestore();
+      setMsg(
+        `已从快照恢复：新增供应商 ${r.providersImported}，重复跳过 ${r.providersSkippedDuplicate}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
+      );
+      api.webdavSnapshotInfo().then(setSnapInfo).catch(() => {});
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -369,11 +420,26 @@ export function SyncPage() {
                 }
               />
             </div>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-medium">自动拉取</div>
+                <div className="text-xs leading-relaxed text-muted-foreground">
+                  按所选间隔定时拉取远端更新（last-write-wins：仅当远端比上次成功同步更新时导入；
+                  空远端不拉取，防远端空配置清空本机）。
+                </div>
+              </div>
+              <Switch
+                checked={autoPull}
+                disabled={!cfg.url.trim()}
+                aria-label="自动拉取开关"
+                onCheckedChange={(v) => void saveAutoPull(v)}
+              />
+            </div>
             <div className="flex items-center gap-2">
               <span className="text-xs text-muted-foreground">定时间隔</span>
               <Select
                 value={String(autoPush.intervalMin)}
-                disabled={!autoPush.enabled}
+                disabled={!autoPush.enabled && !autoPull}
                 onValueChange={(v) =>
                   void saveAuto({ enabled: autoPush.enabled, intervalMin: Number(v) })
                 }
@@ -399,6 +465,33 @@ export function SyncPage() {
                 </span>
               </div>
             )}
+            {lastAutoPull && (
+              <div className="text-xs text-muted-foreground">
+                上次自动拉取：
+                {new Date(lastAutoPull.atMs).toLocaleString("zh-CN", { hour12: false })} ·{" "}
+                <span className={lastAutoPull.ok ? "text-emerald-600" : "text-destructive"}>
+                  {lastAutoPull.ok ? "成功" : lastAutoPull.message}
+                </span>
+              </div>
+            )}
+          </div>
+
+          <div className="space-y-2 rounded-md border bg-muted/30 p-3">
+            <div className="text-sm font-medium">本地推送前快照</div>
+            <div className="text-xs leading-relaxed text-muted-foreground">
+              {snapInfo?.exists
+                ? `上次推送前的完整配置快照（${snapInfo.atMs ? new Date(snapInfo.atMs).toLocaleString("zh-CN", { hour12: false }) : "时间未知"} · ${(snapInfo.chars / 1024).toFixed(1)} KB），可从快照恢复被覆盖前的配置。`
+                : "暂无快照：执行过至少一次 WebDAV 推送后才会留存。"}
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!snapInfo?.exists || busy === "restore"}
+              onClick={() => setConfirmRestore(true)}
+            >
+              <RotateCcw aria-hidden />
+              {busy === "restore" ? "恢复中…" : "从快照恢复"}
+            </Button>
           </div>
         </CardContent>
       </Card>
@@ -418,6 +511,14 @@ export function SyncPage() {
         description={overwriteInfo}
         confirmText="拉取"
         onConfirm={doPull}
+      />
+      <ConfirmDialog
+        open={confirmRestore}
+        onOpenChange={setConfirmRestore}
+        title="从快照恢复本地配置？"
+        description="将用上次推送前的完整快照覆盖本地当前配置（含供应商、模型、网关 Key 与 WebDAV 配置），用于误操作回退。若已开启自动推送，恢复结果随后会防抖同步回远端。"
+        confirmText="恢复"
+        onConfirm={doRestore}
       />
     </div>
   );

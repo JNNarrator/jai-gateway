@@ -15,6 +15,7 @@ import type {
   UsageStatRow,
   WebDavAutoPushStatus,
   WebDavConfigDto,
+  WebDavSnapshotInfo,
 } from "./types";
 
 export const api = {
@@ -98,9 +99,12 @@ export const api = {
     password?: string | null;
     autoPushEnabled?: boolean;
     autoPushIntervalMin?: number;
+    autoPullEnabled?: boolean;
   }) => invoke<void>("webdav_config_set", { input }),
   webdavAutopushStatus: () =>
     invoke<WebDavAutoPushStatus | null>("webdav_autopush_status"),
+  webdavAutopullStatus: () =>
+    invoke<WebDavAutoPushStatus | null>("webdav_autopull_status"),
   webdavTest: (input: {
     url: string;
     username: string;
@@ -118,6 +122,10 @@ export const api = {
     }>("webdav_preview"),
   webdavPush: () => invoke<void>("webdav_push"),
   webdavPull: () => invoke<ImportReport>("webdav_pull"),
+  webdavSnapshotInfo: () =>
+    invoke<WebDavSnapshotInfo>("webdav_snapshot_info"),
+  webdavSnapshotRestore: () =>
+    invoke<ImportReport>("webdav_snapshot_restore"),
 
   // MCP 管理
   mcpList: () => invoke<McpServerRow[]>("mcp_list"),

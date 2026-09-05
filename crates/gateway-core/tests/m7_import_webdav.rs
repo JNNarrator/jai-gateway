@@ -149,6 +149,7 @@ async fn webdav_push_pull_roundtrip() {
         directory: String::new(),
         auto_push_enabled: false,
         auto_push_interval_min: 60,
+        auto_pull_enabled: false,
     };
     let client = reqwest::Client::new();
     let payload = r#"{"format":"jai-export/v1","providers":[]}"#.to_string();
@@ -190,6 +191,7 @@ async fn webdav_pull_imports_into_db() {
         directory: String::new(),
         auto_push_enabled: false,
         auto_push_interval_min: 60,
+        auto_pull_enabled: false,
     };
     let client = reqwest::Client::new();
     let text = sync::pull(&client, &cfg, "pw").await.unwrap();
@@ -212,6 +214,7 @@ async fn probe_verifies_credentials() {
         directory: String::new(),
         auto_push_enabled: false,
         auto_push_interval_min: 60,
+        auto_pull_enabled: false,
     };
 
     // 错误凭据 → 认证失败（此前 OPTIONS 匿名放行会把这里误报成「连接成功」）
@@ -232,6 +235,7 @@ async fn pull_push_error_hints_for_bad_credentials() {
         directory: String::new(),
         auto_push_enabled: false,
         auto_push_interval_min: 60,
+        auto_pull_enabled: false,
     };
 
     let e = sync::pull(&client, &cfg, "wrong").await.unwrap_err();
@@ -252,6 +256,7 @@ async fn pull_404_hints_missing_remote_file() {
         directory: String::new(),
         auto_push_enabled: false,
         auto_push_interval_min: 60,
+        auto_pull_enabled: false,
     };
 
     let e = sync::pull(&client, &cfg, "pw").await.unwrap_err();
@@ -277,6 +282,7 @@ async fn push_backs_up_existing_remote_before_overwrite() {
         directory: String::new(),
         auto_push_enabled: false,
         auto_push_interval_min: 60,
+        auto_pull_enabled: false,
     };
     let client = reqwest::Client::new();
     let empty = r#"{"format":"jai-export/v1","providers":[],"models":[]}"#.to_string();
@@ -324,6 +330,7 @@ async fn probe_404_hints_bad_path() {
         directory: String::new(),
         auto_push_enabled: false,
         auto_push_interval_min: 60,
+        auto_pull_enabled: false,
     };
     let err = sync::probe(&client, &cfg, "pw").await.unwrap_err();
     assert!(err.contains("路径不存在"), "{err}");

@@ -14,6 +14,8 @@ use crate::store::StoreError;
 
 pub const CONFIG_FILE_NAME: &str = "jai-config.json";
 const SNAPSHOT_META_KEY: &str = "webdav_last_snapshot";
+/// 最近一次成功推/拉的远端 exportedAt（last-write-wins 时间戳基线）。
+const LAST_SYNC_META_KEY: &str = "webdav_last_sync_exported_at";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +28,9 @@ pub struct WebDavConfig {
     pub auto_push_enabled: bool,
     /// 定时推送间隔分钟数（30/60/360；默认 60）
     pub auto_push_interval_min: u32,
+    /// 定时自动拉取总开关（默认关；与自动推送共用间隔，按 exportedAt 时间戳 last-write-wins）
+    #[serde(default)]
+    pub auto_pull_enabled: bool,
 }
 
 pub const AUTO_PUSH_INTERVAL_DEFAULT: u32 = 60;
@@ -88,6 +93,9 @@ pub fn config_get(c: &Connection) -> Result<Option<WebDavConfig>, StoreError> {
         auto_push_interval_min: crate::store::meta_get(c, "webdav_auto_push_interval_min")?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(AUTO_PUSH_INTERVAL_DEFAULT),
+        auto_pull_enabled: crate::store::meta_get(c, "webdav_auto_pull_enabled")?
+            .map(|v| v == "1")
+            .unwrap_or(false),
     }))
 }
 
@@ -106,7 +114,22 @@ pub fn config_set(c: &Connection, cfg: &WebDavConfig) -> Result<(), StoreError> 
         "webdav_auto_push_interval_min",
         &cfg.normalized_interval().to_string(),
     )?;
+    crate::store::meta_set(
+        c,
+        "webdav_auto_pull_enabled",
+        if cfg.auto_pull_enabled { "1" } else { "0" },
+    )?;
     Ok(())
+}
+
+/// 最近一次成功推/拉的远端 exportedAt（无记录为 None）。
+pub fn last_sync_get(c: &Connection) -> Result<Option<i64>, StoreError> {
+    Ok(crate::store::meta_get(c, LAST_SYNC_META_KEY)?.and_then(|v| v.parse::<i64>().ok()))
+}
+
+/// 记录最近一次成功推/拉的远端 exportedAt。
+pub fn last_sync_put(c: &Connection, exported_at_ms: i64) -> Result<(), StoreError> {
+    crate::store::meta_set(c, LAST_SYNC_META_KEY, &exported_at_ms.to_string())
 }
 
 /// 读取推送前本地快照（用于误操作回退）。
@@ -261,6 +284,36 @@ pub fn should_protect_remote(local: &str, remote: Option<&str>) -> Option<String
     None
 }
 
+/// 读取导出 JSON 的 `exportedAt`（毫秒时间戳；缺失/非法返回 None）。
+pub fn exported_at(text: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .get("exportedAt")
+        .and_then(Value::as_i64)
+}
+
+/// 定时自动拉取判定（last-write-wins 按 exportedAt 时间戳 + 空远端防护）：
+/// 仅当远端非空（有供应商或模型）、比上次成功同步更新、且内容与本地不同时才应拉取。
+/// 空远端不自动拉取——防止远端空配置静默清空本机（与推送护栏对称）。
+pub fn should_pull(local: &str, remote: &str, last_sync_at: Option<i64>) -> bool {
+    let Ok((rp, rm)) = export_counts(remote) else {
+        return false;
+    };
+    if rp + rm == 0 {
+        return false; // 空远端不自动拉取
+    }
+    let Some(ts) = exported_at(remote) else {
+        return false; // 无法确认远端时间戳 → 不自动拉取（手动拉取可用）
+    };
+    if last_sync_at.is_some_and(|t| ts <= t) {
+        return false; // 不比上次成功同步更新 → 本地不落后
+    }
+    if local == remote {
+        return false; // 内容一致无需拉
+    }
+    true
+}
+
 /// 校验 WebDAV 连接与凭据。
 ///
 /// 用带认证的 `PROPFIND Depth:0` 探测，而非 OPTIONS——DUFS 等服务器对
@@ -299,16 +352,24 @@ mod tests {
     use super::*;
     use crate::store::open_and_migrate;
 
+    fn mk_cfg(url: &str, username: &str, directory: &str) -> WebDavConfig {
+        WebDavConfig {
+            url: url.into(),
+            username: username.into(),
+            directory: directory.into(),
+            auto_push_enabled: false,
+            auto_push_interval_min: AUTO_PUSH_INTERVAL_DEFAULT,
+            auto_pull_enabled: false,
+        }
+    }
+
     #[test]
     fn config_roundtrip_via_meta() {
         let c = open_and_migrate(":memory:").unwrap();
-        let cfg = WebDavConfig {
-            url: "https://dav.example.com/".into(),
-            username: "u".into(),
-            directory: "jai".into(),
-            auto_push_enabled: true,
-            auto_push_interval_min: 30,
-        };
+        let mut cfg = mk_cfg("https://dav.example.com/", "u", "jai");
+        cfg.auto_push_enabled = true;
+        cfg.auto_push_interval_min = 30;
+        cfg.auto_pull_enabled = true;
         config_set(&c, &cfg).unwrap();
         assert_eq!(config_get(&c).unwrap(), Some(cfg));
         snapshot_put(&c, "{}").unwrap();
@@ -321,29 +382,23 @@ mod tests {
         // 未配置时：无连接配置，但间隔常量默认 60
         assert_eq!(config_get(&c).unwrap(), None);
         assert_eq!(AUTO_PUSH_INTERVAL_DEFAULT, 60);
-        // 写入非法间隔 → 读出回落 60
-        let cfg = WebDavConfig {
-            url: "https://dav.example.com/".into(),
-            username: "u".into(),
-            directory: String::new(),
-            auto_push_enabled: false,
-            auto_push_interval_min: 7,
-        };
+        // 写入非法间隔 → 读出回落 60；auto_pull 未写 → 默认关
+        let mut cfg = mk_cfg("https://dav.example.com/", "u", "");
+        cfg.auto_push_interval_min = 7;
         config_set(&c, &cfg).unwrap();
         let read = config_get(&c).unwrap().unwrap();
         assert!(!read.auto_push_enabled);
+        assert!(!read.auto_pull_enabled);
         assert_eq!(read.auto_push_interval_min, AUTO_PUSH_INTERVAL_DEFAULT);
     }
 
     #[test]
     fn config_url_joins_directory() {
-        let cfg = WebDavConfig {
-            url: "https://dav.example.com/remote.php/dav/files/u".into(),
-            username: "u".into(),
-            directory: "jai/backups".into(),
-            auto_push_enabled: false,
-            auto_push_interval_min: AUTO_PUSH_INTERVAL_DEFAULT,
-        };
+        let cfg = mk_cfg(
+            "https://dav.example.com/remote.php/dav/files/u",
+            "u",
+            "jai/backups",
+        );
         assert_eq!(
             cfg.config_url(),
             "https://dav.example.com/remote.php/dav/files/u/jai/backups/jai-config.json"
@@ -352,36 +407,22 @@ mod tests {
 
     #[test]
     fn config_url_without_directory() {
-        let cfg = WebDavConfig {
-            url: "https://dav.example.com/".into(),
-            username: String::new(),
-            directory: String::new(),
-            auto_push_enabled: false,
-            auto_push_interval_min: AUTO_PUSH_INTERVAL_DEFAULT,
-        };
+        let cfg = mk_cfg("https://dav.example.com/", "", "");
         assert_eq!(cfg.config_url(), "https://dav.example.com/jai-config.json");
     }
 
     #[test]
     fn backup_url_joins_directory_and_timestamp() {
-        let cfg = WebDavConfig {
-            url: "https://dav.example.com/remote.php/dav/files/u".into(),
-            username: String::new(),
-            directory: "jai/backups".into(),
-            auto_push_enabled: false,
-            auto_push_interval_min: AUTO_PUSH_INTERVAL_DEFAULT,
-        };
+        let cfg = mk_cfg(
+            "https://dav.example.com/remote.php/dav/files/u",
+            "u",
+            "jai/backups",
+        );
         assert_eq!(
             cfg.backup_url(1234),
             "https://dav.example.com/remote.php/dav/files/u/jai/backups/jai-config.1234.json"
         );
-        let root = WebDavConfig {
-            url: "https://dav.example.com/".into(),
-            username: String::new(),
-            directory: String::new(),
-            auto_push_enabled: false,
-            auto_push_interval_min: AUTO_PUSH_INTERVAL_DEFAULT,
-        };
+        let root = mk_cfg("https://dav.example.com/", "", "");
         assert_eq!(
             root.backup_url(9),
             "https://dav.example.com/jai-config.9.json"
@@ -413,5 +454,51 @@ mod tests {
         assert!(should_protect_remote(full, Some(empty)).is_none());
         // 本地解析失败 → 放行（不误伤）
         assert!(should_protect_remote("bad json", Some(full)).is_none());
+    }
+
+    #[test]
+    fn last_sync_roundtrip_via_meta() {
+        let c = open_and_migrate(":memory:").unwrap();
+        assert_eq!(last_sync_get(&c).unwrap(), None);
+        last_sync_put(&c, 1_788_452_907_000).unwrap();
+        assert_eq!(last_sync_get(&c).unwrap(), Some(1_788_452_907_000));
+    }
+
+    #[test]
+    fn exported_at_parse() {
+        assert_eq!(
+            exported_at(r#"{"exportedAt":12345,"providers":[]}"#),
+            Some(12345)
+        );
+        assert_eq!(exported_at(r#"{"providers":[]}"#), None);
+        assert_eq!(exported_at("not json"), None);
+    }
+
+    #[test]
+    fn auto_pull_should_pull_judgement() {
+        let local = r#"{"format":"jai-export/v1","exportedAt":100,"providers":[{"id":"a"}],"models":[{"id":"m"}]}"#;
+        let remote_newer = r#"{"format":"jai-export/v1","exportedAt":200,"providers":[{"id":"a"},{"id":"b"}],"models":[{"id":"m"}]}"#;
+        let remote_older = r#"{"format":"jai-export/v1","exportedAt":50,"providers":[{"id":"a"}],"models":[{"id":"m"}]}"#;
+        let remote_empty =
+            r#"{"format":"jai-export/v1","exportedAt":300,"providers":[],"models":[]}"#;
+        let remote_no_ts =
+            r#"{"format":"jai-export/v1","providers":[{"id":"a"}],"models":[{"id":"m"}]}"#;
+
+        // 远端更新且非空 → 拉
+        assert!(should_pull(local, remote_newer, Some(100)));
+        // 无 last_sync 记录 → 只要远端非空且时间戳可读即拉
+        assert!(should_pull(local, remote_newer, None));
+        // 远端不比 last_sync 新 → 不拉
+        assert!(!should_pull(local, remote_newer, Some(200)));
+        // 远端比本地旧 → 不拉（本地为主）
+        assert!(!should_pull(local, remote_older, Some(100)));
+        // 空远端 → 不拉（防清空本地）
+        assert!(!should_pull(local, remote_empty, Some(100)));
+        // 远端无时间戳 → 不拉（无法判定新旧）
+        assert!(!should_pull(local, remote_no_ts, Some(100)));
+        // 内容一致 → 不拉
+        assert!(!should_pull(local, local, Some(100)));
+        // 远端非 JSON → 不拉
+        assert!(!should_pull(local, "not json", Some(100)));
     }
 }

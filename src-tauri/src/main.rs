@@ -59,6 +59,8 @@ pub struct AutopushHub {
     pub suppress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 最近一次自动推送结果
     last: std::sync::Arc<tokio::sync::Mutex<Option<AutoPushStatus>>>,
+    /// 最近一次自动拉取结果
+    last_pull: std::sync::Arc<tokio::sync::Mutex<Option<AutoPushStatus>>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -77,6 +79,7 @@ impl AutopushHub {
             push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             suppress: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            last_pull: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -736,6 +739,8 @@ pub struct WebDavConfigDto {
     pub directory: String,
     pub auto_push_enabled: bool,
     pub auto_push_interval_min: u32,
+    /// 定时自动拉取总开关（与自动推送共用间隔，按 exportedAt 时间戳 last-write-wins）
+    pub auto_pull_enabled: bool,
     /// 明文回显（0006 起密码入库并随同步携带，与网关 Key 同级安全模型）
     pub password: Option<String>,
 }
@@ -748,6 +753,7 @@ impl From<WebDavConfig> for WebDavConfigDto {
             directory: c.directory,
             auto_push_enabled: c.auto_push_enabled,
             auto_push_interval_min: c.auto_push_interval_min,
+            auto_pull_enabled: c.auto_pull_enabled,
             password: None,
         }
     }
@@ -767,6 +773,8 @@ pub struct WebDavConfigInput {
     pub auto_push_enabled: Option<bool>,
     /// 自动推送间隔分钟；None 保持原值
     pub auto_push_interval_min: Option<u32>,
+    /// 自动拉取开关；None 保持原值
+    pub auto_pull_enabled: Option<bool>,
 }
 
 #[cfg(test)]
@@ -859,6 +867,7 @@ async fn webdav_config_set(
         auto_push_interval_min: input
             .auto_push_interval_min
             .unwrap_or(old.auto_push_interval_min),
+        auto_pull_enabled: input.auto_pull_enabled.unwrap_or(old.auto_pull_enabled),
     };
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
@@ -890,6 +899,7 @@ async fn webdav_test(core: State<'_, AppCore>, input: WebDavConfigInput) -> Resu
         directory: input.directory.trim().to_string(),
         auto_push_enabled: false,
         auto_push_interval_min: 60,
+        auto_pull_enabled: false,
     };
     sync::probe(&core.http, &cfg, &password).await
 }
@@ -960,7 +970,19 @@ async fn push_now(core: &AppCore) -> Result<(), String> {
     .await
     .map_err(join_err)??;
 
-    sync::push(&core.http, &cfg, &password, export_text).await
+    sync::push(&core.http, &cfg, &password, export_text.clone()).await?;
+
+    // 记录本次推送的 exportedAt 作为自动拉取的新旧基线（防止刚推完又把自己拉回来）
+    if let Some(ts) = sync::exported_at(&export_text) {
+        let db = core.db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with(|c| sync::last_sync_put(c, ts))
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(join_err)??;
+    }
+    Ok(())
 }
 
 /// 自动推送专用入口：护栏检查（本地空配置不覆盖远端备份）→ 常规推送。
@@ -1004,14 +1026,91 @@ async fn webdav_autopush_status(
     }))
 }
 
-/// 自动推送循环：定时 tick 与变更通知合并；未启用时 30s 轮询配置等待开启。
+/// 最近一次自动拉取结果（无记录返回 null）。
+#[tauri::command]
+async fn webdav_autopull_status(
+    core: State<'_, AppCore>,
+) -> Result<Option<WebDavAutoPushStatusDto>, String> {
+    let last = core.autopush.last_pull.lock().await.clone();
+    Ok(last.map(|s| WebDavAutoPushStatusDto {
+        at_ms: s.at_ms,
+        ok: s.ok,
+        message: s.message,
+    }))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavSnapshotInfoDto {
+    pub exists: bool,
+    /// 快照导出时间（导出 JSON 的 exportedAt；解析失败为 None）
+    pub at_ms: Option<i64>,
+    pub chars: usize,
+}
+
+/// 本地「推送前快照」信息（同步页恢复入口的数据源）。
+#[tauri::command]
+async fn webdav_snapshot_info(core: State<'_, AppCore>) -> Result<WebDavSnapshotInfoDto, String> {
+    let db = core.db.clone();
+    let snap = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| sync::snapshot_get(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    let Some(text) = snap else {
+        return Ok(WebDavSnapshotInfoDto {
+            exists: false,
+            at_ms: None,
+            chars: 0,
+        });
+    };
+    let at_ms = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("exportedAt").and_then(serde_json::Value::as_i64));
+    Ok(WebDavSnapshotInfoDto {
+        exists: true,
+        at_ms,
+        chars: text.chars().count(),
+    })
+}
+
+/// 用「推送前快照」恢复本地配置（last-write-wins 误操作回退入口）。
+///
+/// 快照是上次推送前的完整导出（含供应商/模型/网关 Key/WebDAV 配置），
+/// 通过既有 apply_import 合并落库；恢复后如开启自动推送，防抖会将其同步回远端。
+#[tauri::command]
+async fn webdav_snapshot_restore(core: State<'_, AppCore>) -> Result<import::ImportReport, String> {
+    let db = core.db.clone();
+    let snap = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| sync::snapshot_get(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??
+    .ok_or_else(|| "本地没有推送前快照（尚未执行过 WebDAV 推送）".to_string())?;
+    let db = core.db.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| import::apply_import(c, &snap, false).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    core.autopush.notify_change();
+    Ok(out)
+}
+
+/// WebDAV 自动同步循环：定时 tick 与变更通知合并；未启用时 30s 轮询配置等待开启。
+/// - 变更触发：防抖 30s 后自动推送（带「空配置不覆盖远端」护栏）
+/// - 定时触发：开启自动拉取则先按 exportedAt 时间戳拉取远端更新（last-write-wins，
+///   空远端/不比本地新不拉），再按需自动推送
 fn spawn_autopush(core: AppCore) {
     // setup 闭包不在 tokio runtime 上下文内，必须经 tauri 托管 runtime spawn
     tauri::async_runtime::spawn(async move {
         let mut rx = core.autopush.tx.subscribe();
         loop {
-            let interval = current_autopush_interval(&core).await;
-            let wait = interval.unwrap_or_else(|| std::time::Duration::from_secs(30));
+            let push_interval = current_autopush_interval(&core).await;
+            let pull_interval = current_autopull_interval(&core).await;
+            let wait = push_interval
+                .or(pull_interval)
+                .unwrap_or_else(|| std::time::Duration::from_secs(30));
             let change = tokio::select! {
                 r = rx.changed() => {
                     if r.is_err() {
@@ -1035,38 +1134,67 @@ fn spawn_autopush(core: AppCore) {
                 if current_autopush_interval(&core).await.is_none() {
                     continue;
                 }
-            } else if interval.is_none() {
-                // 定时醒来但未启用：只是配置轮询
+            } else if push_interval.is_none() && pull_interval.is_none() {
+                // 定时醒来但均未启用：只是配置轮询
                 continue;
             }
             // 抢不到锁（手动推/拉进行中）则跳过本轮
             let Ok(_guard) = core.autopush.push_lock.try_lock() else {
-                eprintln!("[autopush] 手动同步进行中，跳过本轮");
+                eprintln!("[autosync] 手动同步进行中，跳过本轮");
                 continue;
             };
-            let at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let res = auto_push_guarded(&core).await;
-            let st = match &res {
-                Ok(()) => AutoPushStatus {
-                    at_ms: at,
-                    ok: true,
-                    message: "自动推送成功".into(),
-                },
-                Err(e) => AutoPushStatus {
-                    at_ms: at,
-                    ok: false,
-                    message: e.clone(),
-                },
+            let now_ms = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
             };
-            eprintln!(
-                "[autopush] {} {}",
-                if st.ok { "ok" } else { "err" },
-                st.message
-            );
-            *core.autopush.last.lock().await = Some(st);
+            // 定时唤醒且开启自动拉取：先拉远端更新（exportedAt last-write-wins）
+            if !change && pull_interval.is_some() {
+                let at = now_ms();
+                let res = auto_pull_once(&core).await;
+                let st = match &res {
+                    Ok(()) => AutoPushStatus {
+                        at_ms: at,
+                        ok: true,
+                        message: "自动拉取完成".into(),
+                    },
+                    Err(e) => AutoPushStatus {
+                        at_ms: at,
+                        ok: false,
+                        message: e.clone(),
+                    },
+                };
+                eprintln!(
+                    "[autopull] {} {}",
+                    if st.ok { "ok" } else { "err" },
+                    st.message
+                );
+                *core.autopush.last_pull.lock().await = Some(st);
+            }
+            // 变更唤醒或定时且开启自动推送：推送本机配置（带护栏）
+            if change || push_interval.is_some() {
+                let at = now_ms();
+                let res = auto_push_guarded(&core).await;
+                let st = match &res {
+                    Ok(()) => AutoPushStatus {
+                        at_ms: at,
+                        ok: true,
+                        message: "自动推送成功".into(),
+                    },
+                    Err(e) => AutoPushStatus {
+                        at_ms: at,
+                        ok: false,
+                        message: e.clone(),
+                    },
+                };
+                eprintln!(
+                    "[autopush] {} {}",
+                    if st.ok { "ok" } else { "err" },
+                    st.message
+                );
+                *core.autopush.last.lock().await = Some(st);
+            }
         }
     });
 }
@@ -1090,6 +1218,81 @@ async fn current_autopush_interval(core: &AppCore) -> Option<std::time::Duration
     Some(std::time::Duration::from_secs(
         u64::from(cfg.normalized_interval()) * 60,
     ))
+}
+
+/// 当前自动拉取间隔；未启用 / 未配置返回 None（与自动推送共用间隔分钟数）。
+async fn current_autopull_interval(core: &AppCore) -> Option<std::time::Duration> {
+    let db = core.db.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| sync::config_get(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err);
+    let cfg: Option<WebDavConfig> = match res {
+        Ok(Ok(c)) => c,
+        _ => return None,
+    };
+    let cfg = cfg?;
+    if !cfg.auto_pull_enabled {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(
+        u64::from(cfg.normalized_interval()) * 60,
+    ))
+}
+
+/// 自动拉取一次：远端非空且比上次成功同步更新时，导入远端配置并更新基线。
+///
+/// 与手动拉取相同的回声抑制（导入后 40s 内不触发变更自动推送），
+/// 空远端 / 无时间戳 / 不比本地新 一律不动本地（与推送护栏对称防数据丢失）。
+async fn auto_pull_once(core: &AppCore) -> Result<(), String> {
+    let cfg = get_webdav_config(core).await?;
+    let password = get_webdav_password(core).await?;
+    let db = core.db.clone();
+    let local_text = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    let Some(remote_text) = sync::try_pull(&core.http, &cfg, &password).await? else {
+        return Ok(()); // 远端无文件：无事可拉
+    };
+    let db = core.db.clone();
+    let last_sync = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| sync::last_sync_get(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    if !sync::should_pull(&local_text, &remote_text, last_sync) {
+        return Ok(()); // 空远端 / 不比本地新 / 内容一致：无需拉取
+    }
+    let db = core.db.clone();
+    let value = remote_text.clone();
+    let _report = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| import::apply_import(c, &value, false).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    if let Some(ts) = sync::exported_at(&remote_text) {
+        let db = core.db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with(|c| sync::last_sync_put(c, ts))
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(join_err)??;
+    }
+    // 防回声：拉取导入后 40s 内抑制变更触发的自动推送
+    core.autopush
+        .suppress
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let hub = core.autopush.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+        hub.suppress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    });
+    Ok(())
 }
 
 // ---------------------------------------------------------------- 供应商健康检查
@@ -1219,11 +1422,22 @@ async fn webdav_pull(core: State<'_, AppCore>) -> Result<import::ImportReport, S
     let password = get_webdav_password(&core).await?;
     let text = sync::pull(&core.http, &cfg, &password).await?;
     let db = core.db.clone();
+    let value = text.clone();
     let out = tokio::task::spawn_blocking(move || {
-        db.with_any(|c| import::apply_import(c, &text, false).map_err(|e| e.to_string()))
+        db.with_any(|c| import::apply_import(c, &value, false).map_err(|e| e.to_string()))
     })
     .await
     .map_err(join_err)??;
+    // 记录远端 exportedAt 作为自动拉取的新旧基线
+    if let Some(ts) = sync::exported_at(&text) {
+        let db = core.db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with(|c| sync::last_sync_put(c, ts))
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(join_err)??;
+    }
     // 防抖窗口 30s，抑制再保持 40s
     core.autopush
         .suppress
@@ -2213,6 +2427,9 @@ fn main() {
             webdav_push,
             webdav_pull,
             webdav_autopush_status,
+            webdav_autopull_status,
+            webdav_snapshot_info,
+            webdav_snapshot_restore,
             mcp_list,
             mcp_create,
             mcp_update,

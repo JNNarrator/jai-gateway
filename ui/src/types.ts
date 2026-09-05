@@ -79,6 +79,7 @@ export interface WebDavConfigDto {
   directory: string;
   autoPushEnabled: boolean;
   autoPushIntervalMin: number;
+  autoPullEnabled: boolean;
   password?: string | null;
 }
 
@@ -86,6 +87,12 @@ export interface WebDavAutoPushStatus {
   atMs: number;
   ok: boolean;
   message: string;
+}
+
+export interface WebDavSnapshotInfo {
+  exists: boolean;
+  atMs?: number | null;
+  chars: number;
 }
 
 export interface ImportReport {
