@@ -170,11 +170,9 @@ pub struct GatewayCtx {
 
 impl GatewayCtx {
     pub fn new(db: Db, logs: crate::store::logs::LogHandle) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            // 流式可能长达数分钟：不设总超时，交给分块空闲判定
-            .build()
-            .expect("reqwest client 构建失败");
+        // 出站代理（D8）：启动时读 meta 构建；保存后重启网关生效（与端口约定一致）
+        let proxy = db.with_any(crate::netcfg::ProxyConfig::from_meta).ok();
+        let http = crate::netcfg::build_client(proxy.as_ref(), Duration::from_secs(10));
         Self {
             db,
             logs,

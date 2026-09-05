@@ -11,6 +11,7 @@
 pub mod codec;
 pub mod discover;
 pub mod mcp;
+pub mod netcfg;
 pub mod router;
 pub mod server;
 pub mod skills;

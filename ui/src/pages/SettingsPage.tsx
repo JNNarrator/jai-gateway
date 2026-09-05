@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { KeyRound, Plus, RefreshCw, ShieldCheck } from "lucide-react";
+import { Globe, KeyRound, Plus, RefreshCw, ShieldCheck } from "lucide-react";
 import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
@@ -42,6 +42,12 @@ export function SettingsPage() {
   const [retentionOpen, setRetentionOpen] = useState(false);
   const [originOpen, setOriginOpen] = useState(false);
   const [originValue, setOriginValue] = useState("");
+  const [proxyEnabled, setProxyEnabled] = useState(false);
+  const [proxyUrl, setProxyUrl] = useState("");
+  const [proxyBypass, setProxyBypass] = useState("");
+  const [proxyMsg, setProxyMsg] = useState("");
+  const [proxyMsgOk, setProxyMsgOk] = useState(false);
+  const [proxyBusy, setProxyBusy] = useState(false);
   const corsHasWildcard = raw.split("\n").some((s) => s.trim() === "*");
 
   useEffect(() => {
@@ -58,7 +64,61 @@ export function SettingsPage() {
         setLogRowCap(s.logRowCap);
       })
       .catch(() => {});
+    api
+      .proxyGet()
+      .then((p) => {
+        setProxyEnabled(p.enabled);
+        setProxyUrl(p.url);
+        setProxyBypass(p.bypass.join("\n"));
+      })
+      .catch(() => {});
   }, []);
+
+  async function saveProxy() {
+    setProxyMsg("");
+    setProxyMsgOk(false);
+    if (proxyEnabled && !proxyUrl.trim()) {
+      setProxyMsg("启用代理需填写代理地址");
+      return;
+    }
+    const bypass = proxyBypass
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    setProxyBusy(true);
+    try {
+      await api.proxySet({ enabled: proxyEnabled, url: proxyUrl.trim(), bypass });
+      setProxyMsg("已保存：重启网关后生效（与端口约定一致）");
+      setProxyMsgOk(true);
+    } catch (e) {
+      setProxyMsg(String(e));
+    } finally {
+      setProxyBusy(false);
+    }
+  }
+
+  async function testProxy() {
+    setProxyMsg("");
+    setProxyMsgOk(false);
+    if (proxyEnabled && !proxyUrl.trim()) {
+      setProxyMsg("启用代理需填写代理地址");
+      return;
+    }
+    const bypass = proxyBypass
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    setProxyBusy(true);
+    try {
+      const r = await api.proxyTest({ enabled: proxyEnabled, url: proxyUrl.trim(), bypass });
+      setProxyMsg(r);
+      setProxyMsgOk(true);
+    } catch (e) {
+      setProxyMsg(String(e));
+    } finally {
+      setProxyBusy(false);
+    }
+  }
 
   async function save() {
     const lines = raw.split("\n").map((s) => s.trim()).filter(Boolean);
@@ -124,6 +184,79 @@ export function SettingsPage() {
             <Button onClick={savePort}>保存</Button>
           </div>
           {portMsg && <div className="text-xs text-emerald-600 dark:text-emerald-400">{portMsg}</div>}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2.5">
+            <Globe className="size-4" aria-hidden />
+            网络代理
+            <Switch
+              checked={proxyEnabled}
+              onCheckedChange={setProxyEnabled}
+              aria-label="网络代理开关"
+            />
+            <span className="text-sm font-normal text-muted-foreground">
+              {proxyEnabled ? "已启用" : "已关闭"}
+            </span>
+          </CardTitle>
+          <CardDescription>
+            网关出站（上游模型 / 健康检查 / WebDAV 同步）经代理访问；关闭时与默认行为完全一致。
+            保存后<strong>重启网关生效</strong>（与端口约定一致）。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="space-y-1">
+            <div className="text-xs text-muted-foreground">
+              代理地址（http / https / socks5，可含 user:pass@ 认证）
+            </div>
+            <Input
+              className="font-mono"
+              disabled={!proxyEnabled}
+              value={proxyUrl}
+              onChange={(e) => setProxyUrl(e.target.value)}
+              placeholder="http://127.0.0.1:7890"
+              aria-label="代理地址"
+            />
+          </div>
+          <div className="space-y-1">
+            <div className="text-xs text-muted-foreground">
+              绕过列表（每行一个 host 或 .suffix；* 表示全部绕过）
+            </div>
+            <Textarea
+              className="h-20 font-mono text-xs"
+              disabled={!proxyEnabled}
+              value={proxyBypass}
+              onChange={(e) => setProxyBypass(e.target.value)}
+              placeholder={"127.0.0.1\n.internal"}
+              aria-label="代理绕过列表"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Button onClick={() => void saveProxy()} disabled={proxyBusy}>
+              保存
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={proxyBusy}
+              onClick={() => void testProxy()}
+            >
+              {proxyBusy ? "测试中…" : "测试连接"}
+            </Button>
+          </div>
+          {proxyMsg && (
+            <div
+              className={
+                proxyMsgOk
+                  ? "text-xs text-emerald-600 dark:text-emerald-400"
+                  : "text-xs text-destructive"
+              }
+            >
+              {proxyMsg}
+            </div>
+          )}
         </CardContent>
       </Card>
 

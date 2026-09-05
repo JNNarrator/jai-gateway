@@ -12,6 +12,7 @@
 
 use gateway_core::codec::Family;
 use gateway_core::discover::discover_models;
+use gateway_core::netcfg::{self, ProxyConfig};
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::skills::SkillDraft;
 use gateway_core::store::{
@@ -2061,6 +2062,98 @@ fn families() -> Vec<&'static str> {
 
 // ---------------------------------------------------------------- 设置（M2）
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConfigDto {
+    pub enabled: bool,
+    pub url: String,
+    pub bypass: Vec<String>,
+}
+
+impl From<ProxyConfig> for ProxyConfigDto {
+    fn from(c: ProxyConfig) -> Self {
+        Self {
+            enabled: c.enabled,
+            url: c.url,
+            bypass: c.bypass,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySetInput {
+    pub enabled: bool,
+    pub url: String,
+    pub bypass: Vec<String>,
+}
+
+/// 读取出站代理配置（D8）。
+#[tauri::command]
+async fn proxy_get(core: State<'_, AppCore>) -> Result<ProxyConfigDto, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| netcfg::ProxyConfig::from_meta(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)?
+    .map(ProxyConfigDto::from)
+}
+
+/// 保存出站代理配置。启用时先校验 URL（非法即拒绝）；保存后重启网关生效。
+#[tauri::command]
+async fn proxy_set(
+    core: State<'_, AppCore>,
+    input: ProxySetInput,
+) -> Result<ProxyConfigDto, String> {
+    let url = input.url.trim().to_string();
+    if input.enabled {
+        netcfg::validate_proxy_url(&url)?;
+    }
+    let cfg = ProxyConfig {
+        enabled: input.enabled,
+        url,
+        bypass: input
+            .bypass
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    };
+    let db = core.db.clone();
+    let dto = ProxyConfigDto::from(cfg.clone());
+    tokio::task::spawn_blocking(move || db.with(|c| cfg.save(c)).map_err(|e| e.to_string()))
+        .await
+        .map_err(join_err)??;
+    Ok(dto)
+}
+
+/// 用候选代理配置测试连通性（不落库）：探测 https://www.gstatic.com/generate_204。
+#[tauri::command]
+async fn proxy_test(input: ProxySetInput) -> Result<String, String> {
+    let url = input.url.trim().to_string();
+    if input.enabled {
+        netcfg::validate_proxy_url(&url)?;
+    }
+    let cfg = ProxyConfig {
+        enabled: input.enabled,
+        url,
+        bypass: input
+            .bypass
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    };
+    let client = netcfg::build_client(Some(&cfg), std::time::Duration::from_secs(8));
+    let probe = "https://www.gstatic.com/generate_204";
+    match client.get(probe).send().await {
+        Ok(resp) if resp.status().is_success() => Ok("连接成功".into()),
+        Ok(resp) => Err(format!("连接异常（HTTP {}）", resp.status())),
+        Err(e) => Err(format!("连接失败: {e}")),
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsDto {
@@ -2430,10 +2523,11 @@ fn main() {
             let core = AppCore {
                 db: db.clone(),
                 logs: log_handle,
-                http: reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .expect("reqwest client"),
+                // 出站代理（D8）：启动时读 meta 构建；保存后重启网关生效
+                http: netcfg::build_client(
+                    db.with_any(netcfg::ProxyConfig::from_meta).ok().as_ref(),
+                    std::time::Duration::from_secs(10),
+                ),
                 db_path: db_str,
                 autopush: AutopushHub::new(),
             };
@@ -2586,6 +2680,9 @@ fn main() {
             settings_set_port,
             settings_set_logs_enabled,
             settings_set_retention,
+            proxy_get,
+            proxy_set,
+            proxy_test,
             read_env_var,
             port_in_use,
             families,

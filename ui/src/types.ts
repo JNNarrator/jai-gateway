@@ -83,6 +83,12 @@ export interface WebDavConfigDto {
   password?: string | null;
 }
 
+export interface ProxyConfigDto {
+  enabled: boolean;
+  url: string;
+  bypass: string[];
+}
+
 export interface WebDavAutoPushStatus {
   atMs: number;
   ok: boolean;

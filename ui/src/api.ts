@@ -9,6 +9,7 @@ import type {
   McpServerRow,
   McpTool,
   ModelRow,
+  ProxyConfigDto,
   ProviderDto,
   SettingsDto,
   SkillRow,
@@ -199,4 +200,15 @@ export const api = {
   readEnvVar: (name: string) => invoke<string>("read_env_var", { name }),
   portInUse: (port: number) => invoke<boolean>("port_in_use", { port }),
   families: () => invoke<string[]>("families"),
+  proxyGet: () => invoke<ProxyConfigDto>("proxy_get"),
+  proxySet: (input: {
+    enabled: boolean;
+    url: string;
+    bypass: string[];
+  }) => invoke<ProxyConfigDto>("proxy_set", { input }),
+  proxyTest: (input: {
+    enabled: boolean;
+    url: string;
+    bypass: string[];
+  }) => invoke<string>("proxy_test", { input }),
 };

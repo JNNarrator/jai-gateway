@@ -420,7 +420,10 @@ async fn converted_upstream_429_renders_oai_error() {
     assert!(body["error"]["type"].is_string());
 }
 
-/// B4 回归：上游无换行大块刷流 → 转换路径行缓冲超限即断开（防无界内存）。
+/// B4 回归：上游无换行大块刷流 → 转换路径缓冲护栏断开（防无界内存）。
+///
+/// 全量并发负载下 1MiB 体可能被慢速分片送达，体积护栏（单行超限）或 hold 护栏
+/// （行长时间未完成）任一先触发都算断开——两者都证明「无终止标记流会被护栏切断」。
 #[tokio::test(flavor = "multi_thread")]
 async fn conversion_disconnects_on_newline_flood_upstream() {
     let fx = fixture("gemini", "flood").await;
@@ -432,8 +435,8 @@ async fn conversion_disconnects_on_newline_flood_upstream() {
     let (status, text) = fx.post_chat_raw(body).await;
     assert_eq!(status, 200);
     assert!(
-        text.contains("单行超限"),
-        "应收到行缓冲超限错误帧，实际开头: {}",
+        text.contains("已断开"),
+        "应收到缓冲护栏错误帧（单行超限或行超时），实际开头: {}",
         text.chars().take(200).collect::<String>()
     );
 }
