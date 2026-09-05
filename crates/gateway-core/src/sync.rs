@@ -507,6 +507,53 @@ fn parse_multistatus(xml: &str) -> Result<Vec<BackupInfo>, String> {
     Ok(out)
 }
 
+/// 推送前差异明细（可视 diff，T5）：双向列出差异条目。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushDiffDetail {
+    pub remote_exists: bool,
+    /// 远端有、本地没有的供应商（推送覆盖后将丢失）
+    pub remote_only_providers: Vec<(String, String)>,
+    /// 远端有、本地没有的模型（推送覆盖后将丢失）
+    pub remote_only_models: Vec<(String, String)>,
+    /// 本地有、远端没有的供应商（推送会新增到远端）
+    pub local_only_providers: Vec<(String, String)>,
+    /// 本地有、远端没有的模型（推送会新增到远端）
+    pub local_only_models: Vec<(String, String)>,
+}
+
+impl PushDiffDetail {
+    pub fn blocks(&self) -> bool {
+        !self.remote_only_providers.is_empty() || !self.remote_only_models.is_empty()
+    }
+}
+
+/// 推送前差异明细：远端独有（将丢失）与本地独有（将新增）逐条列出。
+pub fn push_diff_detail(local: &str, remote: Option<&str>) -> Result<PushDiffDetail, String> {
+    let Some(remote) = remote else {
+        return Ok(PushDiffDetail {
+            remote_exists: false,
+            ..Default::default()
+        });
+    };
+    let (lp, lm) = export_keys(local)?;
+    let (rp, rm) = export_keys(remote)?;
+    let mut remote_only_providers: Vec<_> = rp.difference(&lp).cloned().collect();
+    let mut remote_only_models: Vec<_> = rm.difference(&lm).cloned().collect();
+    let mut local_only_providers: Vec<_> = lp.difference(&rp).cloned().collect();
+    let mut local_only_models: Vec<_> = lm.difference(&rm).cloned().collect();
+    remote_only_providers.sort();
+    remote_only_models.sort();
+    local_only_providers.sort();
+    local_only_models.sort();
+    Ok(PushDiffDetail {
+        remote_exists: true,
+        remote_only_providers,
+        remote_only_models,
+        local_only_providers,
+        local_only_models,
+    })
+}
+
 /// 推送前差异预警结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PushDiff {
@@ -858,6 +905,39 @@ mod tests {
         assert!(backup_href(&cfg, "jai-config.json").is_err());
         assert!(backup_href(&cfg, "../evil.json").is_err());
         assert!(backup_href(&cfg, "readme.txt").is_err());
+    }
+
+    #[test]
+    fn push_diff_detail_lists_both_sides() {
+        let local = r#"{"format":"jai-export/v1","providers":[{"id":"p1","name":"A","base_url":"https://a/v1"},{"id":"p3","name":"C","base_url":"https://c/v1"}],"models":[{"id":"m1","providerId":"p1","modelName":"gpt-4o"}]}"#;
+        let remote = r#"{"format":"jai-export/v1","providers":[{"id":"p1","name":"A","base_url":"https://a/v1"},{"id":"p2","name":"B","base_url":"https://b/v1"}],"models":[{"id":"m1","providerId":"p1","modelName":"gpt-4o"},{"id":"m2","providerId":"p2","modelName":"claude-3"}]}"#;
+        let d = push_diff_detail(local, Some(remote)).unwrap();
+        assert!(d.remote_exists);
+        // 远端独有：供应商 B、模型 claude-3（会被覆盖丢失）→ 阻断
+        assert_eq!(
+            d.remote_only_providers,
+            vec![("B".to_string(), "https://b/v1".to_string())]
+        );
+        assert_eq!(
+            d.remote_only_models,
+            vec![("p2".to_string(), "claude-3".to_string())]
+        );
+        assert!(d.blocks());
+        // 本地独有：供应商 C（推送会新增到远端）
+        assert_eq!(
+            d.local_only_providers,
+            vec![("C".to_string(), "https://c/v1".to_string())]
+        );
+        assert!(d.local_only_models.is_empty());
+        // 无远端：不阻断
+        let none = push_diff_detail(local, None).unwrap();
+        assert!(!none.remote_exists);
+        assert!(!none.blocks());
+        // 等价：两侧都空
+        let eq = push_diff_detail(local, Some(local)).unwrap();
+        assert!(eq.remote_only_providers.is_empty());
+        assert!(eq.local_only_models.is_empty());
+        assert!(!eq.blocks());
     }
 
     #[test]

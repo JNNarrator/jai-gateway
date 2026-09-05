@@ -99,6 +99,23 @@ pub struct AppCore {
     pub http: reqwest::Client,
     pub db_path: String,
     pub autopush: AutopushHub,
+    /// 最近一轮健康检查摘要（UX-T3 横幅数据源）
+    pub health_summary: std::sync::Arc<std::sync::Mutex<HealthSummary>>,
+}
+
+/// 最近一轮健康检查摘要（UX-T3 横幅数据源）。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthSummary {
+    pub checked_at_ms: Option<i64>,
+    pub down: Vec<HealthDownProvider>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthDownProvider {
+    pub name: String,
+    pub message: String,
 }
 
 struct GatewayState {
@@ -943,6 +960,47 @@ async fn webdav_preview(core: State<'_, AppCore>) -> Result<WebDavPreview, Strin
     })
 }
 
+/// 推送前差异明细（可视 diff，UX-T5）：远端独有/本地独有逐条列出。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushDiffDetailDto {
+    pub remote_exists: bool,
+    /// [名称, base_url] 对
+    pub remote_only_providers: Vec<[String; 2]>,
+    /// [providerId, modelName] 对
+    pub remote_only_models: Vec<[String; 2]>,
+    pub local_only_providers: Vec<[String; 2]>,
+    pub local_only_models: Vec<[String; 2]>,
+    pub blocks: bool,
+}
+
+#[tauri::command]
+async fn webdav_push_diff(core: State<'_, AppCore>) -> Result<PushDiffDetailDto, String> {
+    let cfg = get_webdav_config(&core).await?;
+    let password = get_webdav_password(&core).await?;
+    let db = core.db.clone();
+    let local_text = tokio::task::spawn_blocking(move || {
+        db.with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(join_err)??;
+    let remote = sync::try_pull(&core.http, &cfg, &password).await?;
+    let d = sync::push_diff_detail(&local_text, remote.as_deref()).map_err(|e| e.to_string())?;
+    let pair = |v: &[(String, String)]| {
+        v.iter()
+            .map(|(a, b)| [a.clone(), b.clone()])
+            .collect::<Vec<[String; 2]>>()
+    };
+    Ok(PushDiffDetailDto {
+        remote_exists: d.remote_exists,
+        remote_only_providers: pair(&d.remote_only_providers),
+        remote_only_models: pair(&d.remote_only_models),
+        local_only_providers: pair(&d.local_only_providers),
+        local_only_models: pair(&d.local_only_models),
+        blocks: d.blocks(),
+    })
+}
+
 /// 手动推送。`force` 为 true 时跳过推送前差异预警（用户已确认覆盖）。
 ///
 /// 差异预警（T3）：远端有本机没有的供应商/模型时，首次调用返回可读错误提示，
@@ -1468,6 +1526,9 @@ async fn health_round(core: &AppCore, app: &AppHandle, first_round: bool) -> Res
     .await
     .map_err(join_err)??;
 
+    // 本轮摘要：失败供应商 (name, message) 累积，轮末写入内存槽供横幅读取
+    let mut down: Vec<(String, String)> = Vec::new();
+
     for row in rows.iter().filter(|r| r.enabled) {
         let was_failing = provider_row_is_failing(row);
 
@@ -1503,6 +1564,7 @@ async fn health_round(core: &AppCore, app: &AppHandle, first_round: bool) -> Res
                 }
             }
             Err(msg) => {
+                down.push((row.name.clone(), msg.clone()));
                 let id = row.id.clone();
                 let m2 = msg.clone();
                 let db = core.db.clone();
@@ -1521,7 +1583,21 @@ async fn health_round(core: &AppCore, app: &AppHandle, first_round: bool) -> Res
             }
         }
     }
+    // 轮末写入摘要（即便 0 失败也刷新 checked_at，横幅据此显示"已检查"）
+    *core.health_summary.lock().unwrap() = HealthSummary {
+        checked_at_ms: Some(store::now_ms() as i64),
+        down: down
+            .into_iter()
+            .map(|(name, message)| HealthDownProvider { name, message })
+            .collect(),
+    };
     Ok(())
+}
+
+/// 读取最近一轮健康检查摘要（UX-T3 横幅数据源）。
+#[tauri::command]
+async fn health_summary(core: State<'_, AppCore>) -> Result<HealthSummary, String> {
+    Ok(core.health_summary.lock().unwrap().clone())
 }
 
 /// 发送系统通知（失败只打日志，不影响探测流程）。
@@ -2530,6 +2606,9 @@ fn main() {
                 ),
                 db_path: db_str,
                 autopush: AutopushHub::new(),
+                health_summary: std::sync::Arc::new(
+                    std::sync::Mutex::new(HealthSummary::default()),
+                ),
             };
             ensure_gateway_key(&core)?;
 
@@ -2654,6 +2733,7 @@ fn main() {
             webdav_autopull_status,
             webdav_snapshot_info,
             webdav_snapshot_restore,
+            webdav_push_diff,
             webdav_backups_list,
             webdav_backup_restore,
             webdav_backup_delete,
@@ -2680,6 +2760,7 @@ fn main() {
             settings_set_port,
             settings_set_logs_enabled,
             settings_set_retention,
+            health_summary,
             proxy_get,
             proxy_set,
             proxy_test,

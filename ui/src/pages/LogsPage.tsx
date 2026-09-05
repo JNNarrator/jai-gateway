@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Download, RefreshCw, ScrollText, Search } from "lucide-react";
+import { Copy, Download, RefreshCw, ScrollText, Search, Terminal } from "lucide-react";
 import { api } from "../api";
 import type { LogRowView } from "../types";
 import { toast } from "../lib/toast";
@@ -8,6 +8,13 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { EmptyState } from "@/components/common/EmptyState";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -32,6 +39,8 @@ export function LogsPage() {
   const [intervalMs, setIntervalMs] = useState(3000);
   const [modelFilter, setModelFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
+  const [providerFilter, setProviderFilter] = useState("");
+  const [sel, setSel] = useState<LogRowView | null>(null);
   const [limit, setLimit] = useState(500);
   const [initialLoading, setInitialLoading] = useState(true);
 
@@ -51,8 +60,13 @@ export function LogsPage() {
     if (modelFilter && !r.modelName.toLowerCase().includes(modelFilter.toLowerCase()))
       return false;
     if (statusFilter && String(r.httpStatus) !== statusFilter) return false;
+    if (providerFilter && (r.providerId ?? "") !== providerFilter) return false;
     return true;
   });
+
+  const providerOptions = Array.from(
+    new Set(rows.map((r) => r.providerId ?? "").filter(Boolean)),
+  ).sort();
 
   function statusClass(s: number) {
     if (s >= 500) return "text-red-600 dark:text-red-400";
@@ -96,6 +110,40 @@ export function LogsPage() {
     a.click();
     URL.revokeObjectURL(a.href);
     toast("已导出 JSON");
+  }
+
+  /** 用行内元数据拼可复现命令（日志按隐私基线不存请求体 → 占位模板）。 */
+  function curlFor(r: LogRowView) {
+    const path = r.inboundFamily.includes("anthropic") ? "/v1/messages" : "/v1/chat/completions";
+    const url = `http://127.0.0.1:1314${path}`;
+    const body = JSON.stringify(
+      {
+        model: r.modelName,
+        stream: r.isStream,
+        messages: [{ role: "user", content: "粘贴真实请求内容" }],
+      },
+      null,
+      2,
+    );
+    return [
+      `curl -N '${url}' \\`,
+      "  -H 'Authorization: Bearer <网关密钥>' \\",
+      "  -H 'Content-Type: application/json' \\",
+      `  -d '${body}'`,
+      "",
+      `# 复现第 ${r.id} 条日志（${new Date(r.ts).toLocaleString("zh-CN", { hour12: false })}，状态 ${r.httpStatus}）；`,
+      "# 密钥在「接入」页获取；端口以实际网关端口为准",
+    ].join("\n");
+  }
+
+  async function copyCurl() {
+    if (!sel) return;
+    try {
+      await navigator.clipboard.writeText(curlFor(sel));
+      toast("已复制 cURL 复现命令");
+    } catch {
+      toast("复制失败", "err");
+    }
   }
 
   return (
@@ -149,6 +197,19 @@ export function LogsPage() {
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value)}
         />
+        <Select value={providerFilter} onValueChange={setProviderFilter}>
+          <SelectTrigger size="sm" className="w-36">
+            <SelectValue placeholder="全部供应商" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all__">全部供应商</SelectItem>
+            {providerOptions.map((p) => (
+              <SelectItem key={p} value={p}>
+                {p}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <div className="ml-auto flex gap-2">
           <Button variant="outline" size="sm" onClick={exportCsv}>
             <Download aria-hidden />
@@ -185,7 +246,9 @@ export function LogsPage() {
                 key={r.id}
                 className={cn(
                   r.httpStatus >= 400 && "bg-destructive/5",
+                  "cursor-pointer",
                 )}
+                onClick={() => setSel(r)}
               >
                 <TableCell className="whitespace-nowrap text-muted-foreground">
                   {new Date(r.ts).toLocaleTimeString()}
@@ -234,8 +297,79 @@ export function LogsPage() {
         </>
       )}
       <p className="text-xs text-muted-foreground">
-        日志不含具体内容，保留 30 天或 5 万行，每日自动清理。
+        日志不含具体内容，保留 30 天或 5 万行，每日自动清理。点击任意行查看详情并复制复现命令。
       </p>
+
+      <Dialog open={!!sel} onOpenChange={(o) => !o && setSel(null)}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Terminal className="size-4" aria-hidden />
+              请求详情
+              {sel && (
+                <span className={cn("text-sm font-semibold", statusClass(sel.httpStatus))}>
+                  {sel.httpStatus}
+                </span>
+              )}
+            </DialogTitle>
+            <DialogDescription>
+              {sel && new Date(sel.ts).toLocaleString("zh-CN", { hour12: false })} · 日志 #{sel?.id}
+            </DialogDescription>
+          </DialogHeader>
+          {sel && (
+            <div className="space-y-3 text-sm">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+                <Detail label="入站协议" value={sel.inboundFamily} />
+                <Detail label="路由模式" value={sel.routeMode} />
+                <Detail label="供应商" value={sel.providerId ?? "—"} />
+                <Detail label="模型" value={sel.modelName} />
+                <Detail label="耗时" value={`${sel.durationMs}ms`} />
+                <Detail
+                  label="流式"
+                  value={sel.isStream ? "SSE 流式" : "一次性"}
+                />
+                <Detail label="输入 Token" value={sel.usageInput?.toLocaleString() ?? "—"} />
+                <Detail label="输出 Token" value={sel.usageOutput?.toLocaleString() ?? "—"} />
+              </div>
+              {(sel.errorKind || sel.errorSummary) && (
+                <div className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs">
+                  <div className="font-semibold text-red-600 dark:text-red-400">
+                    {sel.errorKind ?? "错误"}
+                  </div>
+                  {sel.errorSummary && (
+                    <div className="mt-1 whitespace-pre-wrap break-all text-muted-foreground">
+                      {sel.errorSummary}
+                    </div>
+                  )}
+                </div>
+              )}
+              <div className="rounded-md border bg-muted/30 p-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-xs font-medium text-muted-foreground">
+                    复制为 cURL（复现命令，请求体为占位模板）
+                  </div>
+                  <Button variant="outline" size="sm" className="h-7" onClick={() => void copyCurl()}>
+                    <Copy aria-hidden />
+                    复制
+                  </Button>
+                </div>
+                <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-muted-foreground">
+                  {curlFor(sel)}
+                </pre>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+function Detail({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="truncate font-mono text-xs">{value}</div>
     </div>
   );
 }

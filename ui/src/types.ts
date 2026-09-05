@@ -6,6 +6,16 @@ export interface GwStatus {
   restarts: number;
 }
 
+export interface HealthDownProvider {
+  name: string;
+  message: string;
+}
+
+export interface HealthSummary {
+  checkedAtMs?: number | null;
+  down: HealthDownProvider[];
+}
+
 export type Family = "openai_compat" | "anthropic" | "gemini";
 
 export interface ProviderDto {
@@ -99,6 +109,17 @@ export interface WebDavSnapshotInfo {
   exists: boolean;
   atMs?: number | null;
   chars: number;
+}
+
+export interface PushDiffDetailDto {
+  remoteExists: boolean;
+  /** [名称, base_url] 对 */
+  remoteOnlyProviders: string[][];
+  /** [providerId, modelName] 对 */
+  remoteOnlyModels: string[][];
+  localOnlyProviders: string[][];
+  localOnlyModels: string[][];
+  blocks: boolean;
 }
 
 export interface WebDavBackupItem {

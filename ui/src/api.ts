@@ -4,6 +4,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   GwStatus,
   GatewayKeyInfo,
+  HealthSummary,
   ImportReport,
   LogRowView,
   McpServerRow,
@@ -18,6 +19,7 @@ import type {
   WebDavBackupItem,
   WebDavConfigDto,
   WebDavSnapshotInfo,
+  PushDiffDetailDto,
 } from "./types";
 
 export const api = {
@@ -25,6 +27,7 @@ export const api = {
   status: () => invoke<GwStatus>("gateway_status"),
   start: () => invoke<GwStatus>("gateway_start"),
   stop: () => invoke<GwStatus>("gateway_stop"),
+  healthSummary: () => invoke<HealthSummary>("health_summary"),
 
   // 供应商
   providerList: () => invoke<ProviderDto[]>("provider_list"),
@@ -124,6 +127,7 @@ export const api = {
     }>("webdav_preview"),
   webdavPush: (force?: boolean) =>
     invoke<void>("webdav_push", { force: force ?? false }),
+  webdavPushDiff: () => invoke<PushDiffDetailDto>("webdav_push_diff"),
   webdavPull: () => invoke<ImportReport>("webdav_pull"),
   webdavSnapshotInfo: () =>
     invoke<WebDavSnapshotInfo>("webdav_snapshot_info"),

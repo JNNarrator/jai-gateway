@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Play, Square } from "lucide-react";
+import { AlertTriangle, HeartPulse, Play, Square } from "lucide-react";
 import { api } from "../api";
-import type { GatewayKeyInfo } from "../types";
+import type { GatewayKeyInfo, GwStatus, HealthSummary } from "../types";
 import { toast } from "../lib/toast";
+import { goTab } from "../lib/nav";
 import { PageHeader } from "@/components/common/PageHeader";
 import { CopyField } from "@/components/common/CopyField";
 import { StatusBadge } from "@/components/common/StatusBadge";
@@ -16,12 +17,13 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 export function GatewayPage() {
-  const [status, setStatus] = useState<import("../types").GwStatus | null>(null);
+  const [status, setStatus] = useState<GwStatus | null>(null);
   const [key, setKey] = useState<GatewayKeyInfo | null>(null);
   const [revealKey, setRevealKey] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [confirmRotate, setConfirmRotate] = useState(false);
+  const [health, setHealth] = useState<HealthSummary | null>(null);
 
   const port = status?.port ?? 1314;
   const baseUrl = `http://127.0.0.1:${port}/v1`;
@@ -43,6 +45,13 @@ export function GatewayPage() {
 
   useEffect(() => {
     api.gatewayKeyInfo().then((k) => setKey(k)).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const load = () => api.healthSummary().then(setHealth).catch(() => {});
+    load();
+    const t = setInterval(load, 30_000);
+    return () => clearInterval(t);
   }, []);
 
   async function toggle(run: boolean) {
@@ -114,6 +123,35 @@ export function GatewayPage() {
           {err}
         </div>
       )}
+
+      {health?.checkedAtMs != null &&
+        (health.down.length > 0 ? (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm"
+          >
+            <AlertTriangle className="size-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />
+            <span className="text-amber-700 dark:text-amber-300">
+              上次健康检查 {new Date(health.checkedAtMs).toLocaleTimeString("zh-CN", { hour12: false })} ·
+              {health.down.length} 个供应商不可用：
+              {health.down.map((d) => d.name).join("、")}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-auto h-7"
+              onClick={() => goTab("providers")}
+            >
+              查看供应商
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+            <HeartPulse className="size-4" aria-hidden />
+            健康检查正常 · {new Date(health.checkedAtMs).toLocaleTimeString("zh-CN", { hour12: false })}
+            （{health.down.length} 个不可用）
+          </div>
+        ))}
 
       <Card>
         <CardHeader>

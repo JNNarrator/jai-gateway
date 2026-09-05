@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { api } from "../api";
 import type {
+  PushDiffDetailDto,
   WebDavAutoPushStatus,
   WebDavBackupItem,
   WebDavSnapshotInfo,
@@ -16,6 +17,14 @@ import { CopyField } from "@/components/common/CopyField";
 import { toast } from "../lib/toast";
 import { PageHeader } from "@/components/common/PageHeader";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { FormField } from "@/components/common/FormField";
 import { Button } from "@/components/ui/button";
 import {
@@ -64,6 +73,7 @@ export function SyncPage() {
   const [confirmDeleteBackup, setConfirmDeleteBackup] =
     useState<WebDavBackupItem | null>(null);
   const [pushBlockInfo, setPushBlockInfo] = useState("");
+  const [pushDiff, setPushDiff] = useState<PushDiffDetailDto | null>(null);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState("");
@@ -288,8 +298,10 @@ export function SyncPage() {
     } catch (e) {
       const text = String(e);
       if (text.includes("仍然推送")) {
-        // 差异预警：远端有本机没有的内容，弹确认框由用户决定
+        // 差异预警：远端有本机没有的内容——拉取明细弹可视 diff
         setPushBlockInfo(text);
+        const d = await api.webdavPushDiff().catch(() => null);
+        setPushDiff(d);
       } else {
         setErr(text);
       }
@@ -300,6 +312,7 @@ export function SyncPage() {
 
   async function doPushForce() {
     setPushBlockInfo("");
+    setPushDiff(null);
     setBusy("push");
     setErr("");
     try {
@@ -702,14 +715,81 @@ export function SyncPage() {
         confirmText="恢复"
         onConfirm={doRestore}
       />
-      <ConfirmDialog
-        open={!!pushBlockInfo}
-        onOpenChange={(o) => !o && setPushBlockInfo("")}
-        title="推送将覆盖远端内容"
-        description={pushBlockInfo}
-        confirmText="仍然推送"
-        onConfirm={doPushForce}
-      />
+      {pushDiff ? (
+        <Dialog open onOpenChange={(o) => !o && (setPushDiff(null), setPushBlockInfo(""))}>
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>推送将覆盖远端内容</DialogTitle>
+              <DialogDescription>
+                远端有本机没有的供应商/模型，直接推送会把它们覆盖掉。逐条确认后仍可继续。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="max-h-72 space-y-3 overflow-y-auto pr-1 text-sm">
+              <div>
+                <div className="mb-1 text-xs font-medium text-destructive">
+                  远端独有 · 将被覆盖丢失（{pushDiff.remoteOnlyProviders.length + pushDiff.remoteOnlyModels.length}）
+                </div>
+                {pushDiff.remoteOnlyProviders.length === 0 &&
+                pushDiff.remoteOnlyModels.length === 0 ? (
+                  <div className="text-xs text-muted-foreground">无</div>
+                ) : (
+                  <ul className="space-y-1">
+                    {pushDiff.remoteOnlyProviders.map(([name, base]) => (
+                      <li key={`rp-${name}`} className="truncate font-mono text-xs">
+                        ▲ 供应商 {name} · {base}
+                      </li>
+                    ))}
+                    {pushDiff.remoteOnlyModels.map(([pid, mn]) => (
+                      <li key={`rm-${pid}-${mn}`} className="truncate font-mono text-xs">
+                        ▲ 模型 {mn}（供应商 {pid}）
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+              <div>
+                <div className="mb-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                  本地独有 · 推送将新增到远端
+                </div>
+                {pushDiff.localOnlyProviders.length === 0 &&
+                pushDiff.localOnlyModels.length === 0 ? (
+                  <div className="text-xs text-muted-foreground">无</div>
+                ) : (
+                  <ul className="space-y-1">
+                    {pushDiff.localOnlyProviders.map(([name, base]) => (
+                      <li key={`lp-${name}`} className="truncate font-mono text-xs">
+                        + 供应商 {name} · {base}
+                      </li>
+                    ))}
+                    {pushDiff.localOnlyModels.map(([pid, mn]) => (
+                      <li key={`lm-${pid}-${mn}`} className="truncate font-mono text-xs">
+                        + 模型 {mn}（供应商 {pid}）
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+            <DialogFooter className="gap-2">
+              <Button variant="outline" size="sm" onClick={() => (setPushDiff(null), setPushBlockInfo(""))}>
+                取消
+              </Button>
+              <Button size="sm" variant="destructive" onClick={() => void doPushForce()}>
+                仍然推送
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : (
+        <ConfirmDialog
+          open={!!pushBlockInfo}
+          onOpenChange={(o) => !o && setPushBlockInfo("")}
+          title="推送将覆盖远端内容"
+          description={pushBlockInfo}
+          confirmText="仍然推送"
+          onConfirm={doPushForce}
+        />
+      )}
       <ConfirmDialog
         open={!!confirmRestoreBackup}
         onOpenChange={(o) => !o && setConfirmRestoreBackup(null)}

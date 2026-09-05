@@ -1,5 +1,6 @@
 import { SidebarNav } from "./components/layout/SidebarNav";
 import { TitleBar } from "./components/layout/TitleBar";
+import { CommandPalette } from "./components/common/CommandPalette";
 import { useNav } from "./lib/nav";
 import { GatewayPage } from "./pages/GatewayPage";
 import { SyncPage } from "./pages/SyncPage";
@@ -15,6 +16,7 @@ export default function App() {
   const { tab } = useNav();
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
+      <CommandPalette />
       <TitleBar />
       <div className="flex min-h-0 flex-1">
         <SidebarNav />
