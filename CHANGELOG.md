@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-11
+
+### Added
+- **图片跨族链路**：OpenAI / Anthropic / Gemini 三族 `image` 内容块互转（data URL ↔ base64 source
+  ↔ inlineData），media_type 与载荷不失真；5 例链路测试 `multimodal_image`
+- **模型输入/输出模态集合**（迁移 `0010_model_modalities`，取代 0009 单一 vision 布尔）：
+  `models` 表新增 `input_modalities` / `output_modalities`（可空 TEXT，规范序
+  `text,image,audio,video` 逗号串，`NULL` = 未知）；旧 `supports_multimodal` 列保留可读、
+  降为**派生回落源**（输入含 image → true；输入为 NULL 时才回落旧列；清除标注时旧列一并置
+  NULL，杜绝「幽灵 true」）
+- **上游模态发现**：Gemini `inputModalities` / `outputModalities`、OpenRouter
+  `architecture.input_modalities`、openai 系 `supports_vision` / `multimodal` / `vision`
+  按可信度递降解析；完全取不到一律 `NULL`（未知），不做模型名启发式臆断
+- **出站 `GET /v1/models` 追加 `inputModalities` / `outputModalities`**（只增字段，
+  `contextWindow` / `supportsMultimodal` 语义不变，旧客户端不受影响）
+- **UI 模型页模态编辑器**：入/出双维多选即时生效 + 「清除标注（未知）」；
+  命令 `model_set_modalities` 取代 `model_set_multimodal`；模态随配置导出/导入同步，
+  老快照（仅 `supportsMultimodal` 布尔）导入时自动回填为等价模态集合
+- **验收**：`tests/modalities.rs` 9 例（enum_/store_/discover_/proxy_/sync_）+ 老库 v9→v10
+  真升级验证
+
 ## [0.1.8] - 2026-09-05
 
 ### Added
