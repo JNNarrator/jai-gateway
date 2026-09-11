@@ -6,7 +6,7 @@
 
 > 开箱即用的本地 AI API 网关：把官方与第三方中转的杂牌 token 来源，收敛成一个稳定的本机入口（`127.0.0.1:1314`），并让多设备（macOS / Windows）配置随 WebDAV 保持同步。
 
-**状态**：M0–M9 全部里程碑完成 · UI 2.0（阶段 0–6）已落地 · WebDAV 多设备同步可靠性加固 · 出站代理配置化 · UX 体验增强（日志复现/命令面板/健康横幅/冲突 diff）· 多模态（图片跨族转换 + 模型输入/输出模态集合）· v0.1.9
+**状态**：M0–M9 全部里程碑完成 · UI 2.0（阶段 0–6）已落地 · MCP 统一代理（`server__tool` 转发 + `skill__` 投递）· WebDAV 多设备同步加固（远端备份管理 / 冲突 diff）· 出站代理配置化 · UX 体验增强（日志复现 / 命令面板 / 健康横幅）· 多模态（图片跨族转换 + 模型输入/输出模态集合）· v0.1.9
 
 ---
 
@@ -28,7 +28,7 @@ JAI 是 Tauri 2 本地应用，分三层：**React 前端 → Tauri 桌面壳 �
 │ Providers · Models · Gateway · Logs · Stats · MCP ·              │
 │ Skills · Sync · Settings（共 9 页）                              │
 └─────────────────────────────────┬────────────────────────────────┘
-                                  │ Tauri IPC（约 60 个命令）
+                                  │ Tauri IPC（约 70 个命令）
 ┌─────────────────────────────────▼────────────────────────────────┐
 │ 桌面壳 src-tauri — Tauri 2                                       │
 │ 网关监督循环（看门狗 + 自动重启）· 系统托盘常驻                  │
@@ -43,6 +43,8 @@ JAI 是 Tauri 2 本地应用，分三层：**React 前端 → Tauri 桌面壳 �
 │ router      多渠道路由：优先级故障转移 / 负载均衡                │
 │ store       SQLite 唯一事实源（供应商/模型/密钥/日志）           │
 │ discover    上游模型自动发现 · sync WebDAV 拉取推送              │
+│ netcfg      出站网络：HTTP(S)/SOCKS5 代理 + 绕过列表             │
+│ modality    模型输入/输出模态集合 · 图片跨族转换                 │
 │ mcp         MCP Server 台账 · skills 技能管理                    │
 └─────────────────────────────────┬────────────────────────────────┘
                                   │ HTTP 出站（reqwest）
@@ -82,22 +84,24 @@ JAI 是 Tauri 2 本地应用，分三层：**React 前端 → Tauri 桌面壳 �
 ## 核心特性
 
 - 多供应商管理：OpenAI 兼容 / OpenAI Responses / Anthropic / Gemini 四族渠道；凭据明文存本地 SQLite（与网关 Key 同级安全模型，安全性依赖数据目录文件权限）
-- **配置随 WebDAV 同步**：供应商 API Key、网关 Key、WebDAV 密码随导出同步，换机器拉取即用（客户端零改动）；手动重新生成网关 Key 自动更新远端；推送前自动留存远端上一版时间戳备份 + 本地快照，自动推送带「空配置不覆盖远端」护栏（last-write-wins）
+- **配置随 WebDAV 同步**：供应商 API Key、网关 Key、WebDAV 密码随导出同步，换机器拉取即用（客户端零改动）；手动重新生成网关 Key 自动更新远端；推送前自动留存远端上一版时间戳备份 + 本地快照，自动推送带「空配置不覆盖远端」护栏（last-write-wins）；远端目录可按时间戳列出 / 恢复 / 删除 `jai-config.<时间戳>.json` 备份（恢复后自动对齐拉取基线，避免被立刻拉回）
 - 对外暴露统一网关入口（`127.0.0.1:1314`），支持多条入站协议线：
   - OpenAI `POST /v1/chat/completions` 与旧版 `POST /v1/completions`
   - OpenAI Responses API `POST /v1/responses`
   - Anthropic `POST /v1/messages`（Claude Code 直连，含 `count_tokens` 粗估）
-  - MCP 元数据服务 `POST /mcp`（Streamable HTTP）：把网关登记的 MCP Server / Skill 台账以 MCP 协议暴露给 Agent——`list_mcp_servers` / `get_mcp_server_detail` / `get_tool_schemas` / `list_skills` / `get_skill_detail` 五个只读工具，不注入对话链路、不代执行工具；env 仅回键名不回值
+  - MCP 元数据服务 `POST /mcp`（Streamable HTTP）：把网关登记的 MCP Server / Skill 台账以 MCP 协议暴露给 Agent——五个只读工具（`list_mcp_servers` / `get_mcp_server_detail` / `get_tool_schemas` / `list_skills` / `get_skill_detail`，env 仅回键名不回值）；开启「代理执行」开关（`proxy_allowed`）的 Server 其工具以 `<server>__<tool>` 动态暴露、`tools/call` 显式转发给真实 Server 执行，启用技能以 `skill__<name>` 按名投递全文（32KB 截断并注明）——选择权始终在 Agent，网关只做发现与转发，不注入对话链路
 - 同名模型多渠道路由：按优先级自动故障转移 + 健康感知排序 + 同优先级权重负载均衡
 - 模型别名/映射：每个模型可配置发给上游的真实模型 ID
 - 跨协议转换（含 tool calling）：让任意客户端组合任意上游模型
   - **结构化输出降级执行**：客户端请求 `response_format(json_schema)` 时——openai 系上游原生外传；anthropic/gemini 上游降级为「提示词指令注入 + 输出 JSON 校验」（strict 校验失败返回 502）
   - **reasoning effort 闭环**：入站 `reasoning_effort` / `reasoning.effort` 建模后按目标族映射——Native 透传、Anthropic 转 `thinking` 开/关、无能力族忽略并 WARN
   - **Codex 扩展工具折叠还原**（[protocol-ir §10](docs/design/protocol-ir.md)）：`shell` / `apply_patch` / `custom` / `local_shell` 声明与调用折叠为 function 工具（Codex 客户端可接任意普通模型），回程按工具身份映射还原原始 item（含流式 item 类型与增量事件名）
-- 上游模型自动发现：从供应商 `/models` 拉取模型并入库，自动填上下文窗口/最大输出缺省值
-- MCP / 技能（Skill）管理：网关内登记 MCP Server 与技能（连通检查、工具查看、ZIP 批量导入、Markdown 导出）；MCP 配置导入自动识别三种格式——`{"mcpServers":{...}}` JSON、`codex mcp add` 命令行、Codex `[mcp_servers.*]` TOML 片段
+- 上游模型自动发现：从供应商 `/models` 拉取模型并入库，自动填上下文窗口/最大输出缺省值；输入/输出模态按上游可信度递降解析（`inputModalities` / `architecture.input_modalities` / `supports_vision` 等），取不到即为未知，不做模型名臆断
+- **出站网络代理**（设置页「网络代理」）：HTTP(S) / SOCKS5（可含 `user:pass@` 认证）+ 绕过列表（精确 host / `.suffix` / `*` 全过）+「测试连接」；上游模型发现、健康检查与 WebDAV 同步统一经代理出站，**保存后重启网关生效**；关闭时代理行为与默认完全一致
+- MCP / 技能（Skill）管理：网关内登记 MCP Server 与技能（连通检查、工具查看与调用测试、按 Server 的「代理执行」开关、ZIP 批量导入、Markdown 导出）；MCP 配置导入自动识别三种格式——`{"mcpServers":{...}}` JSON、`codex mcp add` 命令行、Codex `[mcp_servers.*]` TOML 片段
 - 应用内更新：设置页一键检查 / 下载 / 安装 GitHub Releases 最新版本（minisign 签名校验，重启生效）
 - 请求日志（仅元数据）与用量统计可视化（recharts 堆叠柱状图，近 7/30/90 天；可配保留天数/行数上限）
+- **可观测与排障**：日志详情（入站协议 / 路由 / 供应商 / 模型 / 耗时 / token / 错误）与一键「复制为 cURL」复现（请求体为占位模板，仍不落内容）、`Ctrl+K` 全局命令面板、网关页健康自检横幅、WebDAV 推送差异明细弹窗（远端独有 / 本地独有逐条列出）
 - **UI 2.0**：明暗双主题（跟随系统）、可折叠侧边栏、shadcn/ui 组件体系、表单校验就地展示（react-hook-form + zod）、自绘标题栏 + 窗口毛玻璃特效
 - 安全基线：强制鉴权（常量时间比对）、Host/Origin 校验、CORS 默认拒绝、鉴权失败限速、推送前快照
 
@@ -110,7 +114,7 @@ JAI 当前专注适配两个国产 Agent，协议直通与跨族转换对其透�
 
 接入配置：baseURL `http://127.0.0.1:1314/v1`，API Key 用网关 Key（`sk-jai-*`，见应用「网关」页，同页提供各客户端内置接入示例）。
 
-> 💡 Windows 提示：JAI（reqwest）不读 Windows 系统代理，访问需代理的上游时需以 `HTTPS_PROXY=http://127.0.0.1:7890` 启动，否则对需代理的上游返回 502 `all_providers_failed`。
+> 💡 Windows 提示：JAI（reqwest）不读 Windows 系统代理。需代理访问上游时，优先在设置页「网络代理」填写代理地址（保存后重启网关生效）；也可用环境变量 `HTTPS_PROXY=http://127.0.0.1:7890` 启动，否则对需代理的上游返回 502 `all_providers_failed`。
 
 其他客户端（Claude Code、Codex、Continue 等）经协议直通仍可使用，但不在专属适配范围内。
 
@@ -151,7 +155,7 @@ claude
 }
 ```
 
-接入后 Agent 可查询网关登记的 MCP Server / Skill 台账（五个只读工具）。该服务只提供发现与信息，不代执行工具。
+接入后 Agent 可查询网关登记的 MCP Server / Skill 台账（五个只读工具）。开启「代理执行」的 Server，其工具会以 `<server>__<tool>` 出现在工具列表中、由 Agent 主动调用并经网关转发到真实 Server；启用技能可用 `skill__<name>` 拉取全文。网关只做发现与转发，不注入对话链路。
 
 ## 开发
 
@@ -187,8 +191,11 @@ bash scripts/dev.sh     # 一键启动：Vite + Tauri 桌面壳
 | [docs/需求主文档](docs/) —— 见仓库根《JAI — 桌面 AI API 网关.md》 | 需求全量定义与评审记录 |
 | [docs/design/protocol-ir.md](docs/design/protocol-ir.md) | 协议中间表示、逐字段映射总表、行为规范 |
 | [docs/design/storage-schema.md](docs/design/storage-schema.md) | SQLite 表结构、密钥管理、日志策略 |
+| [docs/design/multimodal-support.md](docs/design/multimodal-support.md) | 图片跨族转换链路与模型输入/输出模态集合 |
 | [docs/design/roadmap.md](docs/design/roadmap.md) | M0–M9 里程碑路线图、稳定性基线 |
 | [docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md](docs/superpowers/specs/2026-08-31-ui-framework-upgrade-design.md) | UI 2.0 设计 spec（阶段 0–6） |
+| [docs/superpowers/specs/2026-09-02-secrets-sqlite-sync-design.md](docs/superpowers/specs/2026-09-02-secrets-sqlite-sync-design.md) | 凭据入库 + 随 WebDAV 同步设计 |
+| [docs/superpowers/specs/2026-09-03-mcp-proxy-skill-delivery-design.md](docs/superpowers/specs/2026-09-03-mcp-proxy-skill-delivery-design.md) | MCP 统一代理 + Skill 投递设计 |
 | [docs/zcode接入.md](docs/zcode接入.md) | zcode 接入 JAI 与 MCP/Skill 加载指南 |
 | [docs/design/release.md](docs/design/release.md) | 签名/公证/更新通道/发布检查单 |
 
