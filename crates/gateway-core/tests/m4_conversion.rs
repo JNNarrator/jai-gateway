@@ -254,7 +254,7 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
                 updated_at: now,
             },
         )?;
-        store::model_upsert(c, pid, model_name, Some(200000), 8192)?;
+        store::model_upsert(c, pid, model_name, Some(200000), 8192, None, None)?;
         Ok::<_, store::StoreError>(())
     })
     .unwrap();

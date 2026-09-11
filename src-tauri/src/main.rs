@@ -473,9 +473,21 @@ async fn provider_discover_models(
         let db = core.db.clone();
         let pid = id.clone();
         let name = m.id.clone();
+        let input_mm = m.input_modalities.clone();
+        let output_mm = m.output_modalities.clone();
         tokio::task::spawn_blocking(move || {
-            db.with(|c| store::model_upsert(c, &pid, &name, Some(ctx_w), out_w))
-                .map_err(|e| e.to_string())
+            db.with(|c| {
+                store::model_upsert(
+                    c,
+                    &pid,
+                    &name,
+                    Some(ctx_w),
+                    out_w,
+                    input_mm.as_deref(),
+                    output_mm.as_deref(),
+                )
+            })
+            .map_err(|e| e.to_string())
         })
         .await
         .map_err(join_err)??;
@@ -570,6 +582,34 @@ async fn model_toggle(
     tokio::task::spawn_blocking(move || {
         db.with(|c| store::model_toggle(c, &model_id, enabled))
             .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
+}
+
+/// 模型级输入/输出模态标注（0010）：`Some([..])` 明确标注，`None` 回到「未知」。
+/// 传空数组亦等价于「未知」（读取侧 parse 归一）——语义见 gateway_core::modality。
+#[tauri::command]
+async fn model_set_modalities(
+    core: State<'_, AppCore>,
+    model_id: String,
+    input_modalities: Option<Vec<gateway_core::modality::Modality>>,
+    output_modalities: Option<Vec<gateway_core::modality::Modality>>,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| {
+            store::model_set_modalities(
+                c,
+                &model_id,
+                input_modalities.as_deref(),
+                output_modalities.as_deref(),
+            )
+        })
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(join_err)??;
@@ -2714,6 +2754,7 @@ fn main() {
             model_set_limits,
             model_set_alias,
             model_toggle,
+            model_set_modalities,
             gateway_key_info,
             gateway_key_reveal,
             gateway_key_regenerate,

@@ -209,7 +209,7 @@ async fn fixture(mode: Mode) -> Fixture {
                 updated_at: now,
             },
         )?;
-        store::model_upsert(c, "p-up", model, Some(128000), 4096)?;
+        store::model_upsert(c, "p-up", model, Some(128000), 4096, None, None)?;
         Ok::<_, store::StoreError>(())
     })
     .unwrap();

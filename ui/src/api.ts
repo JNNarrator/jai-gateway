@@ -9,6 +9,7 @@ import type {
   LogRowView,
   McpServerRow,
   McpTool,
+  Modality,
   ModelRow,
   ProxyConfigDto,
   ProviderDto,
@@ -81,6 +82,14 @@ export const api = {
     invoke<void>("model_set_alias", { input: { modelId, upstreamModelId } }),
   modelToggle: (modelId: string, enabled: boolean) =>
     invoke<void>("model_toggle", { modelId, enabled }),
+  /** 模态标注：数组=明确标注（空数组等价未知），null=回到「未知」
+   *  （后端会把 0009 旧布尔列一并清空，避免幽灵 true） */
+  modelSetModalities: (
+    modelId: string,
+    inputModalities: Modality[] | null,
+    outputModalities: Modality[] | null,
+  ) =>
+    invoke<void>("model_set_modalities", { modelId, inputModalities, outputModalities }),
 
   // 网关密钥
   gatewayKeyInfo: () => invoke<GatewayKeyInfo | null>("gateway_key_info"),

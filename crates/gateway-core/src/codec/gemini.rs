@@ -65,11 +65,21 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
         for b in &m.blocks {
             match b {
                 Block::Text { text } => parts.push(json!({"text": text})),
-                Block::Image { data_base64, .. } => {
-                    // Gemini 需 inlineData（http 图片 URL 在 proxy 层已转 base64）
+                Block::Image {
+                    media_type,
+                    data_base64,
+                    ..
+                } => {
+                    // Gemini 需 inlineData（http 图片 URL 在 proxy 层已转 base64）；
+                    // mimeType 用 IR 真实 media_type，缺失/为空才回落 png
                     if let Some(b64) = data_base64.as_ref() {
+                        let mime = if media_type.is_empty() {
+                            "image/png"
+                        } else {
+                            media_type.as_str()
+                        };
                         parts.push(json!({
-                            "inlineData": {"mimeType": "image/png", "data": b64}
+                            "inlineData": {"mimeType": mime, "data": b64}
                         }));
                     }
                 }
@@ -497,5 +507,40 @@ mod tests {
         );
         assert!(matches!(&evts[1], StreamEvent::ToolCallArgsDelta { .. }));
         assert!(matches!(&evts[2], StreamEvent::ToolCallEnd { .. }));
+    }
+
+    #[test]
+    fn encode_image_uses_real_media_type() {
+        // inlineData 的 mimeType 用 IR 真实 media_type（jpeg 不再被硬编码成 png）
+        let mut req = basic_req();
+        req.messages[0] = CanonMessage {
+            role: Role::User,
+            blocks: vec![
+                Block::Text {
+                    text: "look".into(),
+                },
+                Block::Image {
+                    media_type: "image/jpeg".into(),
+                    data_base64: Some("aGVsbG8=".into()),
+                    url: None,
+                },
+            ],
+        };
+        let v = encode_request(&req).unwrap();
+        let parts = &v["contents"][0]["parts"];
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/jpeg");
+        assert_eq!(parts[1]["inlineData"]["data"], "aGVsbG8=");
+
+        // media_type 为空时回落 png
+        req.messages[0].blocks[1] = Block::Image {
+            media_type: String::new(),
+            data_base64: Some("aGVsbG8=".into()),
+            url: None,
+        };
+        let v = encode_request(&req).unwrap();
+        assert_eq!(
+            v["contents"][0]["parts"][1]["inlineData"]["mimeType"],
+            "image/png"
+        );
     }
 }

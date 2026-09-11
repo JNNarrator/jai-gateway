@@ -34,6 +34,9 @@ export interface ProviderDto {
   hasKey: boolean;
 }
 
+/** 模型模态：输入/输出共用同一枚举，与后端 gateway_core::modality 逐字对齐。 */
+export type Modality = "text" | "image" | "audio" | "video";
+
 export interface ModelRow {
   id: string;
   providerId: string;
@@ -42,6 +45,12 @@ export interface ModelRow {
   contextWindow?: number | null;
   maxOutputTokens: number;
   enabled: boolean;
+  /** 派生视图（后端由 inputModalities 推出，兼容旧口径）：null=未知 */
+  supportsMultimodal: boolean | null;
+  /** 输入模态集合：null=未知/未标注 */
+  inputModalities: Modality[] | null;
+  /** 输出模态集合：null=未知/未标注 */
+  outputModalities: Modality[] | null;
 }
 
 export interface GatewayKeyInfo {

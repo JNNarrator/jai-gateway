@@ -152,7 +152,7 @@ async fn fixture(mode: &'static str) -> Fix {
                 updated_at: now,
             },
         )?;
-        store::model_upsert(c, "p-openai", "gpt-4o", Some(200000), 8192)?;
+        store::model_upsert(c, "p-openai", "gpt-4o", Some(200000), 8192, None, None)?;
         // 按 mode 落代理配置（须在 GatewayCtx::new 之前）
         match mode {
             "proxied" => ProxyConfig {

@@ -656,28 +656,53 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
     for m in &req.messages {
         match m.role {
             Role::User => {
-                // 普通文本（串接）+ tool 结果 → 独立 role=tool 消息
+                // 文本 + 图片同轮时合成一个多模态 content 数组（保块序）；
+                // 纯文本保持 string content（与既有夹具兼容）；tool 结果 → 独立 role=tool 消息
                 let mut text = String::new();
+                let mut parts: Vec<Value> = Vec::new();
+                let mut has_image = false;
                 let mut tool_msgs: Vec<Value> = Vec::new();
                 for b in &m.blocks {
                     match b {
-                        Block::Text { text: t } => text.push_str(t),
-                        Block::Image {
-                            data_base64, url, ..
-                        } => {
-                            // OpenAI 可接受 url 或 base64 data url；目前传 url 优先
-                            if let Some(u) = url {
-                                messages.push(json!({
-                                    "role":"user",
-                                    "content":[{"type":"image_url","image_url":{"url":u}}]
-                                }));
-                            } else if let Some(b64) = data_base64 {
-                                messages.push(json!({
-                                    "role":"user",
-                                    "content":[{"type":"image_url",
-                                        "image_url":{"url": format!("data:image/png;base64,{b64}")}}]
-                                }));
+                        Block::Text { text: t } => {
+                            if has_image {
+                                // 已进入图片模式：文本进 parts，保序
+                                parts.push(json!({"type":"text","text":t}));
+                            } else {
+                                text.push_str(t);
                             }
+                        }
+                        Block::Image {
+                            media_type,
+                            data_base64,
+                            url,
+                        } => {
+                            // 首图出现时把已积累文本转进 parts（保序），此后走多模态数组
+                            if !has_image {
+                                has_image = true;
+                                if !text.is_empty() {
+                                    parts.push(json!({"type":"text","text":text}));
+                                    text = String::new();
+                                }
+                            }
+                            // OpenAI 可接受 url 或 base64 data url；url 优先，
+                            // base64 的 data URL 用 IR 真实 media_type（缺失回落 png）
+                            let url_val = if let Some(u) = url {
+                                Value::String(u.clone())
+                            } else if let Some(b64) = data_base64 {
+                                let mime = if media_type.is_empty() {
+                                    "image/png"
+                                } else {
+                                    media_type.as_str()
+                                };
+                                Value::String(format!("data:{mime};base64,{b64}"))
+                            } else {
+                                continue;
+                            };
+                            parts.push(json!({
+                                "type":"image_url",
+                                "image_url":{"url": url_val}
+                            }));
                         }
                         Block::ToolResult {
                             call_id,
@@ -703,7 +728,14 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
                         _ => {}
                     }
                 }
-                if !text.is_empty() {
+                if has_image {
+                    if !text.is_empty() {
+                        parts.push(json!({"type":"text","text":text}));
+                    }
+                    if !parts.is_empty() {
+                        messages.push(json!({"role":"user","content": Value::Array(parts)}));
+                    }
+                } else if !text.is_empty() {
                     messages.push(json!({"role":"user","content":text}));
                 }
                 messages.extend(tool_msgs);
@@ -1720,5 +1752,119 @@ mod tests {
         assert_eq!(m["reasoning_content"], "thinking hard");
         assert_eq!(m["content"], "answer");
         assert!(m.get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn decode_image_parts_data_url_and_url() {
+        // 入站图片：data URL 拆 base64+media_type；http url 透传占位 png
+        let req = super::decode_request(
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":[
+                {"type":"text","text":"look"},
+                {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,aGVsbG8="}},
+                {"type":"image_url","image_url":{"url":"https://x.com/a.png"}}
+            ]}]}"#,
+        )
+        .unwrap();
+        let blocks = &req.messages[0].blocks;
+        assert_eq!(blocks.len(), 3);
+        match &blocks[1] {
+            IrBlock::Image {
+                media_type,
+                data_base64,
+                url,
+            } => {
+                assert_eq!(media_type, "image/jpeg");
+                assert_eq!(data_base64.as_deref(), Some("aGVsbG8="));
+                assert!(url.is_none());
+            }
+            other => panic!("期望 Image，得到 {other:?}"),
+        }
+        match &blocks[2] {
+            IrBlock::Image { url, .. } => {
+                assert_eq!(url.as_deref(), Some("https://x.com/a.png"));
+            }
+            other => panic!("期望 Image，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_text_and_image_single_message_preserves_media_type() {
+        use crate::codec::ir::{CanonMessage, Role as IrRole, SampleParams, ToolChoice};
+        // 同轮 text+image → 单条 user 消息多模态数组，保块序；
+        // base64 的 data URL 用 IR 真实 media_type（jpeg 不再被硬编码成 png）
+        let req = crate::codec::ir::CanonicalRequest {
+            model: "gpt-4o".into(),
+            system: vec![],
+            messages: vec![CanonMessage {
+                role: IrRole::User,
+                blocks: vec![
+                    IrBlock::Text {
+                        text: "before".into(),
+                    },
+                    IrBlock::Image {
+                        media_type: "image/jpeg".into(),
+                        data_base64: Some("aGVsbG8=".into()),
+                        url: None,
+                    },
+                    IrBlock::Text {
+                        text: "after".into(),
+                    },
+                ],
+            }],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            params: SampleParams::default(),
+            stream: false,
+            extensions: Default::default(),
+        };
+        let v = super::encode_request(&req).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "文本+图片应合为一条 user 消息");
+        assert_eq!(msgs[0]["role"], "user");
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3, "块序应保留 text→image→text");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "before");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/jpeg;base64,aGVsbG8="
+        );
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "after");
+    }
+
+    #[test]
+    fn encode_image_url_priority_and_plain_text_stays_string() {
+        use crate::codec::ir::{CanonMessage, Role as IrRole, SampleParams, ToolChoice};
+        // url 优先于 base64；纯文本消息仍是 string content（兼容旧夹具）
+        let req = crate::codec::ir::CanonicalRequest {
+            model: "gpt-4o".into(),
+            system: vec![],
+            messages: vec![
+                CanonMessage {
+                    role: IrRole::User,
+                    blocks: vec![IrBlock::Image {
+                        media_type: "image/jpeg".into(),
+                        data_base64: Some("aGk=".into()),
+                        url: Some("https://x.com/a.png".into()),
+                    }],
+                },
+                CanonMessage::text(IrRole::User, "plain"),
+            ],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            params: SampleParams::default(),
+            stream: false,
+            extensions: Default::default(),
+        };
+        let v = super::encode_request(&req).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0]["content"][0]["image_url"]["url"], "https://x.com/a.png",
+            "url 优先于 base64"
+        );
+        assert_eq!(msgs[1]["content"], "plain");
     }
 }

@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     updated_at: now,
                 },
             )?;
-            store::model_upsert(c, pid, "deepseek-v4-pro", Some(1_000_000), 8192)?;
+            store::model_upsert(c, pid, "deepseek-v4-pro", Some(1_000_000), 8192, None, None)?;
         }
 
         if let Some(_secret) = env_or("JIYUANLVDONG_API_KEY") {
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )?;
             for model in ["glm-5", "kimi-k2.6"] {
-                store::model_upsert(c, pid, model, Some(200_000), 8192)?;
+                store::model_upsert(c, pid, model, Some(200_000), 8192, None, None)?;
             }
         }
 

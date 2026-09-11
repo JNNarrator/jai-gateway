@@ -10,6 +10,7 @@ pub mod migrations;
 pub mod retention;
 pub mod snapshot;
 
+use crate::modality::{self, Modality};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -132,6 +133,13 @@ pub struct ModelRow {
     pub context_window: Option<i64>,
     pub max_output_tokens: i64,
     pub enabled: bool,
+    /// **派生视图**（非存储真相源）：由 `input_modalities` 是否含 image 推出；
+    /// `input_modalities` 为 NULL（未知）时回落 0009 旧列。
+    pub supports_multimodal: Option<bool>,
+    /// 输入模态集合（0010 起的能力真相源）：None = 未知/未标注。
+    pub input_modalities: Option<Vec<Modality>>,
+    /// 输出模态集合：None = 未知/未标注。
+    pub output_modalities: Option<Vec<Modality>>,
 }
 
 // ================================================================ providers
@@ -159,6 +167,9 @@ fn row_to_provider(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
 }
 
 fn row_to_model(r: &rusqlite::Row) -> rusqlite::Result<ModelRow> {
+    let legacy = r.get::<_, Option<i64>>(7)?.map(|v| v != 0);
+    let input_modalities = modality::parse_opt(r.get::<_, Option<String>>(8)?.as_deref());
+    let output_modalities = modality::parse_opt(r.get::<_, Option<String>>(9)?.as_deref());
     Ok(ModelRow {
         id: r.get(0)?,
         provider_id: r.get(1)?,
@@ -167,6 +178,13 @@ fn row_to_model(r: &rusqlite::Row) -> rusqlite::Result<ModelRow> {
         context_window: r.get(4)?,
         max_output_tokens: r.get(5)?,
         enabled: r.get::<_, i64>(6)? != 0,
+        // 派生：集合优先，缺失时才回落旧列（避免「幽灵 true」）
+        supports_multimodal: modality::derive_supports_multimodal(
+            input_modalities.as_deref(),
+            legacy,
+        ),
+        input_modalities,
+        output_modalities,
     })
 }
 
@@ -325,30 +343,43 @@ pub fn provider_delete(c: &Connection, id: &str) -> Result<usize, StoreError> {
 
 // ================================================================ models
 
-const MODEL_COLS: &str =
-    "id,provider_id,model_name,upstream_model_id,context_window,max_output_tokens,enabled";
+const MODEL_COLS: &str = "id,provider_id,model_name,upstream_model_id,context_window,max_output_tokens,enabled,supports_multimodal,input_modalities,output_modalities";
 
+/// Upsert 模型行（0010：入参为输入/输出模态集合，取代 0009 的 vision 布尔）。
+///
+/// 语义：新行走 INSERT 直写；冲突时逐列 `COALESCE(excluded, models)` —— 入站为
+/// NULL（未知）不覆盖已有标注（保护用户手动标注），仅显式解析值才回填。
+/// 旧 `supports_multimodal` 列同步写为**派生值**，与读取侧派生规则一致。
 pub fn model_upsert(
     c: &Connection,
     provider_id: &str,
     model_name: &str,
     context_window: Option<i64>,
     max_output_tokens: i64,
+    input_modalities: Option<&[Modality]>,
+    output_modalities: Option<&[Modality]>,
 ) -> Result<(), StoreError> {
     let id = uuid::Uuid::now_v7().to_string();
+    let derived = modality::derive_supports_multimodal(input_modalities, None);
     c.execute(
         &format!(
-            "INSERT INTO models({MODEL_COLS}) VALUES (?1,?2,?3,NULL,?4,?5,1)
+            "INSERT INTO models({MODEL_COLS}) VALUES (?1,?2,?3,NULL,?4,?5,1,?6,?7,?8)
              ON CONFLICT(provider_id, model_name) DO UPDATE SET
                context_window=excluded.context_window,
-               max_output_tokens=excluded.max_output_tokens"
+               max_output_tokens=excluded.max_output_tokens,
+               supports_multimodal=COALESCE(excluded.supports_multimodal, models.supports_multimodal),
+               input_modalities=COALESCE(excluded.input_modalities, models.input_modalities),
+               output_modalities=COALESCE(excluded.output_modalities, models.output_modalities)"
         ),
         params![
             id,
             provider_id,
             model_name,
             context_window,
-            max_output_tokens
+            max_output_tokens,
+            derived.map(|b| b as i64),
+            input_modalities.map(modality::encode),
+            output_modalities.map(modality::encode)
         ],
     )?;
     Ok(())
@@ -399,6 +430,26 @@ pub fn model_toggle(c: &Connection, model_id: &str, enabled: bool) -> Result<(),
     c.execute(
         "UPDATE models SET enabled=?1 WHERE id=?2",
         params![enabled as i64, model_id],
+    )?;
+    Ok(())
+}
+
+/// 模型级模态集合的手动标注（UI 用户优先，可覆盖发现值）。
+/// `None` 表示回到「未知」（清除标注）。同时把 0009 旧列一并置 NULL ——
+/// 否则旧列的 `true` 会在集合被清空后变成「幽灵 true」。
+pub fn model_set_modalities(
+    c: &Connection,
+    model_id: &str,
+    input_modalities: Option<&[Modality]>,
+    output_modalities: Option<&[Modality]>,
+) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE models SET input_modalities=?1, output_modalities=?2, supports_multimodal=NULL WHERE id=?3",
+        params![
+            input_modalities.map(modality::encode),
+            output_modalities.map(modality::encode),
+            model_id
+        ],
     )?;
     Ok(())
 }

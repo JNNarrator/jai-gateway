@@ -32,6 +32,14 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0008_proxy_call_logs",
         include_str!("migrations/0008_proxy_call_logs.sql"),
     ),
+    (
+        "0009_model_support",
+        include_str!("migrations/0009_model_support.sql"),
+    ),
+    (
+        "0010_model_modalities",
+        include_str!("migrations/0010_model_modalities.sql"),
+    ),
 ];
 
 #[cfg(test)]

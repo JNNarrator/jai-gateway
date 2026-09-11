@@ -126,7 +126,15 @@ async fn fixture(upstream_status: u16) -> Fixture {
                 updated_at: now,
             },
         )?;
-        store::model_upsert(c, "p-claude", "claude-sonnet-4", Some(200000), 8192)?;
+        store::model_upsert(
+            c,
+            "p-claude",
+            "claude-sonnet-4",
+            Some(200000),
+            8192,
+            None,
+            None,
+        )?;
         Ok::<_, store::StoreError>(())
     })
     .unwrap();

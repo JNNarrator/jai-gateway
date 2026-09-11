@@ -477,31 +477,44 @@ fn provider_mark_fail(db: &Db, pid: &str, msg: &str) {
 
 // ---------------------------------------------------------------- handlers
 
+/// GET /v1/models 查询行：(模型名, 供应商名, 上下文窗口, 旧 vision 列, 输入模态串, 输出模态串)。
+type ModelListRow = (
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
 /// GET /v1/models —— 数据库内启用模型的去重聚合输出。
 pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
     let list = {
         let db = ctx.db.clone();
         tokio::task::spawn_blocking(move || {
-            db.with(
-                |c| -> Result<Vec<(String, String, Option<i64>)>, store::StoreError> {
-                    let mut stmt = c.prepare(
-                        "SELECT m.model_name, p.name, m.context_window FROM models m \
-                     JOIN providers p ON p.id=m.provider_id \
-                     WHERE m.enabled=1 AND p.enabled=1 \
-                     ORDER BY p.priority ASC, m.rowid ASC",
-                    )?;
-                    let rows = stmt
-                        .query_map([], |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, String>(1)?,
-                                r.get::<_, Option<i64>>(2)?,
-                            ))
-                        })?
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(rows)
-                },
-            )
+            db.with(|c| -> Result<Vec<ModelListRow>, store::StoreError> {
+                let mut stmt = c.prepare(
+                    "SELECT m.model_name, p.name, m.context_window, m.supports_multimodal, \
+                            m.input_modalities, m.output_modalities \
+                      FROM models m \
+                      JOIN providers p ON p.id=m.provider_id \
+                      WHERE m.enabled=1 AND p.enabled=1 \
+                      ORDER BY p.priority ASC, m.rowid ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                            r.get::<_, Option<i64>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
         })
         .await
     };
@@ -510,16 +523,27 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
         Ok(Ok(rows)) => {
             let mut seen = std::collections::HashSet::new();
             rows.into_iter()
-                .filter(|(id, owner, _ctx)| seen.insert(format!("{owner}/{id}")))
-                .map(|(id, owner, ctx)| {
+                .filter(|(id, owner, _ctx, _l, _i, _o)| seen.insert(format!("{owner}/{id}")))
+                .map(|(id, owner, ctx, legacy, input_raw, output_raw)| {
                     // context_window 为 NULL 时给保守默认 128k（与 schema 注释/UI 编辑页一致），
                     // 供客户端模型目录解析模型上下文窗口、计算 ctx 占用百分比。
                     let context_window = ctx.unwrap_or(128_000);
+                    let input = crate::modality::parse_opt(input_raw.as_deref());
+                    let output = crate::modality::parse_opt(output_raw.as_deref());
+                    // supportsMultimodal 自 0010 起降为**派生视图**：集合优先、缺失回落旧列。
+                    let supports_multimodal = crate::modality::derive_supports_multimodal(
+                        input.as_deref(),
+                        legacy.map(|v| v != 0),
+                    );
+                    // 仅追加字段，旧客户端不受影响：contextWindow / supportsMultimodal 语义未变。
                     json!({
                         "id": format!("{owner}/{id}"),
                         "object": "model",
                         "owned_by": owner,
                         "contextWindow": context_window,
+                        "supportsMultimodal": supports_multimodal,
+                        "inputModalities": input,
+                        "outputModalities": output,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -2488,8 +2512,8 @@ mod tests {
                 },
             )?;
             // 显式窗口 + NULL（回落 128k）两类都要覆盖
-            store::model_upsert(c, "p1", "alpha", Some(65536), 8192)?;
-            store::model_upsert(c, "p1", "beta", None, 4096)?;
+            store::model_upsert(c, "p1", "alpha", Some(65536), 8192, None, None)?;
+            store::model_upsert(c, "p1", "beta", None, 4096, None, None)?;
             Ok(())
         })
         .expect("seed 失败");
@@ -2520,5 +2544,156 @@ mod tests {
             beta["contextWindow"], 128000,
             "context_window 为 NULL 时应给保守默认 128k"
         );
+    }
+
+    #[tokio::test]
+    async fn models_list_exposes_supports_multimodal() {
+        let db = Db::in_memory().unwrap();
+        db.with(|c| {
+            let now = store::now_ms();
+            store::provider_insert(
+                c,
+                &store::ProviderRow {
+                    id: "p1".into(),
+                    name: "prov".into(),
+                    base_url: "http://x".into(),
+                    family: "openai_compat".into(),
+                    enabled: true,
+                    priority: 1,
+                    weight: 1,
+                    extra_headers: None,
+                    api_key: None,
+                    website: None,
+                    last_ok_at: None,
+                    last_err_at: None,
+                    last_err_msg: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )?;
+            // 模态集合三种情形：文本+图像 / 纯文本 / 未知（null）
+            store::model_upsert(
+                c,
+                "p1",
+                "vision-model",
+                Some(128000),
+                8192,
+                Some(&[
+                    crate::modality::Modality::Text,
+                    crate::modality::Modality::Image,
+                ]),
+                Some(&[crate::modality::Modality::Text]),
+            )?;
+            store::model_upsert(
+                c,
+                "p1",
+                "text-only",
+                Some(128000),
+                8192,
+                Some(&[crate::modality::Modality::Text]),
+                None,
+            )?;
+            store::model_upsert(c, "p1", "unknown", Some(128000), 8192, None, None)?;
+            Ok(())
+        })
+        .expect("seed 失败");
+
+        let dir =
+            std::env::temp_dir().join(format!("jai-models-mm-test-{}", rand::random::<u32>()));
+        let log_path = dir.join("main.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (logs, _t) = crate::store::logs::spawn_logger(log_path.to_str().unwrap()).unwrap();
+        let ctx = GatewayCtx::new(db.clone(), logs);
+
+        let resp = models_list(State(ctx)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let data = v["data"].as_array().unwrap();
+        assert_eq!(data.len(), 3);
+        let find = |name: &str| {
+            data.iter()
+                .find(|m| m["id"] == format!("prov/{name}"))
+                .unwrap_or_else(|| panic!("{name} 模型应存在"))
+        };
+        assert_eq!(find("vision-model")["supportsMultimodal"], true);
+        assert_eq!(
+            find("vision-model")["inputModalities"],
+            serde_json::json!(["text", "image"]),
+            "0010：出站追加输入模态集合"
+        );
+        assert_eq!(
+            find("vision-model")["outputModalities"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(find("text-only")["supportsMultimodal"], false);
+        assert_eq!(
+            find("text-only")["inputModalities"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(find("text-only")["outputModalities"], Value::Null);
+        assert_eq!(
+            find("unknown")["supportsMultimodal"],
+            Value::Null,
+            "未标注应输出 null（未知），不做臆断"
+        );
+        assert_eq!(find("unknown")["inputModalities"], Value::Null);
+    }
+
+    #[test]
+    fn model_modalities_upsert_coalesce_and_manual_override() {
+        // 0010 语义：NULL 入站不覆盖已有集合（COALESCE）；手动标注可清除回未知，
+        // 且清除时旧 supports_multimodal 列一并置 NULL（不出现幽灵 true）。
+        use crate::modality::Modality;
+        let db = Db::in_memory().unwrap();
+        db.with(|c| {
+            let now = store::now_ms();
+            store::provider_insert(
+                c,
+                &store::ProviderRow {
+                    id: "p1".into(),
+                    name: "prov".into(),
+                    base_url: "http://x".into(),
+                    family: "openai_compat".into(),
+                    enabled: true,
+                    priority: 1,
+                    weight: 1,
+                    extra_headers: None,
+                    api_key: None,
+                    website: None,
+                    last_ok_at: None,
+                    last_err_at: None,
+                    last_err_msg: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )?;
+            let vision = [Modality::Text, Modality::Image];
+            store::model_upsert(c, "p1", "m1", Some(128000), 8192, Some(&vision), None)?;
+            // 未知（None）再次 upsert 不覆盖已有集合
+            store::model_upsert(c, "p1", "m1", Some(128000), 8192, None, None)?;
+            let row = store::model_get_by_provider_name(c, "p1", "m1")
+                .unwrap()
+                .expect("模型应存在");
+            assert_eq!(row.input_modalities.as_deref(), Some(&vision[..]));
+            assert_eq!(row.supports_multimodal, Some(true));
+
+            // 手动覆盖：文本+图像 → 纯文本 → 未知
+            let text_only = [Modality::Text];
+            store::model_set_modalities(c, &row.id, Some(&text_only), None)?;
+            let row = store::model_get_by_provider_name(c, "p1", "m1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.supports_multimodal, Some(false));
+            store::model_set_modalities(c, &row.id, None, None)?;
+            let row = store::model_get_by_provider_name(c, "p1", "m1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.supports_multimodal, None, "None = 回到未知");
+            assert_eq!(row.input_modalities, None);
+            Ok(())
+        })
+        .expect("model_modalities_upsert_coalesce_and_manual_override 失败");
     }
 }

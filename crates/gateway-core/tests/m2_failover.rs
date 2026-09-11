@@ -113,8 +113,8 @@ async fn fixture(priority_a: i64, priority_b: i64, status_a: u16, status_b: u16)
     db.with(|c| {
         store::provider_insert(c, &prow("A", priority_a, port_a))?;
         store::provider_insert(c, &prow("B", priority_b, port_b))?;
-        store::model_upsert(c, "p-A", "m-test", Some(128000), 4096)?;
-        store::model_upsert(c, "p-B", "m-test", Some(128000), 4096)?;
+        store::model_upsert(c, "p-A", "m-test", Some(128000), 4096, None, None)?;
+        store::model_upsert(c, "p-B", "m-test", Some(128000), 4096, None, None)?;
         Ok::<_, store::StoreError>(())
     })
     .unwrap();

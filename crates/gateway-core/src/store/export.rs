@@ -106,6 +106,17 @@ mod tests {
     fn export_contains_only_expected_content() {
         let conn = open_and_migrate(":memory:").unwrap();
         seed(&conn);
+        // 模态集合随快照导出（0010）
+        super::super::model_set_modalities(
+            &conn,
+            "m1",
+            Some(&[
+                crate::modality::Modality::Text,
+                crate::modality::Modality::Image,
+            ]),
+            Some(&[crate::modality::Modality::Text]),
+        )
+        .unwrap();
         let s = build_export_json(&conn).unwrap();
 
         let v: Value = serde_json::from_str(&s).unwrap();
@@ -119,6 +130,10 @@ mod tests {
             "无凭据不带 api_key 字段"
         );
         assert_eq!(v["models"][0]["modelName"], "gpt-4o");
+        assert_eq!(
+            v["models"][0]["supportsMultimodal"], true,
+            "多模态标注应随导出快照携带"
+        );
         assert_eq!(v["gateway_key"], "sk-jai-secretvalue");
         // webdav_password 随 meta 全量导出
         let meta = v["meta"].as_array().unwrap();

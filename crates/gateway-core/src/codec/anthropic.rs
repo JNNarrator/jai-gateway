@@ -786,6 +786,38 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                         });
                                     }
                                 }
+                                Some("image") => {
+                                    // 图片块（Claude Code 等客户端）：base64 内联或 http url；
+                                    // 未知 source 类型 Lenient 丢弃
+                                    let source = p.get("source");
+                                    let stype = source
+                                        .and_then(|s| s.get("type"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
+                                    match stype {
+                                        "base64" => blocks.push(Block::Image {
+                                            media_type: source
+                                                .and_then(|s| s.get("media_type"))
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("image/png")
+                                                .to_string(),
+                                            data_base64: source
+                                                .and_then(|s| s.get("data"))
+                                                .and_then(Value::as_str)
+                                                .map(str::to_string),
+                                            url: None,
+                                        }),
+                                        "url" => blocks.push(Block::Image {
+                                            media_type: "image/png".into(),
+                                            data_base64: None,
+                                            url: source
+                                                .and_then(|s| s.get("url"))
+                                                .and_then(Value::as_str)
+                                                .map(str::to_string),
+                                        }),
+                                        _ => {}
+                                    }
+                                }
                                 Some("tool_use") => {
                                     // 历史工具调用 id 同样反解：与回传的 tool_result
                                     // 保持同一把键（转 OpenAI 上游时二者必须匹配）
@@ -1235,6 +1267,58 @@ mod m5_tests {
             Block::ToolResult { call_id, content, .. }
                 if call_id == "x" && content[0].as_text() == Some("sunny")
         ));
+    }
+
+    #[test]
+    fn decode_anthropic_image_base64_and_url() {
+        // 入站 image 块：base64 内联 + http url 两种 source 都要还原为 IR Block::Image
+        let body = br#"{
+            "model":"claude-sonnet-4",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"what is in this picture?"},
+                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"aGVsbG8="}},
+                {"type":"image","source":{"type":"url","url":"https://x.com/a.png"}}
+            ]}]
+        }"#;
+        let req = decode_request(body).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        let blocks = &req.messages[0].blocks;
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], Block::Text { text } if text == "what is in this picture?"));
+        match &blocks[1] {
+            Block::Image {
+                media_type,
+                data_base64,
+                url,
+            } => {
+                assert_eq!(media_type, "image/jpeg", "base64 source 保留 media_type");
+                assert_eq!(data_base64.as_deref(), Some("aGVsbG8="));
+                assert!(url.is_none());
+            }
+            other => panic!("blocks[1] 应为 Image 块: {other:?}"),
+        }
+        match &blocks[2] {
+            Block::Image {
+                data_base64, url, ..
+            } => {
+                assert!(data_base64.is_none());
+                assert_eq!(url.as_deref(), Some("https://x.com/a.png"));
+            }
+            other => panic!("blocks[2] 应为 Image 块: {other:?}"),
+        }
+
+        // 未知 source 类型：Lenient 丢弃，不报错（无块消息随后被规范化过滤）
+        let bad = br#"{
+            "model":"m",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"keep"},
+                {"type":"image","source":{"type":"gcs","gcs_uri":"gs://b/x"}}
+            ]}]
+        }"#;
+        let req = decode_request(bad).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].blocks.len(), 1, "未知 source 块应丢弃");
+        assert!(matches!(&req.messages[0].blocks[0], Block::Text { text } if text == "keep"));
     }
 
     #[test]

@@ -8,6 +8,8 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::modality::Modality;
+
 use super::{
     gw_key_active, gw_key_rotate, meta_set, model_upsert, provider_get_by_name_base,
     provider_insert, provider_set_api_key, provider_set_website, provider_update_fields,
@@ -231,8 +233,31 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
             .and_then(Value::as_i64)
             .unwrap_or(4096);
         let enabled = m.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-        model_upsert(c, local_id, model_name, context_window, max_output_tokens)
-            .map_err(|e| e.to_string())?;
+        // 模态集合随导出快照携带（0010）；缺省 None 不覆盖本地已有标注。
+        // 老快照（0009 期）只有 supportsMultimodal 布尔 → 回填为等价模态集合：
+        // true ⇒ 文本+图像，false ⇒ 仅文本。
+        let legacy_bool = m.get("supportsMultimodal").and_then(Value::as_bool);
+        let input_modalities = m
+            .get("inputModalities")
+            .and_then(crate::modality::from_json_array)
+            .or_else(|| match legacy_bool {
+                Some(true) => Some(vec![Modality::Text, Modality::Image]),
+                Some(false) => Some(vec![Modality::Text]),
+                None => None,
+            });
+        let output_modalities = m
+            .get("outputModalities")
+            .and_then(crate::modality::from_json_array);
+        model_upsert(
+            c,
+            local_id,
+            model_name,
+            context_window,
+            max_output_tokens,
+            input_modalities.as_deref(),
+            output_modalities.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         if !enabled {
             if let Ok(Some(model_row)) = super::model_get_by_provider_name(c, local_id, model_name)
             {

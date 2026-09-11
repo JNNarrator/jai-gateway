@@ -88,7 +88,7 @@ async fn legacy_completions_passthrough() {
                 updated_at: now,
             },
         )?;
-        store::model_upsert(c, pid, model, Some(8192), 2048)?;
+        store::model_upsert(c, pid, model, Some(8192), 2048, None, None)?;
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
