@@ -11,6 +11,7 @@ import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogFooter,
   DialogHeader,
@@ -360,36 +361,39 @@ function SkillDialog({
         <DialogHeader>
           <DialogTitle>{initial ? `编辑「${initial.name}」` : "添加技能"}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-4">
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">名称</label>
-            <Input
-              value={name}
-              onChange={(e) => {
-                setName(e.target.value);
-                setNameErr("");
-              }}
-            />
-            {nameErr && (
-              <p className="text-xs text-destructive" role="alert">
-                {nameErr}
-              </p>
-            )}
+        <DialogBody>
+          <div className="space-y-4">
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">名称</label>
+              <Input
+                value={name}
+                onChange={(e) => {
+                  setName(e.target.value);
+                  setNameErr("");
+                }}
+              />
+              {nameErr && (
+                <p className="text-xs text-destructive" role="alert">
+                  {nameErr}
+                </p>
+              )}
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">描述</label>
+              <Input value={description} onChange={(e) => setDescription(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">内容/指令</label>
+              <Textarea
+                className="h-32 font-mono text-xs"
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+              />
+            </div>
           </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">描述</label>
-            <Input value={description} onChange={(e) => setDescription(e.target.value)} />
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">内容/指令</label>
-            <Textarea
-              className="h-32 font-mono text-xs"
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-            />
-          </div>
-        </div>
-        <DialogFooter className="gap-2">
+                </DialogBody>
+
+<DialogFooter className="gap-2">
           <Button onClick={() => void submit()}>{initial ? "保存" : "创建"}</Button>
           <Button variant="ghost" onClick={onClose}>
             取消

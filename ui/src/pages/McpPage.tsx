@@ -13,6 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -322,22 +323,25 @@ function McpImportDialog({
             {` [mcp_servers.名称] command = "..." / url = "..."`}
           </DialogDescription>
         </DialogHeader>
-        <textarea
-          className="min-h-[160px] w-full resize-y rounded-md border bg-transparent px-3 py-2 font-mono text-xs text-foreground placeholder:text-muted-foreground"
-          value={text}
-          onChange={(e) => {
-            setText(e.target.value);
-            setLocalErr("");
-          }}
-          placeholder={'codex mcp add my-server --env "KEY=value" -- "C:\\path\\to\\mcp.cmd"'}
-          spellCheck={false}
-        />
-        {localErr && (
-          <p className="text-xs text-destructive" role="alert">
-            {localErr}
-          </p>
-        )}
-        <DialogFooter className="gap-2">
+        <DialogBody>
+          <textarea
+            className="min-h-[160px] w-full resize-y rounded-md border bg-transparent px-3 py-2 font-mono text-xs text-foreground placeholder:text-muted-foreground"
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value);
+              setLocalErr("");
+            }}
+            placeholder={'codex mcp add my-server --env "KEY=value" -- "C:\\path\\to\\mcp.cmd"'}
+            spellCheck={false}
+          />
+          {localErr && (
+            <p className="text-xs text-destructive" role="alert">
+              {localErr}
+            </p>
+          )}
+                </DialogBody>
+
+<DialogFooter className="gap-2">
           <Button
             type="button"
             variant="outline"
@@ -445,88 +449,91 @@ function McpDialog({
             stdio 类型由网关拉起子进程；sse / http 走远程 URL。
           </DialogDescription>
         </DialogHeader>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">名称</label>
-            <Input value={name} onChange={(e) => { setName(e.target.value); setNameErr(""); }} />
-            {nameErr && (
-              <p className="text-xs text-destructive" role="alert">
-                {nameErr}
-              </p>
-            )}
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">类型</label>
-            <Select value={kind} onValueChange={setKind}>
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="stdio">stdio</SelectItem>
-                <SelectItem value="sse">sse</SelectItem>
-                <SelectItem value="http">http</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          {kind === "stdio" ? (
-            <>
-              <div className="space-y-1.5">
-                <label className="text-sm font-medium">命令</label>
+        <DialogBody>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">名称</label>
+              <Input value={name} onChange={(e) => { setName(e.target.value); setNameErr(""); }} />
+              {nameErr && (
+                <p className="text-xs text-destructive" role="alert">
+                  {nameErr}
+                </p>
+              )}
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">类型</label>
+              <Select value={kind} onValueChange={setKind}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="stdio">stdio</SelectItem>
+                  <SelectItem value="sse">sse</SelectItem>
+                  <SelectItem value="http">http</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {kind === "stdio" ? (
+              <>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">命令</label>
+                  <Input
+                    className="font-mono"
+                    value={command}
+                    onChange={(e) => setCommand(e.target.value)}
+                    placeholder="npx / node / python"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-sm font-medium">参数（JSON 数组）</label>
+                  <Input
+                    className={cn("font-mono", argsErr && "border-destructive")}
+                    value={args}
+                    onChange={(e) => {
+                      setArgs(e.target.value);
+                      setArgsErr("");
+                    }}
+                    placeholder='["-y","@modelcontextprotocol/server-filesystem"]'
+                  />
+                  {argsErr && (
+                    <p className="text-xs text-destructive" role="alert">
+                      {argsErr}
+                    </p>
+                  )}
+                </div>
+                <div className="space-y-1.5 md:col-span-2">
+                  <label className="text-sm font-medium">环境变量（JSON 对象，可选）</label>
+                  <Input
+                    className={cn("font-mono", envErr && "border-destructive")}
+                    value={env}
+                    onChange={(e) => {
+                      setEnv(e.target.value);
+                      setEnvErr("");
+                    }}
+                    placeholder='{"API_KEY":"xxx"}'
+                  />
+                  {envErr && (
+                    <p className="text-xs text-destructive" role="alert">
+                      {envErr}
+                    </p>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="space-y-1.5 md:col-span-2">
+                <label className="text-sm font-medium">URL</label>
                 <Input
                   className="font-mono"
-                  value={command}
-                  onChange={(e) => setCommand(e.target.value)}
-                  placeholder="npx / node / python"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder="https://mcp.example.com/sse"
                 />
               </div>
-              <div className="space-y-1.5">
-                <label className="text-sm font-medium">参数（JSON 数组）</label>
-                <Input
-                  className={cn("font-mono", argsErr && "border-destructive")}
-                  value={args}
-                  onChange={(e) => {
-                    setArgs(e.target.value);
-                    setArgsErr("");
-                  }}
-                  placeholder='["-y","@modelcontextprotocol/server-filesystem"]'
-                />
-                {argsErr && (
-                  <p className="text-xs text-destructive" role="alert">
-                    {argsErr}
-                  </p>
-                )}
-              </div>
-              <div className="space-y-1.5 md:col-span-2">
-                <label className="text-sm font-medium">环境变量（JSON 对象，可选）</label>
-                <Input
-                  className={cn("font-mono", envErr && "border-destructive")}
-                  value={env}
-                  onChange={(e) => {
-                    setEnv(e.target.value);
-                    setEnvErr("");
-                  }}
-                  placeholder='{"API_KEY":"xxx"}'
-                />
-                {envErr && (
-                  <p className="text-xs text-destructive" role="alert">
-                    {envErr}
-                  </p>
-                )}
-              </div>
-            </>
-          ) : (
-            <div className="space-y-1.5 md:col-span-2">
-              <label className="text-sm font-medium">URL</label>
-              <Input
-                className="font-mono"
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                placeholder="https://mcp.example.com/sse"
-              />
-            </div>
-          )}
-        </div>
-        <DialogFooter className="gap-2">
+            )}
+          </div>
+                </DialogBody>
+
+<DialogFooter className="gap-2">
           <Button onClick={() => void submit()}>{initial ? "保存" : "创建"}</Button>
           <Button variant="ghost" onClick={onClose}>
             取消

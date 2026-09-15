@@ -31,6 +31,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogBody,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -505,7 +506,7 @@ function ProviderDialog({
 
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>
             {mode === "create" ? "添加供应商" : `编辑「${p?.name}」`}
@@ -517,170 +518,177 @@ function ProviderDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <form className="space-y-4" onSubmit={(e) => void submit(e)}>
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <FormField label="名称" htmlFor="pf-name" error={errors.name?.message}>
-              <Input id="pf-name" placeholder="官方 / 某中转…" {...register("name")} />
-            </FormField>
-            <FormField
-              label="协议族"
-              htmlFor="pf-family"
-              error={errors.family?.message}
-              hint={mode === "edit" ? "协议族创建后不可修改" : undefined}
-            >
-              <Select
-                value={watch("family")}
-                disabled={mode === "edit"}
-                onValueChange={(v) => {
-                  setValue("family", v as FormValues["family"], {
-                    shouldValidate: true,
-                  });
-                }}
+        <form
+          className="flex min-h-0 flex-1 flex-col gap-4"
+          onSubmit={(e) => void submit(e)}
+        >
+          <DialogBody className="space-y-4">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <FormField label="名称" htmlFor="pf-name" error={errors.name?.message}>
+                <Input id="pf-name" placeholder="官方 / 某中转…" {...register("name")} />
+              </FormField>
+              <FormField
+                label="协议族"
+                htmlFor="pf-family"
+                error={errors.family?.message}
+                hint={mode === "edit" ? "协议族创建后不可修改" : undefined}
               >
-                <SelectTrigger id="pf-family" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {FAMILY_OPTIONS.map((o) => (
-                    <SelectItem key={o.value} value={o.value}>
-                      {o.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                <Select
+                  value={watch("family")}
+                  disabled={mode === "edit"}
+                  onValueChange={(v) => {
+                    setValue("family", v as FormValues["family"], {
+                      shouldValidate: true,
+                    });
+                  }}
+                >
+                  <SelectTrigger id="pf-family" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {FAMILY_OPTIONS.map((o) => (
+                      <SelectItem key={o.value} value={o.value}>
+                        {o.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </FormField>
+            </div>
+
+            <FormField
+              label="Base URL"
+              htmlFor="pf-url"
+              error={errors.baseUrl?.message}
+              hint={meta.hint}
+            >
+              <Input
+                id="pf-url"
+                placeholder={meta.placeholder}
+                {...register("baseUrl")}
+              />
             </FormField>
-          </div>
 
-          <FormField
-            label="Base URL"
-            htmlFor="pf-url"
-            error={errors.baseUrl?.message}
-            hint={meta.hint}
-          >
-            <Input
-              id="pf-url"
-              placeholder={meta.placeholder}
-              {...register("baseUrl")}
-            />
-          </FormField>
+            <FormField
+              label="官网（可选）"
+              htmlFor="pf-website"
+              error={errors.website?.message}
+            >
+              <Input
+                id="pf-website"
+                placeholder="https://provider.example.com"
+                {...register("website")}
+              />
+            </FormField>
 
-          <FormField
-            label="官网（可选）"
-            htmlFor="pf-website"
-            error={errors.website?.message}
-          >
-            <Input
-              id="pf-website"
-              placeholder="https://provider.example.com"
-              {...register("website")}
-            />
-          </FormField>
+            <FormField
+              label="API Key"
+              htmlFor="pf-key"
+              error={errors.apiKey?.message}
+              labelExtra={
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  onClick={() => setEnvOpen(true)}
+                >
+                  从环境变量导入
+                </Button>
+              }
+            >
+              <Input
+                id="pf-key"
+                type="password"
+                placeholder={mode === "edit" ? (p?.hasKey ? "•••• 已保存" : "尚未录入") : ""}
+                {...register("apiKey")}
+              />
+            </FormField>
 
-          <FormField
-            label="API Key"
-            htmlFor="pf-key"
-            error={errors.apiKey?.message}
-            labelExtra={
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <FormField
+                label="路由优先级（数字越小越优先）"
+                htmlFor="pf-priority"
+                error={errors.priority?.message}
+              >
+                <Input
+                  id="pf-priority"
+                  type="number"
+                  {...register("priority", { valueAsNumber: true })}
+                />
+              </FormField>
+              <FormField
+                label="权重（同优先级按比例分发）"
+                htmlFor="pf-weight"
+                error={errors.weight?.message}
+              >
+                <Input
+                  id="pf-weight"
+                  type="number"
+                  {...register("weight", { valueAsNumber: true })}
+                />
+              </FormField>
+            </div>
+
+            <div className="space-y-2">
+              <div className="text-sm font-medium">追加请求头（可选）</div>
+              {fields.map((f, i) => (
+                <div key={f.id} className="space-y-1">
+                  <div className="flex gap-2">
+                    <Input
+                      placeholder="Header 名，如 HTTP-Referer"
+                      {...register(`extraHeaders.${i}.key` as const)}
+                    />
+                    <Input placeholder="值" {...register(`extraHeaders.${i}.value` as const)} />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      className="size-9 shrink-0"
+                      aria-label="删除此行"
+                      onClick={() => remove(i)}
+                    >
+                      <Trash2 className="size-4" aria-hidden />
+                    </Button>
+                  </div>
+                  {errors.extraHeaders?.[i]?.key && (
+                    <p className="text-xs text-destructive" role="alert">
+                      {errors.extraHeaders[i]?.key?.message}
+                    </p>
+                  )}
+                </div>
+              ))}
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
-                className="h-6 px-2 text-xs"
-                onClick={() => setEnvOpen(true)}
+                onClick={() => append({ key: "", value: "" })}
               >
-                从环境变量导入
+                <Plus aria-hidden />
+                添加请求头
               </Button>
-            }
-          >
-            <Input
-              id="pf-key"
-              type="password"
-              placeholder={mode === "edit" ? (p?.hasKey ? "•••• 已保存" : "尚未录入") : ""}
-              {...register("apiKey")}
-            />
-          </FormField>
+            </div>
 
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <FormField
-              label="路由优先级（数字越小越优先）"
-              htmlFor="pf-priority"
-              error={errors.priority?.message}
-            >
-              <Input
-                id="pf-priority"
-                type="number"
-                {...register("priority", { valueAsNumber: true })}
-              />
-            </FormField>
-            <FormField
-              label="权重（同优先级按比例分发）"
-              htmlFor="pf-weight"
-              error={errors.weight?.message}
-            >
-              <Input
-                id="pf-weight"
-                type="number"
-                {...register("weight", { valueAsNumber: true })}
-              />
-            </FormField>
-          </div>
-
-          <div className="space-y-2">
-            <div className="text-sm font-medium">追加请求头（可选）</div>
-            {fields.map((f, i) => (
-              <div key={f.id} className="space-y-1">
-                <div className="flex gap-2">
-                  <Input
-                    placeholder="Header 名，如 HTTP-Referer"
-                    {...register(`extraHeaders.${i}.key` as const)}
-                  />
-                  <Input placeholder="值" {...register(`extraHeaders.${i}.value` as const)} />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    className="size-9 shrink-0"
-                    aria-label="删除此行"
-                    onClick={() => remove(i)}
-                  >
-                    <Trash2 className="size-4" aria-hidden />
-                  </Button>
-                </div>
-                {errors.extraHeaders?.[i]?.key && (
-                  <p className="text-xs text-destructive" role="alert">
-                    {errors.extraHeaders[i]?.key?.message}
-                  </p>
-                )}
+            {formErr && (
+              <div className="text-xs text-destructive" role="alert">
+                {formErr}
               </div>
-            ))}
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => append({ key: "", value: "" })}
-            >
-              <Plus aria-hidden />
-              添加请求头
-            </Button>
-          </div>
+            )}
+            {testMsg && (
+              <div
+                className={cn(
+                  "text-xs",
+                  testMsg.ok ? "text-emerald-600 dark:text-emerald-400" : "text-destructive",
+                )}
+              >
+                {testMsg.text}
+              </div>
+            )}
 
-          {formErr && (
-            <div className="text-xs text-destructive" role="alert">
-              {formErr}
-            </div>
-          )}
-          {testMsg && (
-            <div
-              className={cn(
-                "text-xs",
-                testMsg.ok ? "text-emerald-600 dark:text-emerald-400" : "text-destructive",
-              )}
-            >
-              {testMsg.text}
-            </div>
-          )}
+          </DialogBody>
 
-          <DialogFooter className="gap-2">
+          <DialogFooter className="gap-2 border-t pt-4">
+
             <Button
               type="button"
               variant="outline"
