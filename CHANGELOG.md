@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- **流式 usage 丢失 → 客户端上下文占比恒 0**（dsh-tui 状态栏 `ctx 0/128k 0.0%`，仅部分供应商复现）：
+  - 根因：`codec/openai.rs` 判定 usage 帧时只认「`choices` 为空数组」这一种形状。scnet（超算）的末帧是
+    `{"choices":[{"index":0,"delta":{}}],"usage":{...}}`（choices 非空）→ 整帧被丢弃 → 出站
+    `response.completed.usage` 恒 0 → dsh/pi-ai 的 `tokens.input` 恒 0；tokenrhythm（基元律动）末帧为
+    `"choices":[] + usage`，故一直正常，表现为「换供应商就不统计」
+  - 修复：usage 采集与 choices 形状解耦（带非 null `usage` 的帧一律进 IR，同帧带正文也不吞）；
+    `convert_streaming_response` 把 Finish 挂起到上游 `[DONE]`/EOF 再合并下发，避免「先发零值收尾帧、
+    再补一帧造成重复 completed/message_stop」；落库时零值 Finish 不再覆盖真实 usage
+  - 顺带修：`emit_log` 把 `route_mode` 硬编码为 `"passthrough"`，跨族转换请求也被记成直通
+    （本次排查即被该字段误导）→ 新增 `RouteMode` 枚举 + `emit_log_with`，转换路径 20 处调用点改标 `converted`
+  - 回归：单测 4 例 + 集成用例 `responses_to_openai_stream_usage_split_frames`（按抓包真实帧形状跑完整链路，
+    断言 completed 唯一、`input_tokens 259132`、日志 `route_mode=converted` 与 usage 落库）；两处 A/B 反证会失败
+
 ## [0.1.9] - 2026-09-11
 
 ### Added

@@ -69,6 +69,37 @@
   - 新增单测：`reasoning_content_roundtrip`、`decode_assistant_embedded_function_call`。
   - ✅ curl 实测：纯 MCP 循环（thinking 模型）成功、内嵌格式 + reasoning 回传成功、日志 200。
 
+- [x] 8. dsh-tui 上下文占比统计不出来（走 JAI 网关时 `ctx 0/128k 0.0%`）
+  - 现象：dsh-tui 状态栏 `ctx 0/128k 0.0%`（本机 dsh-tui + JAI，模型 `超算/Qwen3.8-Flash-Event`）；
+    同一网关的 `基元律动/deepseek-flash` 路由显示正常 → 属**按供应商分化**，不是 dsh-tui 侧问题。
+  - 根因：`crates/gateway-core/src/codec/openai.rs` 的 `parse_stream_event` 判定「usage 帧」时只看
+    `choices` 是否为**空数组**。scnet（超算）的末帧形状是
+    `{"choices":[{"index":0,"delta":{}}],"usage":{...}}`（choices 非空、delta 为空），整帧被当普通
+    chunk 丢弃 → IR 只剩 `finish_reason` 帧的零值 Finish → 出站 `response.completed.usage` 恒 0 →
+    dsh/pi-ai 的 `tokens.input` 恒 0 → ctx 占比恒 0。对照 tokenrhythm（基元律动）末帧是
+    `"choices":[] + usage`，所以只有超算路由复现（同一份代码，两种供应商写法）。
+  - 已解决：
+    1. usage 采集与 choices 形状解耦：带非 null `usage` 的帧一律产出 IR Finish（与 content 增量同帧时
+       正文照旧不丢）；
+    2. `convert_streaming_response` 把 Finish **挂起合并**，上游 `[DONE]`/EOF 时一次性下发真实 usage——
+       否则「先 finish_reason 帧、后 usage 帧」会先发一个 usage 全 0 的收尾帧，再补一帧就成了重复的
+       `response.completed` / `message_stop`（挂起点在 `[DONE]` 与 EOF 两处，幂等 take）；
+    3. 落库口径同步：零值 Finish 不再覆盖已采到的真实 usage（防「usage 帧在前、finish_reason 帧在后」）；
+    4. 顺带修 `emit_log` 把 `route_mode` 硬编码成 `"passthrough"` 的问题：跨族转换请求也被记成直通，
+       本次排查正是被日志这个字段误导（新增 `RouteMode` 枚举 + `emit_log_with`，转换路径 20 处调用点改标 converted）。
+  - 验证：
+    - 单测 4 例：非空 choices usage 帧 / 拆帧顺序 / usage 与正文同帧 / `"usage":null` 干扰帧；
+    - 集成用例 `responses_to_openai_stream_usage_split_frames` 按抓包的真实帧形状跑完整链路
+      （客户端 Responses 入站 → 网关 → mock chat 上游）：completed 帧唯一，`input_tokens 259132`、
+      `output_tokens 1805`、`cached_tokens 258944`，且日志 `route_mode=converted`、
+      `usage_input/usage_output` 落库为真值；
+    - 两处 A/B 反证：还原旧 usage 判定 → usage 断言挂；还原硬编码 route_mode → converted 断言挂；
+    - `cargo test -p gateway-core` 全绿（196 单测 + 各集成文件）+ clippy 无告警。
+  - 诊断期证据（可复核）：直连上游 `api.scnet.cn` 的 `/v1/chat/completions`、`/v1/responses` 均返回真实
+    usage；JAI `request_logs` 里超算路由 `usage_input/usage_output` 恒 0、基元律动路由为真实值；
+    dsh 会话日志（`$DSH_HOME/sessions/**/session.v3.jsonl.zstd`）里 `usage` 全 0 而
+    `request/context.contextWindow=128000` 正常（上下文窗口没问题，是占用数字没了）。
+  - 注意：本修复需**重建并重启 JAI** 才生效（线上跑的是旧二进制）；重启前 dsh-tui 仍显示 0%。
 
 ## 2. 优化清单
 

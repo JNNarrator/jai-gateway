@@ -960,23 +960,16 @@ pub fn parse_stream_event(raw: &[u8]) -> Result<Vec<crate::codec::ir::StreamEven
         serde_json::from_slice(raw).map_err(|e| format!("OpenAI SSE JSON 解析失败: {e}"))?;
 
     let mut out = Vec::new();
-    // usage chunk：choices 缺失/非数组，或空数组但带 usage（OpenAI 流式末帧标准形状
-    // "choices":[] + usage；此前漏掉空数组导致跨族转换 usage 恒 0）。
-    let choices_arr = v.get("choices").and_then(Value::as_array);
-    let usage_frame = match choices_arr {
-        Some(arr) => arr.is_empty(),
-        None => true,
-    };
-    if usage_frame {
-        if let Some(u) = v.get("usage") {
-            let usage = parse_usage(Some(u));
-            out.push(StreamEvent::Finish {
-                stop_reason: StopReason::EndTurn,
-                usage,
-            });
-            return Ok(out);
-        }
-    }
+    // usage 的采集与 choices 的形状无关。OpenAI 官方末帧是 `"choices":[] + usage`，
+    // 但 openai_compat 阵营里同样合法的写法还有 `"choices":[{"index":0,"delta":{}}] + usage`
+    // （scnet/超算 gateway）以及 usage 与 content 增量同帧。此前只有 choices 为空/缺失
+    // 才认 usage 帧，非空末帧被当普通 chunk 整帧丢弃 → IR 只收到 finish_reason 那帧的
+    // 零值 Finish → 出站 usage 恒 0，dsh-tui 的上下文占比统计不出来。
+    let frame_usage = v
+        .get("usage")
+        .filter(|u| !u.is_null())
+        .map(|u| parse_usage(Some(u)));
+    let mut saw_finish = false;
 
     if let Some(choices) = v.get("choices").and_then(Value::as_array) {
         if let Some(c) = choices.first() {
@@ -1033,9 +1026,22 @@ pub fn parse_stream_event(raw: &[u8]) -> Result<Vec<crate::codec::ir::StreamEven
                     "content_filter" => StopReason::SafetyBlock,
                     _ => StopReason::EndTurn,
                 };
-                let usage = parse_usage(v.get("usage"));
+                let usage = frame_usage
+                    .clone()
+                    .unwrap_or_else(|| parse_usage(v.get("usage")));
+                saw_finish = true;
                 out.push(StreamEvent::Finish { stop_reason, usage });
             }
+        }
+    }
+    // 本帧带 usage 却没有 finish_reason：供应商把两者拆成两帧的写法（含 choices 非空
+    // 的末帧）。这里必须补出 Finish，否则真实 usage 永远进不了 IR，客户端只会看到 0。
+    if let Some(usage) = frame_usage {
+        if !saw_finish {
+            out.push(StreamEvent::Finish {
+                stop_reason: StopReason::EndTurn,
+                usage,
+            });
         }
     }
     Ok(out)
@@ -1590,6 +1596,79 @@ mod tests {
         )
         .unwrap();
         assert!(evs.is_empty());
+    }
+
+    fn finish_usage(evs: &[crate::codec::ir::StreamEvent]) -> crate::codec::ir::Usage {
+        use crate::codec::ir::StreamEvent as Ev;
+        evs.iter()
+            .find_map(|e| match e {
+                Ev::Finish { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("应产出 Finish 事件")
+    }
+
+    #[test]
+    fn parse_stream_event_usage_frame_with_nonempty_choices() {
+        // scnet/超算 gateway 的末帧形状：choices 非空（只有一个空 delta）但带 usage。
+        // 此前按 "choices 为空" 判定 usage 帧，整帧被丢弃 → 出站 usage 恒 0，
+        // dsh-tui 的上下文占比统计不出来（2026-09-15 实测根因）。
+        let evs = super::parse_stream_event(
+            br#"{"id":"c1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{}}],
+                "usage":{"prompt_tokens":259132,"completion_tokens":1805,"total_tokens":260937,
+                          "prompt_tokens_details":{"cached_tokens":258944}}}"#,
+        )
+        .unwrap();
+        let u = finish_usage(&evs);
+        assert_eq!(u.input_tokens, 259132);
+        assert_eq!(u.output_tokens, 1805);
+        assert_eq!(u.cache_read_tokens, Some(258944));
+    }
+
+    #[test]
+    fn parse_stream_event_usage_split_after_finish_reason_frame() {
+        // 供应商拆两帧：先 finish_reason（无 usage）再 usage 末帧。
+        // 两帧各产出一个 Finish，且 usage 帧必须带真实数字，供上层择优保留。
+        let first = super::parse_stream_event(
+            br#"{"id":"c1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(finish_usage(&first).input_tokens, 0);
+        let second = super::parse_stream_event(
+            br#"{"id":"c1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{}}],
+                "usage":{"prompt_tokens":66,"completion_tokens":26,"total_tokens":92}}"#,
+        )
+        .unwrap();
+        assert_eq!(finish_usage(&second).input_tokens, 66);
+        assert_eq!(finish_usage(&second).output_tokens, 26);
+    }
+
+    #[test]
+    fn parse_stream_event_usage_same_frame_as_content_delta() {
+        // usage 与 content 增量同帧：正文不能因为补 Finish 而被吞掉。
+        use crate::codec::ir::StreamEvent as Ev;
+        let evs = super::parse_stream_event(
+            br#"{"id":"c1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"content":"OK"}}],
+                "usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}"#,
+        )
+        .unwrap();
+        assert!(matches!(&evs[0], Ev::TextDelta { text } if text == "OK"));
+        assert_eq!(finish_usage(&evs).input_tokens, 10);
+    }
+
+    #[test]
+    fn parse_stream_event_null_usage_is_noop() {
+        // `"usage":null` 的中间帧（部分供应商每帧都带 null usage）不应产出 Finish
+        let evs = super::parse_stream_event(
+            br#"{"id":"c1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"content":"hi"}}],"usage":null}"#,
+        )
+        .unwrap();
+        assert_eq!(evs.len(), 1);
     }
 
     #[test]

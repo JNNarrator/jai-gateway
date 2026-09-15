@@ -34,6 +34,20 @@ async fn spawn_openai_mock(mode: &'static str) -> u16 {
                         .body(Body::from(sse))
                         .unwrap()
                 }
+                "stream_split_usage" => {
+                    // scnet/超算 的真实末帧形状（2026-09-15 抓包）：finish_reason 帧不带 usage，
+                    // usage 单独一帧且 choices 非空（只有一个空 delta）。此前该 usage 帧被整帧
+                    // 丢弃 → 出站 usage 恒 0，dsh-tui 上下文占比统计不出来。
+                    let sse = "data: {\"id\":\"chatcmpl_s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello from scnet\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                               data: {\"id\":\"chatcmpl_s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":259132,\"completion_tokens\":1805,\"total_tokens\":260937,\"prompt_tokens_details\":{\"cached_tokens\":258944}}}\n\n\
+                               data: [DONE]\n\n";
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
                 "text" => Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
@@ -87,6 +101,7 @@ async fn spawn_openai_mock(mode: &'static str) -> u16 {
 struct Fixture {
     port: u16,
     key: String,
+    db: Db,
     _keepalive: (
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
@@ -108,6 +123,12 @@ impl Fixture {
         let text = resp.text().await.unwrap_or_default();
         let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         (status, body)
+    }
+
+    /// 等待后台日志管道落库后取最近 N 条（route_mode / usage 落库断言用）
+    async fn recent_logs(&self, n: i64) -> Vec<gateway_core::store::logs::LogRowView> {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        gateway_core::store::logs::logs_recent(&self.db, n).unwrap()
     }
 
     async fn post_responses_raw(&self, body: Value) -> (u16, String) {
@@ -189,6 +210,7 @@ async fn fixture(mode: &'static str) -> Fixture {
     Fixture {
         port,
         key: key.to_string(),
+        db,
         _keepalive: (stop_tx, guard),
     }
 }
@@ -252,6 +274,51 @@ async fn responses_to_openai_stream() {
     assert!(text.contains("response.output_text.delta"), "应发文本增量");
     assert!(text.contains("response.completed"), "应发 completed");
     assert!(text.contains("hello from responses"), "内容转换");
+}
+
+/// M6 回归：上游把 stop_reason 与 usage 拆成两帧、且 usage 帧带非空 choices
+/// （scnet/超算 形状，2026-09-15 抓包）时，客户端必须拿到真实 usage，
+/// 且收尾帧只出现一次——补 usage 不得造成重复的 response.completed。
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_to_openai_stream_usage_split_frames() {
+    let fx = fixture("stream_split_usage").await;
+    let (status, text) = fx.post_responses_raw(responses_body("gpt-4o", true)).await;
+    assert_eq!(status, 200);
+    assert!(text.contains("hello from scnet"), "内容转换: {text}");
+    let completed = text.matches("\"type\":\"response.completed\"").count();
+    assert_eq!(
+        completed, 1,
+        "completed 帧必须唯一，实际 {completed} 个: {text}"
+    );
+    let completed_line = text
+        .lines()
+        .find(|l| l.contains("\"type\":\"response.completed\""))
+        .expect("应有 completed 帧");
+    // 此前 usage 恒为 0（dsh-tui ctx 占比统计不出来的根因）
+    assert!(
+        completed_line.contains("\"input_tokens\":259132"),
+        "input_tokens 应为真实值: {completed_line}"
+    );
+    assert!(
+        completed_line.contains("\"output_tokens\":1805"),
+        "output_tokens 应为真实值: {completed_line}"
+    );
+    assert!(
+        completed_line.contains("\"cached_tokens\":258944"),
+        "缓存读细分应保留: {completed_line}"
+    );
+
+    // 落库口径同样回归：usage 真实 + route_mode 必须标成 converted
+    // （此前 emit_log 把 route_mode 硬编码为 passthrough，转换请求也记成直通，
+    // 排查本次 ctx 恒 0 时正是被该字段误导）。
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200)
+        .expect("应有成功日志");
+    assert_eq!(row.route_mode, "converted", "跨族转换请求必须标 converted");
+    assert_eq!(row.usage_input, Some(259132), "日志 usage_input 应为真实值");
+    assert_eq!(row.usage_output, Some(1805), "日志 usage_output 应为真实值");
 }
 
 /// M6 验收：模型不存在时返回 Responses 错误形状

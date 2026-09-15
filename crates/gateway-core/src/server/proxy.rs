@@ -239,8 +239,63 @@ pub async fn security_mw(State(ctx): State<GatewayCtx>, req: Request, next: Next
 
 // ---------------------------------------------------------------- 日志
 
+/// 日志的「路由模式」：同族直通 vs 跨族转换。
+///
+/// 此前 `emit_log` 把 route_mode 硬编码为 "passthrough"，跨族转换路径
+/// （try_converted_candidate / convert_plain_response / convert_streaming_response）
+/// 也一律记成 passthrough，于是日志与统计里的「路由模式」字段完全不可信——
+/// 排查「客户端 ctx 恒 0」时就因该字段显示 passthrough 而误判请求走的是字节直通。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RouteMode {
+    Passthrough,
+    Converted,
+}
+
+impl RouteMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            RouteMode::Passthrough => "passthrough",
+            RouteMode::Converted => "converted",
+        }
+    }
+}
+
+/// 同族直通路径的日志入口（含路由尚未确定的早期失败：那类请求没有转换过，
+/// 沿用 passthrough 语义）。
 #[allow(clippy::too_many_arguments)]
 fn emit_log(
+    logs: &crate::store::logs::LogHandle,
+    inbound_family: &str,
+    peeked: Option<&PeekRequest>,
+    provider_id: Option<&str>,
+    upstream_model_id: Option<String>,
+    status: i64,
+    duration_ms: i64,
+    is_stream: bool,
+    usage: Option<&Value>,
+    error_kind: Option<String>,
+    error_summary: Option<String>,
+) {
+    emit_log_with(
+        RouteMode::Passthrough,
+        logs,
+        inbound_family,
+        peeked,
+        provider_id,
+        upstream_model_id,
+        status,
+        duration_ms,
+        is_stream,
+        usage,
+        error_kind,
+        error_summary,
+    );
+}
+
+/// 落一条请求日志；`mode` 决定 route_mode 字段（同族直通 / 跨族转换）。
+#[allow(clippy::too_many_arguments)]
+fn emit_log_with(
+    mode: RouteMode,
     logs: &crate::store::logs::LogHandle,
     inbound_family: &str,
     peeked: Option<&PeekRequest>,
@@ -257,7 +312,7 @@ fn emit_log(
     logs.emit(LogEvent {
         ts: store::now_ms(),
         inbound_family: inbound_family.into(),
-        route_mode: "passthrough",
+        route_mode: mode.as_str(),
         model_name: peeked.map(|p| p.model.clone()).unwrap_or_default(),
         provider_id: provider_id.map(str::to_string),
         upstream_model_id,
@@ -1166,7 +1221,8 @@ async fn try_converted_candidate(
 
     // 2) 护栏（M4：单条消息 blocks ≤ 64 / args ≤ 256KB）
     if let Err(msg) = crate::codec::ir::validate_guards(&req) {
-        emit_log(
+        emit_log_with(
+            RouteMode::Converted,
             &ctx.logs,
             wire.log_family(),
             Some(peeked),
@@ -1196,7 +1252,8 @@ async fn try_converted_candidate(
         );
         let outcome = plan.resolve(&mut req);
         if let Some((msg, code)) = outcome.rejection {
-            emit_log(
+            emit_log_with(
+                RouteMode::Converted,
                 &ctx.logs,
                 wire.log_family(),
                 Some(peeked),
@@ -1219,7 +1276,8 @@ async fn try_converted_candidate(
         if !outcome.warnings.is_empty() {
             // 能力面降级 / Lenient 丢弃 WARN 进结构化日志（UI 日志页可见），
             // 不再仅落控制台
-            emit_log(
+            emit_log_with(
+                RouteMode::Converted,
                 &ctx.logs,
                 wire.log_family(),
                 Some(peeked),
@@ -1375,7 +1433,8 @@ async fn try_converted_candidate(
         Err(e) => {
             let msg = format!("上游连接失败: {e}");
             provider_mark_fail(&ctx.db, &cand.provider_id, &msg);
-            emit_log(
+            emit_log_with(
+                RouteMode::Converted,
                 &ctx.logs,
                 wire.log_family(),
                 Some(peeked),
@@ -1410,7 +1469,8 @@ async fn try_converted_candidate(
         match router::classify_status(up_status.as_u16(), &snippet) {
             AttemptVerdict::Stop { kind } => {
                 provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
-                emit_log(
+                emit_log_with(
+                    RouteMode::Converted,
                     &ctx.logs,
                     wire.log_family(),
                     Some(peeked),
@@ -1432,7 +1492,8 @@ async fn try_converted_candidate(
             }
             AttemptVerdict::Failover { kind } => {
                 provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
-                emit_log(
+                emit_log_with(
+                    RouteMode::Converted,
                     &ctx.logs,
                     wire.log_family(),
                     Some(peeked),
@@ -1523,7 +1584,8 @@ async fn convert_plain_response(
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
             let msg = format!("上游响应读取失败: {e}");
-            emit_log(
+            emit_log_with(
+                RouteMode::Converted,
                 &ctx.logs,
                 wire.log_family(),
                 Some(&peeked),
@@ -1544,7 +1606,8 @@ async fn convert_plain_response(
             ));
         }
         Err(_) => {
-            emit_log(
+            emit_log_with(
+                RouteMode::Converted,
                 &ctx.logs,
                 wire.log_family(),
                 Some(&peeked),
@@ -1580,7 +1643,8 @@ async fn convert_plain_response(
     let mut resp = match parsed {
         Ok(r) => r,
         Err(msg) => {
-            emit_log(
+            emit_log_with(
+                RouteMode::Converted,
                 &ctx.logs,
                 wire.log_family(),
                 Some(&peeked),
@@ -1625,7 +1689,8 @@ async fn convert_plain_response(
             .join("");
         if serde_json::from_str::<Value>(&text).is_err() {
             let msg = "上游未遵守 JSON 结构化输出约束（降级校验失败）";
-            emit_log(
+            emit_log_with(
+                RouteMode::Converted,
                 &ctx.logs,
                 wire.log_family(),
                 Some(&peeked),
@@ -1652,7 +1717,8 @@ async fn convert_plain_response(
         "prompt_tokens": usage.input_tokens,
         "completion_tokens": usage.output_tokens,
     });
-    emit_log(
+    emit_log_with(
+        RouteMode::Converted,
         &ctx.logs,
         wire.log_family(),
         Some(&peeked),
@@ -1819,9 +1885,34 @@ async fn convert_streaming_response(
             let mut line_buf: Vec<u8> = first_lines;
             // IR 累计的 usage：Finish 事件携带，自然结束时透传落库（修复日志输入/输出恒空）
             let mut last_usage: Option<crate::codec::ir::Usage> = None;
+            // 挂起的 Finish：上游常把 stop_reason 与 usage 拆成两帧（先 finish_reason 帧、
+            // 后 usage 末帧），且 usage 帧可能带非空 choices。若逐帧渲染，客户端会先收到一个
+            // usage 全 0 的收尾帧，第二帧再渲染就是重复的 completed/message_stop。故挂起
+            // Finish，等上游 [DONE] 或 EOF 时合并真实 usage 一次性发出（stop_reason 以先到的
+            // 显式 finish_reason 帧为准）。
+            let mut pending_finish: Option<(
+                crate::codec::ir::StopReason,
+                crate::codec::ir::Usage,
+            )> = None;
             // 行缓冲护栏计时：line_buf 非空且长时间无完整行 → 断开（防无终止标记流拖死下游）
             let mut last_drain_at = Instant::now();
             let line_hold = sse_line_hold_timeout();
+
+            // 发出挂起的 Finish（幂等：[DONE] 与 EOF 两处各调一次也只发一次）
+            macro_rules! flush_pending_finish {
+                () => {{
+                    if let Some((stop_reason, usage)) = pending_finish.take() {
+                        for frame in render_frame(
+                            &mut renderer,
+                            &crate::codec::ir::StreamEvent::Finish { stop_reason, usage },
+                        ) {
+                            if tx.send(Ok(Bytes::from(frame))).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }};
+            }
 
             // 解析并发送当前行缓冲（首字节可能已包含整个 SSE 流）
             macro_rules! drain_sse_lines {
@@ -1834,6 +1925,11 @@ async fn convert_streaming_response(
                         }
                         let payload: &[u8] = trim_ascii(&line[5..]);
                         if payload.is_empty() || payload == b"[DONE]" {
+                            // OpenAI 系终止标记：usage 末帧已到齐，先补发挂起的 Finish
+                            // （不等连接关闭——上游若保持连接，下游会缺收尾帧）
+                            if payload == b"[DONE]" {
+                                flush_pending_finish!();
+                            }
                             continue;
                         }
                         let mut events: Vec<crate::codec::ir::StreamEvent> =
@@ -1842,7 +1938,7 @@ async fn convert_streaming_response(
                                     match crate::codec::anthropic::parse_stream_event(payload) {
                                         Ok(v) => v,
                                         Err(e) => {
-                                            emit_log(
+                                            emit_log_with(RouteMode::Converted,
                                                 &ctx2.logs,
                                                 wire2.log_family(),
                                                 Some(&peeked2),
@@ -1862,7 +1958,7 @@ async fn convert_streaming_response(
                                 "gemini" => match crate::codec::gemini::parse_stream_event(payload) {
                                     Ok(v) => v,
                                     Err(e) => {
-                                        emit_log(
+                                        emit_log_with(RouteMode::Converted,
                                             &ctx2.logs,
                                             wire2.log_family(),
                                             Some(&peeked2),
@@ -1882,7 +1978,7 @@ async fn convert_streaming_response(
                                 {
                                     Ok(v) => v,
                                     Err(e) => {
-                                        emit_log(
+                                        emit_log_with(RouteMode::Converted,
                                             &ctx2.logs,
                                             wire2.log_family(),
                                             Some(&peeked2),
@@ -1901,7 +1997,7 @@ async fn convert_streaming_response(
                                 "openai_responses" => {
                                     // Responses 上游的 SSE 尚未支持流式转换；
                                     // 若上游返回 SSE，暂时按无法解析处理。
-                                    emit_log(
+                                    emit_log_with(RouteMode::Converted,
                                         &ctx2.logs,
                                         wire2.log_family(),
                                         Some(&peeked2),
@@ -1928,12 +2024,40 @@ async fn convert_streaming_response(
                             }
                         }
                         for ev in events {
-                            if let crate::codec::ir::StreamEvent::Finish { usage, .. } = &ev {
-                                last_usage = Some(usage.clone());
+                            // Finish 不立刻下发：挂起合并（见 pending_finish 注释）。
+                            // 一旦下发，客户端就会先看到一个 usage 全 0 的收尾帧，
+                            // 后续真实 usage 只能变成重复的 completed/message_stop。
+                            if let crate::codec::ir::StreamEvent::Finish {
+                                stop_reason,
+                                usage,
+                            } = &ev
+                            {
+                                let is_zero =
+                                    usage.input_tokens == 0 && usage.output_tokens == 0;
+                                match &mut pending_finish {
+                                    None => {
+                                        pending_finish =
+                                            Some((stop_reason.clone(), usage.clone()));
+                                    }
+                                    Some((_, prev)) => {
+                                        // 后到的真实 usage 覆盖先到的零值占位；
+                                        // 零值不覆盖已有真实值（含 usage 帧在前、finish_reason
+                                        // 帧在后的供应商顺序）。
+                                        let prev_zero =
+                                            prev.input_tokens == 0 && prev.output_tokens == 0;
+                                        if prev_zero && !is_zero {
+                                            *prev = usage.clone();
+                                        }
+                                    }
+                                }
+                                if !is_zero || last_usage.is_none() {
+                                    last_usage = Some(usage.clone());
+                                }
+                                continue;
                             }
                             for frame in render_frame(&mut renderer, &ev) {
                                 if tx.send(Ok(Bytes::from(frame))).await.is_err() {
-                                    emit_log(
+                                    emit_log_with(RouteMode::Converted,
                                         &ctx2.logs,
                                         wire2.log_family(),
                                         Some(&peeked2),
@@ -1959,7 +2083,8 @@ async fn convert_streaming_response(
                 ($msg:expr) => {{
                     let msg: String = $msg;
                     let _ = tx.send(Ok(error_sse_frame(wire2, &msg))).await;
-                    emit_log(
+                    emit_log_with(
+                        RouteMode::Converted,
                         &ctx2.logs,
                         wire2.log_family(),
                         Some(&peeked2),
@@ -1991,7 +2116,8 @@ async fn convert_streaming_response(
                         let msg = format!("上游流空闲超时({}s)", STREAM_IDLE_TIMEOUT.as_secs());
                         let _ = tx.send(Ok(error_sse_frame(wire2, &msg))).await;
                         drop(tx);
-                        emit_log(
+                        emit_log_with(
+                            RouteMode::Converted,
                             &ctx2.logs,
                             wire2.log_family(),
                             Some(&peeked2),
@@ -2034,7 +2160,8 @@ async fn convert_streaming_response(
                         let msg = format!("stream aborted by upstream: {e}");
                         let _ = tx.send(Ok(error_sse_frame(wire2, &msg))).await;
                         provider_mark_fail(&ctx2.db, &pid, &msg);
-                        emit_log(
+                        emit_log_with(
+                            RouteMode::Converted,
                             &ctx2.logs,
                             wire2.log_family(),
                             Some(&peeked2),
@@ -2051,6 +2178,9 @@ async fn convert_streaming_response(
                         break;
                     }
                     Ok(None) => {
+                        // 自然结束：先补发挂起的 Finish（上游无 [DONE] 时靠这里收尾），
+                        // 再补 message_stop / [DONE]。
+                        flush_pending_finish!();
                         // 自然结束：Anthropic 补 message_stop，OpenAI 补 [DONE]
                         if wire2 == InboundWire::Anthropic {
                             let _ = tx
@@ -2071,7 +2201,8 @@ async fn convert_streaming_response(
                                 "cache_creation_input_tokens": u.cache_write_tokens,
                             })
                         });
-                        emit_log(
+                        emit_log_with(
+                            RouteMode::Converted,
                             &ctx2.logs,
                             wire2.log_family(),
                             Some(&peeked2),
