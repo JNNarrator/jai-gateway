@@ -24,3 +24,8 @@ src-tauri/gen/
 
 # shell/log noise
 nohup.out
+
+# 本地视觉回归 / 自动化产物（体积大，不入库）
+.vr/
+.playwright-mcp/
+.zcode/
