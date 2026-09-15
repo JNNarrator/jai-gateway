@@ -437,6 +437,30 @@ export function SyncPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          {/* 主操作条：置于 WebDAV 卡片顶部并吸顶，避免默认窗口下需要滚动上千像素才点到 */}
+          <div className="sticky top-0 z-10 -mx-6 flex flex-wrap gap-2 border-b border-border/60 bg-card px-6 py-3">
+            <Button onClick={saveCfg}>保存配置</Button>
+            <Button variant="outline" onClick={testWebdav}>
+              测试连接
+            </Button>
+            <Button variant="outline" onClick={previewWebdav}>
+              预览变更
+            </Button>
+            <Button variant="outline" disabled={busy === "push"} onClick={doPush}>
+              <CloudUpload aria-hidden />
+              {busy === "push" ? "推送中…" : "推送"}
+            </Button>
+            <Button variant="outline" disabled={busy === "pull"} onClick={doPull}>
+              <Download aria-hidden />
+              {busy === "pull" ? "拉取中…" : "拉取"}
+            </Button>
+          </div>
+          {busy && (
+            <div className="h-1 w-full overflow-hidden rounded bg-muted">
+              <div className="h-full w-1/3 animate-pulse rounded bg-primary" />
+            </div>
+          )}
+
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <FormField label="WebDAV 根地址" htmlFor="dav-url" className="md:col-span-2">
               <Input
@@ -499,28 +523,6 @@ export function SyncPage() {
             </FormField>
           </div>
 
-          <div className="flex flex-wrap gap-2">
-            <Button onClick={saveCfg}>保存配置</Button>
-            <Button variant="outline" onClick={testWebdav}>
-              测试连接
-            </Button>
-            <Button variant="outline" onClick={previewWebdav}>
-              预览变更
-            </Button>
-            <Button variant="outline" disabled={busy === "push"} onClick={doPush}>
-              <CloudUpload aria-hidden />
-              {busy === "push" ? "推送中…" : "推送"}
-            </Button>
-            <Button variant="outline" disabled={busy === "pull"} onClick={doPull}>
-              <Download aria-hidden />
-              {busy === "pull" ? "拉取中…" : "拉取"}
-            </Button>
-          </div>
-          {busy && (
-            <div className="h-1 w-full overflow-hidden rounded bg-muted">
-              <div className="h-full w-1/3 animate-pulse rounded bg-primary" />
-            </div>
-          )}
 
           <div className="space-y-3 rounded-md border bg-muted/30 p-3">
             <div className="flex items-center justify-between gap-3">

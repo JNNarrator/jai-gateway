@@ -226,9 +226,12 @@ export function LogsPage() {
         <SkeletonList rows={8} itemClassName="h-8" />
       ) : (
         <>
-      <div className="overflow-x-auto rounded-lg border">
+      {/* 表格内部滚动 + 吸顶表头：日志可上千行，避免整页被撑到数千像素、表头滚丢 */}
+      <div className="rounded-lg border">
+        {/* 只有表格本身内部滚动（含吸顶表头），「加载更多」始终留在可视区 */}
+        <div className="max-h-[calc(100dvh-18rem)] overflow-auto">
         <Table>
-          <TableHeader>
+          <TableHeader className="sticky top-0 z-10 bg-muted/50 backdrop-blur">
             <TableRow className="bg-muted/50 hover:bg-muted/50">
               <TableHead>时间</TableHead>
               <TableHead>模型</TableHead>
@@ -277,6 +280,7 @@ export function LogsPage() {
             ))}
           </TableBody>
         </Table>
+        </div>
         {filtered.length === 0 && (
           <EmptyState
             icon={ScrollText}
