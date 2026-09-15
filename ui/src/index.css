@@ -33,7 +33,9 @@
   --popover: oklch(0.21 0.006 285.885);
   --popover-foreground: oklch(0.985 0 0);
   --primary: oklch(0.685 0.169 237.323);        /* 暗色下更亮的蓝紫 */
-  --primary-foreground: oklch(0.985 0 0);
+  /* 亮蓝 (#00A6F4) 配白字只有 2.59:1，不到 AA 4.5；改深色前景后约 7.3:1，
+     且不影响 text-primary 链接/焦点环在暗背景上的可读性。 */
+  --primary-foreground: oklch(0.145 0 0);
   --secondary: oklch(0.274 0.006 286.033);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.274 0.006 286.033);

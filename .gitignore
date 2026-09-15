@@ -29,3 +29,9 @@ nohup.out
 .vr/
 .playwright-mcp/
 .zcode/
+
+# 视觉回归：脚本入库，体积大的证据不入库
+.vr/shots/
+.vr/tmp/
+.vr/*.json
+.vr/*.log

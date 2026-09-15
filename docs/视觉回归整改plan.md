@@ -212,3 +212,40 @@ node .vr/audit-summarize.mjs .vr/audit-dark-980x640.json
 | `.vr/audit-dark-980x640.json` / `audit-light-980x640.json` / `audit-dark-760x520.json` | 对比度/字号/命中区/截断/半行截断 |
 | `.vr/shots/*.png` | 715 张截图（`walk-`、`fold-`、`deep2-`、`audit-` 前缀） |
 | `.vr/*.mjs` | 可复现脚本（run / fold / deep2 / audit / summarize） |
+
+---
+
+## 6. 进度记录（交接用）
+
+> 本次会话到此，换机后从这里接着做。探针脚本随仓库提交（`.vr/*.mjs`），体积大的证据（截图/JSON/日志）未纳入 git。
+
+### 已完成并验证
+
+| 项 | 提交 | 验证证据 |
+|---|---|---|
+| P0-1 供应商弹窗主按钮可见 | `9ce86c4` | deep2 980×640：footer 546–599 可见，`创建/保存/测试连接` 全可见；760×520：footer 426–479 可见，滚动只发生在 `dialog-body`（980：458>427；760：602>307） |
+| P0-2 弹窗基座限高 + `DialogBody`（Mcp/Skills 已接入） | `9ce86c4` | audit 长内容注入（长技能正文 / +4 行表单项）在 980×640 与 760×520 均 `dlgBad=0` |
+| P0-3 toast 移右下 + 点击穿透 | `9ce86c4` | walk 遍历：980×640（88 步）、760×520（300 步）toast 遮挡均为 **0** |
+| P1-6 日志表内部滚动 + 吸顶表头 | `bc38627` | fold：日志页内容 2931→604，首屏 21%→100%，折叠线下控件 0 |
+| P1-4（部分）同步页主操作条上移吸顶 | `bc38627` | fold：`保存配置/测试连接/预览变更/推送/拉取` 不再出现在折叠线下清单 |
+| P2-7 暗色主按钮对比度 | 本次提交 | probe-colors3（强制暗色）：**2.59 → 7.32:1**（`--primary-foreground` 改 `oklch(0.145 0 0)`） |
+
+### 待做（按优先级）
+
+- **P1-4 其余页面**：设置页（`保存` y=1115、日志开关 698、编辑保留策略 769、检查更新 1749）、网关页（`复制配置` y=797）——用同法把主操作上移或吸顶，或加卡片锚点导航；设置页首屏 34%、网关 55%。
+- **P1-5 模型页表格**：7 列 801px，760 宽窗口横向溢出 217px；行内输入/保存被折叠线切 9–14px。方案：次要列降级进详情、外层 `overflow-x-auto` + 右缘渐隐、sticky thead。
+- **P2-8 浅色小字/状态色 79 类**（最差 badge「缺少凭据」3.2、日志状态码 3.38、同步「成功」3.55、设置说明 3.65、toast 文案 4.26）：状态色提级到 -700，badge 文本用 `--foreground`。
+- **P2-9 命中区**：Switch 32×18、弹窗关闭 16×16、行内复制 16×16、批量勾选 16×16、弹窗内协议 `select` 1×1 → 统一 ≥24×24 或改自定义触发器。
+- **P2-10 字号与截断**：2 处 10px；MCP 注册 URL 截 22px、供应商 base URL 截 21px。
+- **P3-11** 折叠线硬切加渐隐；**P3-12** 默认窗口 1080×740 / `minHeight` 560（`src-tauri/tauri.conf.json`）。
+
+### 复现环境（换机后）
+
+1. 前端依赖：`cd ui && npm i`。
+2. 探针脚本开头用 `createRequire` 引 Playwright，路径写死在
+   `/Users/jiangnan/Documents/workspace/deepseek-harness/node_modules/.pnpm/playwright@1.61.1/node_modules/playwright/`，
+   **换机需改成新机器上的 Playwright 路径**（Chrome 可执行文件路径同理）。
+3. 起前端：`cd ui && nohup npx vite --host 127.0.0.1 --port 5173 > /tmp/vite.log 2>&1 &`
+4. 跑探针：`export TMPDIR=$PWD/.vr/tmp && node .vr/deep2.mjs --size=980x640`
+   - `fold.mjs` 折叠线/横向溢出/弹窗 Esc；`deep2.mjs` 弹窗结构解剖；`audit.mjs` 对比度/字号/命中区/截断；`run.mjs` 动态点击遍历（较慢，建议后台跑）；`audit-summarize.mjs` 汇总。
+5. 证据：`.vr/*.json`、`.vr/*.log`、`.vr/shots/`（715+ 张截图）；这些未入库，需要时单独拷贝。

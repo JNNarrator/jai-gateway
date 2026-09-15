@@ -69,6 +69,32 @@
   - 新增单测：`reasoning_content_roundtrip`、`decode_assistant_embedded_function_call`。
   - ✅ curl 实测：纯 MCP 循环（thinking 模型）成功、内嵌格式 + reasoning 回传成功、日志 200。
 
+- [ ] 6. `mcp_pool` 集成测试负载敏感 + **失败级联**（会污染 `scripts/regression.sh` 门禁）
+  - 现象：`cargo test --workspace` 偶发 3 个用例 FAILED，报 `MCP initialize 超时`；**每轮失败的用例集合都不同**
+    （实测两次分别为 {timeout_discards_connection, rebuilds_after_crash, env_participates_in_pool_key}
+    与 {timeout_discards_connection, rebuilds_when_process_dies_after_response, idle_reclaim_reaps_process}）。
+  - 根因（已定位，两段证据）：
+    1. `JAI_MCP_POOL_CALL_TIMEOUT_MS` **同时管初始化握手**（`crates/gateway-core/src/mcp.rs:349` 用
+       `pool_call_timeout()` 包住 `initialize`），而 `tests/mcp_pool.rs:111` 把它压到 **100ms**；机器有负载时
+       「spawn 假 server + 握手」可能超过 100ms → init 超时。
+       验证：`JAI_MCP_POOL_CALL_TIMEOUT_MS=30 cargo test -p gateway-core --test mcp_pool`
+       → 5/7 用例报同一句 `MCP initialize 超时`（复现签名）。
+    2. `tests/mcp_pool.rs:122` 的 `remove_var` 在 `assert_eq!().unwrap()` **之后**，只在成功路径执行；
+       一旦 panic 就跳过清理 → 进程级环境变量停留在 100ms → **后续所有用例连带超时**。
+  - 影响：门禁偶发红灯，且失败信息指向无关用例，容易误判为被测代码回归（本次即先被误判为本次改动导致；
+    随后以 70 次「有/无改动」对照实验（各 35 次、6 路 CPU 负载）均 0 失败，证实与本次 codec 改动无关）。
+  - 建议修法：① 用 RAII guard（Drop 时还原环境变量），别把清理写在断言之后；
+    ② 初始化握手不要复用调用超时（单列 `JAI_MCP_POOL_INIT_TIMEOUT_MS`，给 spawn 留足余量）；
+    ③ 该文件测试是进程级共享状态，超时阈值不宜压到 100ms 量级。
+
+- [ ] 7. Responses **出站**丢弃消息级图片（`Block::Image` 在 user 消息里）
+  - 位置：`crates/gateway-core/src/codec/responses.rs` 的 `encode_request`，注释写「Responses 上游 v1 不支持
+    图片内联转换，Lenient 丢弃」——**该注释与官方 schema 存疑**：Responses 的 message content 支持
+    `input_image`（依据见 `docs/design/tool-result-image-protocol-factcheck.md`）。
+  - 与「工具结果内嵌图片」（本次已修）属同一类静默丢失，但**本次未动**：改动会让原本「静默丢图但请求成功」
+    的请求变成「带图请求」，若某些中转上游不接受可能由 200 变 4xx，需单独评估。
+  - 建议：先确认目标上游对 `input_image` 的接受度，再按与本次相同的「原生承载 / 显式降级 + CapabilityWarn」口径处理。
+
 - [x] 8. dsh-tui 上下文占比统计不出来（走 JAI 网关时 `ctx 0/128k 0.0%`）
   - 现象：dsh-tui 状态栏 `ctx 0/128k 0.0%`（本机 dsh-tui + JAI，模型 `超算/Qwen3.8-Flash-Event`）；
     同一网关的 `基元律动/deepseek-flash` 路由显示正常 → 属**按供应商分化**，不是 dsh-tui 侧问题。
@@ -101,6 +127,8 @@
     `request/context.contextWindow=128000` 正常（上下文窗口没问题，是占用数字没了）。
   - 注意：本修复需**重建并重启 JAI** 才生效（线上跑的是旧二进制）；重启前 dsh-tui 仍显示 0%。
 
+
+
 ## 2. 优化清单
 
 - [x] 1. 创建供应商弹框应该有按钮可以测试能不能获取到模型。
@@ -117,13 +145,13 @@
 > 详见 [`docs/视觉回归整改plan.md`](视觉回归整改plan.md)（含 303 步动态点击遍历、715 张截图、对比度/命中区/折叠线量化数据）。
 > 完成一项就把 `[ ]` 改成 `[x]`。
 
-- [ ] 1. P0 供应商「添加/编辑」弹窗主按钮打开即不可见：弹窗内容 620–780px 挤进 542px 可滚区，`创建/保存/测试连接/取消` 在可视框外（`ProvidersPage.tsx:508` 把 `max-h-[85vh] overflow-y-auto` 加在整个 DialogContent 上）
-- [ ] 2. P0 弹窗基座 `dialog.tsx` 缺 `max-h`/可滚动正文结构：内容一长（长技能正文、MCP env 行、大 JSON 导入）就溢出视口且无法滚动（760×520 下 MCP 添加弹窗 h=528 > 520，上下各被切 4px）
-- [ ] 3. P0 toast 遮挡底部控件：`bottom-center` toaster（z=999999999，rect x312–668/y565–619）在遍历中造成 150 次「被遮挡点不到」，含弹窗内输入框与 `检查更新`/`测试连接`；建议改 `bottom-right` + z-index 降到 40
-- [ ] 4. P1 主操作在首屏之外：同步页首屏仅 38%（`保存配置/测试连接/预览变更/推送/拉取` 全在 y=761）、日志 21%、设置 34%、模型 36%、网关 55%；760×520 下同步 28%、供应商 39%
+- [x] 1. P0 供应商「添加/编辑」弹窗主按钮打开即不可见：弹窗内容 620–780px 挤进 542px 可滚区，`创建/保存/测试连接/取消` 在可视框外（`ProvidersPage.tsx:508` 把 `max-h-[85vh] overflow-y-auto` 加在整个 DialogContent 上）
+- [x] 2. P0 弹窗基座 `dialog.tsx` 缺 `max-h`/可滚动正文结构：内容一长（长技能正文、MCP env 行、大 JSON 导入）就溢出视口且无法滚动（760×520 下 MCP 添加弹窗 h=528 > 520，上下各被切 4px）
+- [x] 3. P0 toast 遮挡底部控件：`bottom-center` toaster（z=999999999，rect x312–668/y565–619）在遍历中造成 150 次「被遮挡点不到」，含弹窗内输入框与 `检查更新`/`测试连接`；建议改 `bottom-right` + z-index 降到 40
+- [~] 4. P1 主操作在首屏之外（同步页已修：操作条吸顶；设置页/网关页待做）：同步页首屏曾仅 38%（`保存配置/测试连接/预览变更/推送/拉取` 全在 y=761）、日志 21%、设置 34%、模型 36%、网关 55%；760×520 下同步 28%、供应商 39%
 - [ ] 5. P1 模型页 7 列表格 801px：760 宽窗口溢出 217px，行内输入被折叠线切 9–14px
-- [ ] 6. P1 日志页 2931px 长表：`加载更多` 在 y=2870，表头无 sticky
-- [ ] 7. P2 暗色主题主按钮对比度 2.59:1（`--primary` #00A6F4 + `--primary-foreground` #FAFAFA），AA 要求 4.5:1；浅色主题同按钮 5.03:1 合格
+- [x] 6. P1 日志页 2931px 长表：`加载更多` 在 y=2870，表头无 sticky
+- [x] 7. P2 暗色主题主按钮对比度 2.59:1（`--primary` #00A6F4 + `--primary-foreground` #FAFAFA），AA 要求 4.5:1；浅色主题同按钮 5.03:1 合格
 - [ ] 8. P2 浅色主题小字/状态色对比度不足 79 类：badge「缺少凭据」3.2、日志状态码「429/499」3.38、同步「成功」3.55、设置说明 3.65、toast 文案 4.26
 - [ ] 9. P2 命中区过小：Switch 32×18、弹窗关闭 16×16、行内复制 16×16、批量勾选 16×16、弹窗内协议 `select` 1×1（几乎不可点）
 - [ ] 10. P2 字号与截断：2 处 10px 文本；MCP 注册 URL 截 22px、供应商 base URL 截 21px
