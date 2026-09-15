@@ -103,7 +103,30 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                     } else {
                         json!({"result": text})
                     };
-                    parts.push(json!({"functionResponse": {"name": name, "response": response}}));
+                    let mut fr = json!({"name": name, "response": response});
+                    // 工具结果内嵌图片：`response` 是 JSON 对象（Struct），装不下图；
+                    // v1beta 的 `functionResponse.parts` 是承载位置（JAI 出站固定打 v1beta）。
+                    // 旧实现只取文本块，图片被无声丢弃。
+                    let inline: Vec<Value> = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            Block::Image {
+                                media_type,
+                                data_base64: Some(b64),
+                                ..
+                            } => Some(json!({
+                                "inlineData": {
+                                    "mimeType": if media_type.is_empty() { "image/png" } else { media_type.as_str() },
+                                    "data": b64,
+                                }
+                            })),
+                            _ => None,
+                        })
+                        .collect();
+                    if !inline.is_empty() {
+                        fr["parts"] = Value::Array(inline);
+                    }
+                    parts.push(json!({"functionResponse": fr}));
                 }
                 _ => {}
             }

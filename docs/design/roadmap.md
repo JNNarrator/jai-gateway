@@ -378,7 +378,10 @@
    - 复现：`scripts/sse_mock_upstream.py`（恒速 mock 上游）+ bench 供应商直插 + curl 经网关拉流
 3. **空闲 RSS**：主进程 123.6–126.6 MB；全足迹（主进程 + WKWebView WebContent 165MB + GPU 45MB + Networking 26MB）≈ 360 MB。
    ⚠️ M0 时代定立的「空闲 RSS < 80MB」目标与当前 webview 架构不匹配（WebContent 辅助进程为系统 XPC，不受应用控制），建议按「主进程 + WebContent 合计」或分平台重定基线 —— 待评审
-4. **⚠️ 稳定性 finding（待修，gateway-core）**：转换路径（MCP 注入启用时）对**无 finish_reason/[DONE] 终止标记的上游流**不向下游转发（35s+ 零字节），且疑似无界缓冲；passthrough 不受影响。真实 LLM 流均带终止标记故日常不受影响，但恶意/故障上游可触发内存膨胀（稳定性为一票否决域）。复现：启用 MCP + mock 恒速流；修复建议：重排缓冲护栏对终止标记缺失的流生效（超限即断开+日志）。
+4. **✅ 稳定性 finding（已修复，2026-09-05）：原问题为转换路径（MCP 注入启用时）对**无 finish_reason/[DONE] 终止标记的上游流**不向下游转发（35s+ 零字节）、且疑似无界缓冲；passthrough 不受影响。
+   - 修复：提交 `f9db4d4`「流式转换缓冲护栏」——转换路径 SSE 行缓冲加**双重护栏**：① 单行超限（>1MiB 无换行刷流）立即断开并落日志，防无界内存；② 行长时间未完成（默认 90s，`JAI_SSE_LINE_HOLD_SECS` 可覆盖）断开，防终止标记缺失的流拖死下游（`crates/gateway-core/src/server/proxy.rs` 的 `MAX_SSE_LINE_BYTES` / `SSE_LINE_HOLD_TIMEOUT`）
+   - 回归测试：`crates/gateway-core/tests/m4_conversion.rs` 的 `conversion_disconnects_on_newline_flood_upstream`（flood 刷流）与 `conversion_disconnects_on_terminationless_slow_stream`（trickle 无终止标记流）
+   - 核实记录（2026-09-15）：两例回归实测通过（flood → 收到「已断开」错误帧；trickle → 收到「未完成」行超时错误帧）；CHANGELOG 0.1.7 已收录该修复。**本条原标注的「待修」系 09-01 快照未随修复更新，现已对齐。**
 5. **48h 常驻观察**：2026-09-01 11:35 起（release 实例，MCP 已恢复启用），`scripts/observe48h.sh` 每 30 分钟采样（alive/healthz/RSS），至 2026-09-03 11:35 判定零崩溃；期间第一梯队客户端各至少一例真实流量。
 
 ### M9（发布工程）—— 工程侧已完成 ✅（签名/公证/真机验收需真实 secrets 与发布主机执行）
@@ -464,3 +467,6 @@
    任何改动不得破坏 dsh 链路，dsh 验证不通过不得宣称完成。
 2. **zcode 次重点支持**。使用量也大，应与 dsh 一并纳入回归；其余客户端相对靠后。
 3. dsh 相关验收必须覆盖：注册/添加 DeepSeek 渠道、模型发现、真实对话、SSE 流式、工具调用（如 harness 触达）。
+4. 接入手段不得只依赖「用户手动复制粘贴」：`scripts/setup_dsh.mjs` 是 dsh 的正式接入路径；
+   改动 dsh 配置 schema 相关逻辑时须跑 `node scripts/setup_dsh_test.mjs` 全绿（离线、自带假网关）。
+   注意：dsh 运行中会整份重写 `settings.yaml`，脚本须在 dsh 退出后执行。

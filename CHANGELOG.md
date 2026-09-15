@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **dsh 接入生成器**（`scripts/setup_dsh.mjs`）：把 JAI 结构化合并进 dsh 的
+  `$DSH_HOME/settings.yaml`（`llm-pi-ai.providers.<route>`，`api: openai-responses`
+  / `openai-completions` 可切），`models` 取自 JAI 实时 `/v1/models`（含 `contextWindow`
+  与 `input` 模态），网关 Key 写入 `$DSH_HOME/.env`（0600，经 `apiKeyEnv` 引用）；
+  支持 `--dry-run` 打 diff（key 脱敏、不写盘）、改动前时间戳备份、幂等，且保留用户既有的
+  其他 route、注释与自加字段；落盘前过 dsh 自身运行时 schema 校验。配套离线自测
+  `scripts/setup_dsh_test.mjs`（9 项断言）。**未做 dsh 真机 boot 验证**（需短暂退出 dsh）。
+
+### Fixed
 - **流式 usage 丢失 → 客户端上下文占比恒 0**（dsh-tui 状态栏 `ctx 0/128k 0.0%`，仅部分供应商复现）：
   - 根因：`codec/openai.rs` 判定 usage 帧时只认「`choices` 为空数组」这一种形状。scnet（超算）的末帧是
     `{"choices":[{"index":0,"delta":{}}],"usage":{...}}`（choices 非空）→ 整帧被丢弃 → 出站
@@ -16,6 +26,35 @@ All notable changes to this project will be documented in this file.
     （本次排查即被该字段误导）→ 新增 `RouteMode` 枚举 + `emit_log_with`，转换路径 20 处调用点改标 `converted`
   - 回归：单测 4 例 + 集成用例 `responses_to_openai_stream_usage_split_frames`（按抓包真实帧形状跑完整链路，
     断言 completed 唯一、`input_tokens 259132`、日志 `route_mode=converted` 与 usage 落库）；两处 A/B 反证会失败
+- **工具结果内嵌图片的跨族丢图**（agent 客户端截图类工具的真实形态：图片在
+  `tool_result` / `function_call_output` 里，而非用户消息）：
+  - 入站解码：Anthropic `tool_result.content` 内容块数组中的 `image` 块不再被只取文本字段
+    的逻辑丢弃；OpenAI `role=tool` 消息 `content` 为内容数组时不再整条退化成空串；
+    Responses `function_call_output.output` 为内容项数组（含 `input_image`）时不再被抹成空串
+  - 出站编码：**四族各按自身规范承载**——Anthropic `tool_result.content` 与 Responses
+    `function_call_output.output` 按内容块数组原生承载；Gemini 走 v1beta 的
+    `functionResponse.parts[].inlineData`（`response` 是 JSON 对象装不下图）；**OpenAI chat
+    是唯一装不下的**（规范原文「For tool messages, only type `text` is supported」），
+    故降级**提升为紧随其后的一条 user 消息**并在 tool 消息文本里留一行说明
+  - 降级可见：新增能力面 `Capabilities::tool_result_images`（anthropic / openai_responses /
+    gemini = true，openai_compat = false），装不下时规划层产出 `CapabilityWarn`
+    进结构化日志（UI 日志页可见），不再静默
+  - 顺带修一处 data URL 误判：Responses 入站 `input_image` 的 `data:` URL 不再被整串塞进
+    `url` 字段（会被 Anthropic/Gemini 上游拒），改为拆出真实 `media_type` + 载荷
+  - 新增共享工具 `codec/image.rs`（data URL 解析口径统一 + 工具结果图片探测）
+  - 回归测试：`crates/gateway-core/tests/multimodal_image.rs` 由 5 例扩至 15 例；
+    新增 9 例均经改动前源码验证会失败（非空转）
+  - 协议依据来自四家官方 OpenAPI spec / proto / SDK 类型核查（Anthropic tool-use 文档示例、
+    OpenAI Chat 规范原文、Responses `FunctionCallOutputItemParam`、Gemini v1beta
+    `FunctionResponse.parts`），核查报告留档 `docs/design/tool-result-image-protocol-factcheck.md`；
+    **未验证项**：Gemini v1(GA) 是否支持 `parts` 无法确认（故依赖出站固定打 v1beta）、
+    `tool_result` 内非 base64 图源未获文档背书
+
+### Notes
+- **仍存**：Responses **出站**的消息级图片（`Block::Image` 在 user 消息里）仍按 "v1 不支持
+  图片内联转换" 丢弃，见 `codec/responses.rs` —— 同类静默丢失，本次未动（超出本次范围）。
+  注意：Responses 官方 schema 的 `input_image` 在 message 里是合法的，此注释疑似过时，
+  但改动会影响既有成功请求，需单独评估。
 
 ## [0.1.9] - 2026-09-11
 

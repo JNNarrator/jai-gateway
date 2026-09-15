@@ -368,15 +368,7 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                         .unwrap_or_default()
                         .to_string();
                     let is_error = m.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-                    let text = content
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_default();
-                    let result_blocks = if text.is_empty() {
-                        vec![]
-                    } else {
-                        vec![Block::Text { text }]
-                    };
+                    let result_blocks = decode_tool_content_blocks(content);
                     messages.push(CanonMessage {
                         role: Role::User,
                         blocks: vec![Block::ToolResult {
@@ -531,19 +523,7 @@ fn content_blocks(content: Option<&Value>) -> Result<Vec<Block>, String> {
                             .and_then(Value::as_str)
                             .unwrap_or_default();
                         // data:image/png;base64,xxxx 内联，否则当 URL
-                        if let Some((meta, b64)) = parse_data_url(img) {
-                            blocks.push(Block::Image {
-                                media_type: meta,
-                                data_base64: Some(b64),
-                                url: None,
-                            });
-                        } else {
-                            blocks.push(Block::Image {
-                                media_type: "image/png".into(),
-                                data_base64: None,
-                                url: Some(img.to_string()),
-                            });
-                        }
+                        blocks.push(crate::codec::image::image_block_from_url(img));
                     }
                     _ => {}
                 }
@@ -554,12 +534,42 @@ fn content_blocks(content: Option<&Value>) -> Result<Vec<Block>, String> {
     }
 }
 
-/// 解析 `data:image/{type};base64,{payload}`。
-fn parse_data_url(s: &str) -> Option<(String, String)> {
-    let rest = s.strip_prefix("data:")?;
-    let (meta, payload) = rest.split_once(',')?;
-    let media_type = meta.strip_suffix(";base64")?.to_string();
-    Some((media_type, payload.to_string()))
+/// 解析 `role=tool` 消息的 content → ToolResult 内容块。
+///
+/// OpenAI chat 规范里 tool 消息的 content 是字符串，但部分客户端与中转会
+/// 发送内容数组（可含 `image_url`，即"工具返回图片"）。旧实现只取
+/// `Value::as_str()`，遇到数组会得到空串——整条工具结果被静默抹掉。
+/// 此处对两种形状都接受：字符串 → Text；数组 → 逐 part 解析。
+fn decode_tool_content_blocks(content: Option<&Value>) -> Vec<Block> {
+    match content {
+        Some(Value::String(s)) if !s.is_empty() => vec![Block::Text { text: s.clone() }],
+        Some(Value::Array(parts)) => parts.iter().filter_map(decode_tool_content_part).collect(),
+        _ => vec![],
+    }
+}
+
+/// 解析 tool 消息内容数组里的单个 part（text / image_url，缺 type 时按 text 兜底）。
+fn decode_tool_content_part(p: &Value) -> Option<Block> {
+    match p.get("type").and_then(Value::as_str) {
+        Some("text") => p.get("text").and_then(Value::as_str).map(|t| Block::Text {
+            text: t.to_string(),
+        }),
+        Some("image_url") => {
+            let url = p
+                .get("image_url")
+                .and_then(|i| i.get("url"))
+                .and_then(Value::as_str)?;
+            if url.is_empty() {
+                None
+            } else {
+                Some(crate::codec::image::image_block_from_url(url))
+            }
+        }
+        // 兼容省略 type 的裸 {"text": "..."}
+        _ => p.get("text").and_then(Value::as_str).map(|t| Block::Text {
+            text: t.to_string(),
+        }),
+    }
 }
 
 /// 渲染非流式响应：CanonicalResponse → OpenAI chat.completion JSON。
@@ -641,6 +651,33 @@ fn usage_json(u: &Usage) -> Value {
 
 // Anthropic 入站 × OpenAI 上游 时使用（Claude Code × GPT 模型）。
 
+/// 渲染一个 OpenAI 图片 part（消息级与「工具结果提升」共用）。
+///
+/// url 优先；否则把 base64 载荷包成 data URL，`media_type` 缺失/为空才回落 png。
+/// 既无 url 也无载荷 → `None`（不产出空图片 part）。
+fn render_image_part(
+    media_type: &str,
+    data_base64: &Option<String>,
+    url: &Option<String>,
+) -> Option<Value> {
+    let url_val = if let Some(u) = url {
+        Value::String(u.clone())
+    } else if let Some(b64) = data_base64 {
+        let mime = if media_type.is_empty() {
+            "image/png"
+        } else {
+            media_type
+        };
+        Value::String(format!("data:{mime};base64,{b64}"))
+    } else {
+        return None;
+    };
+    Some(json!({
+        "type":"image_url",
+        "image_url":{"url": url_val}
+    }))
+}
+
 /// 编码请求：IR → OpenAI chat completions body。
 pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value, String> {
     let mut body = json!({
@@ -662,6 +699,8 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
                 let mut parts: Vec<Value> = Vec::new();
                 let mut has_image = false;
                 let mut tool_msgs: Vec<Value> = Vec::new();
+                // 工具结果内嵌图片的降级落点（tool 消息装不下图 → 提升为紧随其后的 user 消息）
+                let mut hoisted_parts: Vec<Value> = Vec::new();
                 for b in &m.blocks {
                     match b {
                         Block::Text { text: t } => {
@@ -687,22 +726,10 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
                             }
                             // OpenAI 可接受 url 或 base64 data url；url 优先，
                             // base64 的 data URL 用 IR 真实 media_type（缺失回落 png）
-                            let url_val = if let Some(u) = url {
-                                Value::String(u.clone())
-                            } else if let Some(b64) = data_base64 {
-                                let mime = if media_type.is_empty() {
-                                    "image/png"
-                                } else {
-                                    media_type.as_str()
-                                };
-                                Value::String(format!("data:{mime};base64,{b64}"))
-                            } else {
+                            let Some(part) = render_image_part(media_type, data_base64, url) else {
                                 continue;
                             };
-                            parts.push(json!({
-                                "type":"image_url",
-                                "image_url":{"url": url_val}
-                            }));
+                            parts.push(part);
                         }
                         Block::ToolResult {
                             call_id,
@@ -724,6 +751,29 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
                                 "tool_call_id": call_id,
                                 "content": content_val,
                             }));
+                            // 工具结果内嵌图片：OpenAI chat 规范明确「tool 消息只支持 text
+                            // part」，装不下图片 → 降级提升为紧随其后的一条 user 消息
+                            //（capability 面 tool_result_images=false，规划层已记 CapabilityWarn）。
+                            // 旧实现只渲染文本块，图片被无声丢弃。
+                            for c in content {
+                                if let Block::Image {
+                                    media_type,
+                                    data_base64,
+                                    url,
+                                } = c
+                                {
+                                    if let Some(p) = render_image_part(media_type, data_base64, url)
+                                    {
+                                        if hoisted_parts.is_empty() {
+                                            hoisted_parts.push(json!({
+                                                "type": "text",
+                                                "text": "[工具结果内嵌图片，已降级提升为紧随其后的 user 消息]"
+                                            }));
+                                        }
+                                        hoisted_parts.push(p);
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -739,6 +789,12 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
                     messages.push(json!({"role":"user","content":text}));
                 }
                 messages.extend(tool_msgs);
+                if !hoisted_parts.is_empty() {
+                    messages.push(json!({
+                        "role":"user",
+                        "content": Value::Array(hoisted_parts)
+                    }));
+                }
             }
             Role::Assistant => {
                 let mut content = String::new();

@@ -243,9 +243,70 @@ async fn dsh_second_round_independent_items() {
     let guard = captured.lock().unwrap();
     let up = guard.last().expect("mock 应收到请求");
     let msgs = up["messages"].as_array().unwrap();
-    println!("=== 变体3：独立 items，转换后 messages ===");
-    for m in msgs {
-        println!("  {}", serde_json::to_string(m).unwrap());
-    }
+    assert_tool_pairing(msgs);
+}
+
+/// 端到端（dsh 真实链路形状）：Responses 入站 + **openai_compat 上游**。
+///
+/// 工具结果内嵌图片时，OpenAI Chat 的 `role=tool` 消息只允许 text part（规范原文
+/// "For tool messages, only type `text` is supported"），装不下图片。网关须把它
+/// **降级提升**为紧随其后的一条 user 消息——否则截图类工具对模型完全不可见
+/// （agent 会陷入「要图 → 拿不到图 → 再要图」的空转）。
+#[tokio::test]
+async fn dsh_tool_result_image_hoisted_for_chat_upstream() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let fx = fixture(captured.clone()).await;
+    let b64 = "aGVsbG8tdmlzaW9u";
+    let body = json!({
+        "model":"dsh-model",
+        "input":[
+            {"role":"user","content":[{"type":"input_text","text":"截个图"}]},
+            {"type":"function_call","call_id":"call_1","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"截图如下"},
+                {"type":"input_image",
+                 "image_url": format!("data:image/jpeg;base64,{b64}")}
+            ]}
+        ]
+    });
+    let (status, resp) = fx.post_responses_raw(body).await;
+    assert_eq!(status, 200, "网关应转换成功: {resp}");
+
+    let guard = captured.lock().unwrap();
+    let up = guard.last().expect("mock 上游应收到请求");
+    let msgs = up["messages"].as_array().expect("Chat 上游应有 messages");
+
+    // ① tool 消息保留文本（图片不得让整条工具结果退化成空串）
+    let idx = msgs
+        .iter()
+        .position(|m| m["role"] == "tool")
+        .unwrap_or_else(|| panic!("应有 role=tool 消息，messages={msgs:?}"));
+    assert!(
+        msgs[idx]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("截图如下"),
+        "tool 消息应保留文本，messages={msgs:?}"
+    );
+
+    // ② 紧随其后有 user 消息承载图片，且 media_type 与载荷不失真
+    let next = &msgs[idx + 1];
+    assert_eq!(
+        next["role"], "user",
+        "图片应提升为紧随 tool 消息之后的 user 消息，messages={msgs:?}"
+    );
+    let img = next["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("提升消息应为多模态数组，messages={msgs:?}"))
+        .iter()
+        .find(|c| c["type"] == "image_url")
+        .unwrap_or_else(|| panic!("提升消息应含 image_url part，messages={msgs:?}"));
+    assert_eq!(
+        img["image_url"]["url"],
+        format!("data:image/jpeg;base64,{b64}"),
+        "media_type 不得退化（jpeg 不能被当 png）"
+    );
+
+    // ③ 不得破坏既有的「tool_calls 必须有配对 tool 消息」上游约束
     assert_tool_pairing(msgs);
 }

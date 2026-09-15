@@ -6,6 +6,7 @@
 //! - `openai`   ：OpenAI 旁路工具（M1）+ InboundCodec::OpenAI（M4）
 //! - `anthropic`：Anthropic 直通助手（M3）+ UpstreamCodec::Anthropic（M4）
 //! - `gemini`   ：UpstreamCodec::Gemini（M4）
+//! - `image`    ：图片块构造与 data URL 解析的共享工具（跨族保真）
 //!
 //! 实现节奏：M1 直通 → M3 Anthropic 直通 → M4/M5 跨族 Codec → M6 Responses 入站。
 
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 pub mod anthropic;
 pub mod capability;
 pub mod gemini;
+pub mod image;
 pub mod ir;
 pub mod openai;
 pub mod responses;

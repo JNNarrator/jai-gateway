@@ -114,6 +114,22 @@ JAI 当前专注适配两个国产 Agent，协议直通与跨族转换对其透�
 
 接入配置：baseURL `http://127.0.0.1:1314/v1`，API Key 用网关 Key（`sk-jai-*`，见应用「网关」页，同页提供各客户端内置接入示例）。
 
+### dsh 一键接入（脚本）
+
+```bash
+node scripts/setup_dsh.mjs --dry-run   # 先看将发生的 diff（不写盘、key 脱敏）
+node scripts/setup_dsh.mjs             # 合并进 $DSH_HOME/settings.yaml + 写 $DSH_HOME/.env(0600)
+```
+
+把 JAI 作为一条 `llm-pi-ai` provider route 写进 dsh 配置（默认 route 名 `jai`、`api: openai-responses`，
+可用 `--api openai-completions` 切 Chat 线），`models` 取自 JAI 实时 `/v1/models`，网关 Key 写进
+`$DSH_HOME/.env`（权限 0600，由 `apiKeyEnv` 引用）。改动前自动打时间戳备份，**不改动其他 route、
+注释与用户自加字段**，重复执行幂等。合并结果会先过 dsh 自己的运行时 schema 校验
+（`@deepseek-ai/dsh-llm-pi-ai.Config`）再落盘。
+
+> ⚠️ 执行前请先退出正在运行的 dsh：dsh 运行时会整份重写 `settings.yaml`，可能覆盖合并结果。
+> 自测：`node scripts/setup_dsh_test.mjs`（离线、自带假网关，9 项断言）。
+
 > 💡 Windows 提示：JAI（reqwest）不读 Windows 系统代理。需代理访问上游时，优先在设置页「网络代理」填写代理地址（保存后重启网关生效）；也可用环境变量 `HTTPS_PROXY=http://127.0.0.1:7890` 启动，否则对需代理的上游返回 502 `all_providers_failed`。
 
 其他客户端（Claude Code、Codex、Continue 等）经协议直通仍可使用，但不在专属适配范围内。

@@ -59,6 +59,12 @@ pub struct Capabilities {
     pub reasoning: EffortMode,
     /// 流式 usage 支持（encoder 决定是否注入 stream_options/include_usage）
     pub streaming_usage: bool,
+    /// 工具结果内嵌图片能否原生承载（`tool_result` / `function_call_output` 里的图片）。
+    ///
+    /// `false` 时 encoder 会把它**降级提升**为紧随其后的一条 user 消息
+    /// （两族都原生支持 user 消息带图），并由本层记一条 CapabilityWarn——
+    /// 而不是像旧实现那样静默丢弃。
+    pub tool_result_images: bool,
 }
 
 fn set(ss: &[&'static str]) -> HashSet<&'static str> {
@@ -98,6 +104,8 @@ static OPENAI_COMPAT_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilitie
     degraded_formats: &[],
     reasoning: EffortMode::Native,
     streaming_usage: true,
+    // OpenAI chat 的 role=tool 消息 content 只能是字符串，装不下图片
+    tool_result_images: false,
 });
 
 static OPENAI_RESPONSES_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
@@ -118,6 +126,8 @@ static OPENAI_RESPONSES_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabili
     degraded_formats: &[],
     reasoning: EffortMode::Native,
     streaming_usage: true,
+    // Responses 的 function_call_output.output 支持内容项数组（含 input_image）
+    tool_result_images: true,
 });
 
 static ANTHROPIC_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
@@ -133,6 +143,8 @@ static ANTHROPIC_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
     ],
     reasoning: EffortMode::Boolean,
     streaming_usage: true,
+    // Anthropic 的 tool_result.content 是 content block 数组，可含 image
+    tool_result_images: true,
 });
 
 static GEMINI_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
@@ -155,6 +167,8 @@ static GEMINI_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
     ],
     reasoning: EffortMode::None,
     streaming_usage: false,
+    // v1beta 的 functionResponse.parts 可承载 inlineData（JAI 出站固定打 v1beta）
+    tool_result_images: true,
 });
 
 /// 按出站协议族取能力表。
@@ -255,8 +269,31 @@ pub fn plan_compatibility<'a>(
     plan_tools(req, caps, &mut plan);
     plan_tool_choice(req, &mut plan);
     plan_extension_fields(req, caps, &mut plan);
+    plan_tool_result_images(req, caps, &mut plan);
 
     plan
+}
+
+/// 工具结果内嵌图片的承载能力。
+///
+/// agent 客户端（Claude Code / dsh / Codex）的截图类工具把图片放在**工具结果**里；
+/// 目标族装不下时（如 OpenAI chat 的 `role=tool` 只允许 text part），encoder 会把它
+/// **降级提升**为紧随其后的一条 user 消息——这里是该降级的显式记录点，
+/// 避免像旧实现那样静默丢图（旧实现只渲染文本块，图片无声消失）。
+fn plan_tool_result_images(
+    req: &CanonicalRequest,
+    caps: &Capabilities,
+    plan: &mut CompatibilityPlan,
+) {
+    if caps.tool_result_images || !crate::codec::image::request_has_tool_result_image(req) {
+        return;
+    }
+    plan.diagnostics.push(Diagnostic {
+        path: "messages[].tool_result.image".into(),
+        action: DecisionAction::Degraded,
+        reason: "工具结果内嵌图片在该上游族无法原生承载，已降级提升为紧随其后的一条 user 消息"
+            .into(),
+    });
 }
 
 fn plan_response_format(req: &CanonicalRequest, caps: &Capabilities, plan: &mut CompatibilityPlan) {
@@ -886,6 +923,7 @@ mod tests {
             degraded_formats: &[("json_schema", FormatDegradation::JsonObject)],
             reasoning: EffortMode::None,
             streaming_usage: true,
+            tool_result_images: true,
         };
         let mut ext = Map::new();
         ext.insert("response_format".into(), response_format_json_schema());

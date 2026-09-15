@@ -136,6 +136,31 @@ use crate::codec::ir::{
     StreamEvent, ToolChoice, ToolSpec, Usage,
 };
 
+/// 渲染 IR 叶子块（`text` / `image`）为 Anthropic content block。
+///
+/// 消息级 `content` 与 `tool_result.content` 都是 content block 数组，两处共用
+/// 同一渲染口径——否则工具结果里的图片会在转换路径被丢掉（同族直通不受影响，
+/// 直通是字节转发，所以「客户端能发、Anthropic 能收」这件事本身就是既成事实）。
+/// 其余块型（ToolUse / ToolResult）由调用方另行展开，返回 `None`。
+fn render_leaf_block(b: &Block) -> Option<Value> {
+    match b {
+        Block::Text { text } => Some(json!({"type":"text","text":text})),
+        Block::Image {
+            media_type,
+            data_base64,
+            url,
+        } => {
+            let src = if let Some(b64) = data_base64 {
+                json!({"type":"base64","media_type":media_type,"data":b64})
+            } else {
+                json!({"type":"url","url":url.as_deref().unwrap_or("")})
+            };
+            Some(json!({"type":"image","source":src}))
+        }
+        _ => None,
+    }
+}
+
 /// 编码请求：IR → Anthropic Messages body。
 /// `max_output_tokens` 由调用方保证（请求侧缺省时用模型配置值）。
 pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
@@ -221,18 +246,10 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                 let mut has_tool_result = false;
                 for b in &m.blocks {
                     match b {
-                        Block::Text { text } => blocks.push(json!({"type":"text","text":text})),
-                        Block::Image {
-                            media_type,
-                            data_base64,
-                            url,
-                        } => {
-                            let src = if let Some(b64) = data_base64 {
-                                json!({"type":"base64","media_type":media_type,"data":b64})
-                            } else {
-                                json!({"type":"url","url":url.as_deref().unwrap_or("")})
-                            };
-                            blocks.push(json!({"type":"image","source":src}));
+                        Block::Text { .. } | Block::Image { .. } => {
+                            if let Some(v) = render_leaf_block(b) {
+                                blocks.push(v);
+                            }
                         }
                         Block::ToolResult {
                             call_id,
@@ -240,11 +257,10 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                             is_error,
                         } => {
                             has_tool_result = true;
-                            let content_json: Vec<Value> = content
-                                .iter()
-                                .filter_map(|c| c.as_text())
-                                .map(|t| json!({"type":"text","text":t}))
-                                .collect();
+                            // tool_result 的 content 同样是 content block 数组，
+                            // 官方允许其中含 image（Claude Code 的截图类工具会这么发）
+                            let content_json: Vec<Value> =
+                                content.iter().filter_map(render_leaf_block).collect();
                             blocks.push(json!({
                                 "type":"tool_result",
                                 "tool_use_id": call_id,
@@ -738,6 +754,50 @@ mod tests {
 
 use crate::codec::ir::{canonical_to_anthropic_id, decode_anthropic_tool_id};
 
+/// 解析 Anthropic content block（`text` / `image`）→ IR 块。
+///
+/// 消息级 content 与 `tool_result.content` 共用同一口径：后者也是 content block
+/// 数组，且官方允许其中含 image（Claude Code 的截图类工具就这么发）。
+/// 未知类型 / 未知 source 一律返回 `None`（Lenient 丢弃，与既有行为一致）。
+fn decode_anthropic_content_block(p: &Value) -> Option<Block> {
+    match p.get("type").and_then(Value::as_str) {
+        Some("text") => p.get("text").and_then(Value::as_str).map(|t| Block::Text {
+            text: t.to_string(),
+        }),
+        Some("image") => {
+            let source = p.get("source");
+            let stype = source
+                .and_then(|s| s.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match stype {
+                "base64" => Some(Block::Image {
+                    media_type: source
+                        .and_then(|s| s.get("media_type"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png")
+                        .to_string(),
+                    data_base64: source
+                        .and_then(|s| s.get("data"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    url: None,
+                }),
+                "url" => Some(Block::Image {
+                    media_type: "image/png".into(),
+                    data_base64: None,
+                    url: source
+                        .and_then(|s| s.get("url"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// 解码 Anthropic Messages 请求 → CanonicalRequest。
 pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
     let v: Value = serde_json::from_slice(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
@@ -789,33 +849,8 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                 Some("image") => {
                                     // 图片块（Claude Code 等客户端）：base64 内联或 http url；
                                     // 未知 source 类型 Lenient 丢弃
-                                    let source = p.get("source");
-                                    let stype = source
-                                        .and_then(|s| s.get("type"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default();
-                                    match stype {
-                                        "base64" => blocks.push(Block::Image {
-                                            media_type: source
-                                                .and_then(|s| s.get("media_type"))
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("image/png")
-                                                .to_string(),
-                                            data_base64: source
-                                                .and_then(|s| s.get("data"))
-                                                .and_then(Value::as_str)
-                                                .map(str::to_string),
-                                            url: None,
-                                        }),
-                                        "url" => blocks.push(Block::Image {
-                                            media_type: "image/png".into(),
-                                            data_base64: None,
-                                            url: source
-                                                .and_then(|s| s.get("url"))
-                                                .and_then(Value::as_str)
-                                                .map(str::to_string),
-                                        }),
-                                        _ => {}
+                                    if let Some(b) = decode_anthropic_content_block(p) {
+                                        blocks.push(b);
                                     }
                                 }
                                 Some("tool_use") => {
@@ -848,15 +883,12 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                             Value::String(s) => {
                                                 Some(vec![Block::Text { text: s.clone() }])
                                             }
+                                            // tool_result 的内容是 content block 数组，
+                                            // 其中可含图片（Claude Code 的截图类工具会这么发）。
+                                            // 旧实现只挑 `text` 字段，图片整块丢失。
                                             Value::Array(a) => Some(
                                                 a.iter()
-                                                    .filter_map(|x| {
-                                                        x.get("text").and_then(Value::as_str).map(
-                                                            |t| Block::Text {
-                                                                text: t.to_string(),
-                                                            },
-                                                        )
-                                                    })
+                                                    .filter_map(decode_anthropic_content_block)
                                                     .collect(),
                                             ),
                                             _ => None,

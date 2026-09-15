@@ -139,6 +139,76 @@ fn extended_tool_item(
     }
 }
 
+/// 解析 Responses 的图片 part（`input_image`）→ Image 块。
+///
+/// 两种形状：
+/// - `{"type":"input_image","image_url":"https://…" | "data:image/jpeg;base64,…"}`
+/// - `{"type":"input_image","image":"<base64 载荷>"}`（部分客户端省略 `data:` 前缀）
+///
+/// 旧实现把整个 data URL 塞进 `url`、把裸 base64 一律标成 png：前者会让上游
+/// 收到非法的"远程 URL"（Anthropic/Gemini 会直接拒），此处统一走
+/// `codec::image` 的共享解析口径。
+fn decode_image_part(part: &Value) -> Option<Block> {
+    // 形状一：image_url（可为 data URL，也可为远程 URL）
+    if let Some(url) = part.get("image_url").and_then(Value::as_str) {
+        if url.is_empty() {
+            return None;
+        }
+        return Some(crate::codec::image::image_block_from_url(url));
+    }
+    // 形状二：image 字段直接给 base64 载荷（可带 data: 前缀）
+    let raw = part.get("image").and_then(Value::as_str)?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(match crate::codec::image::parse_data_url(raw) {
+        Some((media_type, data_base64)) => Block::Image {
+            media_type,
+            data_base64: Some(data_base64),
+            url: None,
+        },
+        None => Block::Image {
+            media_type: "image/png".into(),
+            data_base64: Some(raw.to_string()),
+            url: None,
+        },
+    })
+}
+
+/// 解析 `function_call_output.output` → ToolResult 内容块。
+///
+/// Responses 允许 `output` 为字符串，也允许内容项数组（其中可有 `input_image`
+/// ——即"工具返回图片"，如截图/图表工具）。旧实现只取 `Value::as_str()`，
+/// 数组形状会得到空串：工具结果连同图片一起被静默抹掉。
+fn decode_function_output_blocks(output: Option<&Value>) -> Vec<Block> {
+    match output {
+        Some(Value::String(s)) if !s.is_empty() => vec![Block::Text { text: s.clone() }],
+        Some(Value::Array(items)) => items.iter().filter_map(decode_output_part).collect(),
+        _ => vec![],
+    }
+}
+
+/// 解析 function_call_output 内容项数组里的单个 part。
+fn decode_output_part(part: &Value) -> Option<Block> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("input_image") => decode_image_part(part),
+        Some("input_text" | "output_text" | "text") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|t| Block::Text {
+                text: t.to_string(),
+            }),
+        // 兼容省略 type 的内容项：优先 text，其次图片字段
+        _ => part
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|t| Block::Text {
+                text: t.to_string(),
+            })
+            .or_else(|| decode_image_part(part)),
+    }
+}
+
 /// 从 Responses reasoning item 提取推理文本，兼容三种形状：
 /// - OpenAI 标准：`summary` / `content` 数组（summary_text / reasoning_text 元素）
 /// - 旧式：`reasoning` 数组（含 `text` 字段）或字符串
@@ -288,23 +358,8 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                             }
                                         }
                                         "input_image" => {
-                                            if let Some(image_url) =
-                                                part.get("image_url").and_then(Value::as_str)
-                                            {
-                                                blocks.push(Block::Image {
-                                                    media_type: "image/png".into(),
-                                                    data_base64: None,
-                                                    url: Some(image_url.to_string()),
-                                                });
-                                            } else if let Some(detail) =
-                                                part.get("image").and_then(Value::as_str)
-                                            {
-                                                // 兼容 data URL 内联
-                                                blocks.push(Block::Image {
-                                                    media_type: "image/png".into(),
-                                                    data_base64: Some(detail.to_string()),
-                                                    url: None,
-                                                });
+                                            if let Some(b) = decode_image_part(part) {
+                                                blocks.push(b);
                                             }
                                         }
                                         _ => {
@@ -366,18 +421,10 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                         .and_then(Value::as_str)
                                         .unwrap_or_default()
                                         .to_string();
-                                    let output = fco
-                                        .get("output")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_string();
+                                    let content = decode_function_output_blocks(fco.get("output"));
                                     blocks.push(Block::ToolResult {
                                         call_id,
-                                        content: if output.is_empty() {
-                                            vec![]
-                                        } else {
-                                            vec![Block::Text { text: output }]
-                                        },
+                                        content,
                                         is_error: false,
                                     });
                                 }
@@ -423,20 +470,12 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string();
-                            let output = item
-                                .get("output")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
+                            let output_blocks = decode_function_output_blocks(item.get("output"));
                             messages.push(CanonMessage {
                                 role: Role::User,
                                 blocks: vec![Block::ToolResult {
                                     call_id,
-                                    content: if output.is_empty() {
-                                        vec![]
-                                    } else {
-                                        vec![Block::Text { text: output }]
-                                    },
+                                    content: output_blocks,
                                     is_error: false,
                                 }],
                             });
@@ -911,6 +950,30 @@ fn build_usage(u: &Usage) -> Value {
     usage
 }
 
+/// 渲染一个 `input_image` 内容项（工具结果内嵌图片用）。
+///
+/// 口径与 openai 编码器一致：url 优先；否则把 base64 载荷包回 data URL，
+/// media_type 缺失时回落 png。既无 url 也无载荷 → `None`（不产出空图片项）。
+fn render_input_image(
+    media_type: &str,
+    data_base64: &Option<String>,
+    url: &Option<String>,
+) -> Option<Value> {
+    let url_val = if let Some(u) = url {
+        u.clone()
+    } else if let Some(b64) = data_base64 {
+        let mime = if media_type.is_empty() {
+            "image/png"
+        } else {
+            media_type
+        };
+        format!("data:{mime};base64,{b64}")
+    } else {
+        return None;
+    };
+    Some(json!({"type": "input_image", "image_url": url_val}))
+}
+
 /// 编码 IR → OpenAI Responses API 请求体（上游侧）。
 ///
 /// 与 [`decode_request`] 保持对称；主要用于 MCP 工具自动合并时
@@ -947,10 +1010,45 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                                 .filter_map(|c| c.as_text())
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            let output = if *is_error {
-                                format!("[error] {text}")
+                            // 工具结果内的图片：Responses 的 `output` 支持内容项数组
+                            //（`input_image`），因此存在非文本块时改用数组形状；
+                            // 纯文本仍走字符串形状（既有字节口径不变）。
+                            // 旧实现只 `filter_map(as_text)`，图片被无声吃掉。
+                            let images: Vec<&Block> = content
+                                .iter()
+                                .filter(|c| matches!(c, Block::Image { .. }))
+                                .collect();
+                            let output = if images.is_empty() {
+                                Value::String(if *is_error {
+                                    format!("[error] {text}")
+                                } else {
+                                    text
+                                })
                             } else {
-                                text
+                                let mut items: Vec<Value> = Vec::new();
+                                let head = if *is_error {
+                                    format!("[error] {text}")
+                                } else {
+                                    text
+                                };
+                                if !head.is_empty() {
+                                    items.push(json!({"type":"input_text","text": head}));
+                                }
+                                for img in images {
+                                    if let Block::Image {
+                                        media_type,
+                                        data_base64,
+                                        url,
+                                    } = img
+                                    {
+                                        if let Some(v) =
+                                            render_input_image(media_type, data_base64, url)
+                                        {
+                                            items.push(v);
+                                        }
+                                    }
+                                }
+                                Value::Array(items)
                             };
                             tool_results.push(json!({
                                 "type": "function_call_output",

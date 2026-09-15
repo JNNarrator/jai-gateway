@@ -45,6 +45,12 @@ JAI 已认准 dsh 是第一优先客户端（[README.md:112](../../README.md)）
 - 落点：`scripts/` 新增生成器，或 Tauri IPC 命令 + 设置页按钮；实现 settings.yaml 结构化合并 + 备份 + `--dry-run`
 - 验证：在临时 `DSH_HOME` 下执行，断言既有其他 route 与注释被保留、`.env` 权限 0600、重复执行幂等
 
+> **状态更新（2026-09-15）：已落地** —— `scripts/setup_dsh.mjs`（结构化合并 + 时间戳备份 +
+> `--dry-run` + 幂等 + `.env` 0600），配套离线自测 `scripts/setup_dsh_test.mjs`（9 项断言全绿）。
+> schema 依据为本机实证：`~/.dsh/settings.yaml:5-37` 的真实 JAI route，以及落盘前加载的
+> `@deepseek-ai/dsh-llm-pi-ai` 运行时 schema 校验。**未覆盖**：dsh 真机 boot（端到端启动）验证
+> —— `dsh --dump-config` 会写入用户真实 profile 目录，需用户同意并短暂退出 dsh 才能做。
+
 ### P1-1 冷却分级：Retry-After 感知 + 错误类型区分 + 时间窗自愈
 JAI 已有失败持久记忆与健康降级（[crates/gateway-core/src/server/proxy.rs:1027](../../crates/gateway-core/src/server/proxy.rs) → [crates/gateway-core/src/store/mod.rs:333](../../crates/gateway-core/src/store/mod.rs)；[crates/gateway-core/src/router/mod.rs:14](../../crates/gateway-core/src/router/mod.rs)、[:54](../../crates/gateway-core/src/router/mod.rs)），且 `router` 注释明确写着"最近失败的主渠道会被健康备渠道接管，而不是每次先撞一次失败"——这块的**骨架是对的**。差距在**分级**（[配额与冷却引擎](https://github.com/tashfeenahmed/freellmapi/blob/main/docs/en/architecture/02-quota-and-cooldown-engine.md) §4/§6）有三点：
 1. **不听 Retry-After**：上游说"1 小时后重试"，JAI 过了 5 分钟照打——对日额度耗尽（RPD/TPD）这类错误，5 分钟窗口等于没有；
