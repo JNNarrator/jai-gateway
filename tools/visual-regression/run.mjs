@@ -162,7 +162,7 @@ function probe() {
   const res = {
     vw, vh,
     doc: { scrollW: document.documentElement.scrollWidth, clientW: document.documentElement.clientWidth, scrollH: document.documentElement.scrollHeight, clientH: document.documentElement.clientHeight },
-    unreachable: [], covered: [], offscreenScroll: [], clipped: [], clippedEdge: [], clippedInScroller: [], dialogs: [], toasts: [], menus: [],
+    unreachable: [], covered: [], offscreenScroll: [], clipped: [], clippedEdge: [], clippedInScroller: [], underSticky: [], dialogs: [], toasts: [], menus: [],
     counts: { inter: 0 },
   };
   const nodes = Array.from(document.querySelectorAll(INTER));
@@ -204,6 +204,7 @@ function probe() {
       const hdr = document.querySelector("header");
       const hdrBottom = hdr ? hdr.getBoundingClientRect().bottom : 0;
       if (top && top.tagName === "HEADER" && hdrBottom > 0 && r.top < hdrBottom) res.clippedEdge.push(item);
+      else if (top && getComputedStyle(top).position === "sticky") res.underSticky.push(item); // 被页面吸顶操作条/表头压住，属可见性设计
       else res.covered.push(item);
     }
   }
@@ -282,7 +283,7 @@ async function snap(label, note) {
   out.steps.push({ idx, label, note: note || "", shot: path.relative(".", file), probe: p });
   const dlgBad = (p.dialogs || []).reduce((a, d) => a + d.unreachableCount, 0);
   const n = (p.unreachable?.length || 0) + (p.covered?.length || 0) + dlgBad;
-  console.log(`[${idx}] ${label} :: out=${p.unreachable?.length ?? "?"} covered=${p.covered?.length ?? "?"} dlg=${(p.dialogs || []).map((d) => `${d.title || d.slot}:${d.overflowTop > 1 || d.overflowBottom > 1 ? "OVERFLOW" : "fit"}(unreach ${d.unreachableCount})`).join(" | ") || "-"} menus=${(p.menus || []).length} BAD=${n} clippedEdge=${p.clippedEdge?.length ?? 0} inScroller=${p.clippedInScroller?.length ?? 0}`);
+  console.log(`[${idx}] ${label} :: out=${p.unreachable?.length ?? "?"} covered=${p.covered?.length ?? "?"} dlg=${(p.dialogs || []).map((d) => `${d.title || d.slot}:${d.overflowTop > 1 || d.overflowBottom > 1 ? "OVERFLOW" : "fit"}(unreach ${d.unreachableCount})`).join(" | ") || "-"} menus=${(p.menus || []).length} BAD=${n} clippedEdge=${p.clippedEdge?.length ?? 0} inScroller=${p.clippedInScroller?.length ?? 0} underSticky=${p.underSticky?.length ?? 0}`);
   fs.writeFileSync(path.join(ROOT, `out-${TAG}.json`), JSON.stringify({ ...out, consoleErrors: [...new Set(consoleErrors)] }, null, 2));
   return p;
 }

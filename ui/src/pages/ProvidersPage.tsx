@@ -286,12 +286,12 @@ function ProviderCard(props: {
                 优先级 {p.priority} · 权重 {p.weight}
               </span>
               {!p.hasKey && (
-                <Badge variant="outline" className="border-amber-500/40 text-amber-600 dark:text-amber-400">
+                <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-400">
                   缺少凭据
                 </Badge>
               )}
               {p.lastOkAt && !lastFailed && (
-                <Badge variant="outline" className="border-emerald-500/30 text-emerald-600 dark:text-emerald-400">
+                <Badge variant="outline" className="border-emerald-500/30 text-emerald-700 dark:text-emerald-400">
                   最近成功
                 </Badge>
               )}
@@ -337,7 +337,7 @@ function ProviderCard(props: {
                 className={cn(
                   "mt-1 text-xs",
                   props.msg.startsWith("连接成功") || props.msg.startsWith("发现")
-                    ? "text-emerald-600 dark:text-emerald-400"
+                    ? "text-emerald-700 dark:text-emerald-400"
                     : "text-destructive",
                 )}
               >
@@ -678,7 +678,7 @@ function ProviderDialog({
               <div
                 className={cn(
                   "text-xs",
-                  testMsg.ok ? "text-emerald-600 dark:text-emerald-400" : "text-destructive",
+                  testMsg.ok ? "text-emerald-700 dark:text-emerald-400" : "text-destructive",
                 )}
               >
                 {testMsg.text}

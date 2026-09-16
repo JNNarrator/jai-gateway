@@ -378,7 +378,7 @@ export function SyncPage() {
         </div>
       )}
       {msg && (
-        <div className="rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-primary">
+        <div className="rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-foreground">
           {msg}
         </div>
       )}
@@ -582,7 +582,7 @@ export function SyncPage() {
               <div className="text-xs text-muted-foreground">
                 上次自动推送：
                 {new Date(lastAuto.atMs).toLocaleString("zh-CN", { hour12: false })} ·{" "}
-                <span className={lastAuto.ok ? "text-emerald-600" : "text-destructive"}>
+                <span className={lastAuto.ok ? "text-emerald-700 dark:text-emerald-400" : "text-destructive"}>
                   {lastAuto.ok ? "成功" : lastAuto.message}
                 </span>
               </div>
@@ -591,7 +591,7 @@ export function SyncPage() {
               <div className="text-xs text-muted-foreground">
                 上次自动拉取：
                 {new Date(lastAutoPull.atMs).toLocaleString("zh-CN", { hour12: false })} ·{" "}
-                <span className={lastAutoPull.ok ? "text-emerald-600" : "text-destructive"}>
+                <span className={lastAutoPull.ok ? "text-emerald-700 dark:text-emerald-400" : "text-destructive"}>
                   {lastAutoPull.ok ? "成功" : lastAutoPull.message}
                 </span>
               </div>
@@ -651,7 +651,7 @@ export function SyncPage() {
                       <div className="truncate font-mono">
                         {b.name}
                         {b.isCurrent && (
-                          <span className="ml-2 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+                          <span className="ml-2 rounded bg-muted px-1 py-0.5 text-[11px] text-foreground">
                             当前
                           </span>
                         )}
@@ -750,7 +750,7 @@ export function SyncPage() {
                 )}
               </div>
               <div>
-                <div className="mb-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                <div className="mb-1 text-xs font-medium text-emerald-700 dark:text-emerald-400">
                   本地独有 · 推送将新增到远端
                 </div>
                 {pushDiff.localOnlyProviders.length === 0 &&

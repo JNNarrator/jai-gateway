@@ -69,9 +69,10 @@ export function LogsPage() {
   ).sort();
 
   function statusClass(s: number) {
-    if (s >= 500) return "text-red-600 dark:text-red-400";
-    if (s >= 400) return "text-red-500 dark:text-red-300";
-    if (s >= 200 && s < 300) return "text-emerald-600 dark:text-emerald-400";
+    // 表格行有 bg-muted/50 底纹，会再拉低对比度：统一用 700/800 级保证 AA
+    if (s >= 500) return "text-red-800 dark:text-red-400";
+    if (s >= 400) return "text-red-700 dark:text-red-300";
+    if (s >= 200 && s < 300) return "text-emerald-700 dark:text-emerald-400";
     return "text-muted-foreground";
   }
 

@@ -27,7 +27,11 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       richColors
       visibleToasts={2}
       style={{ pointerEvents: "none" }}
-      toastOptions={{ duration: 2400, style: { pointerEvents: "none" } }}
+      toastOptions={{
+        duration: 2400,
+        // 只做视觉反馈：不吞点击；文字用 --foreground，避免 richColors 彩色字低于 AA
+        style: { pointerEvents: "none", color: "var(--foreground)" },
+      }}
     />
   </React.StrictMode>,
 );

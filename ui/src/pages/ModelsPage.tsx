@@ -152,6 +152,7 @@ export function ModelsPage() {
         />
       ) : (
         <>
+        {/* 窄窗口（最小 760px）下 7 列会横向溢出：表格容器内可横向滚动 */}
         <div className="rounded-lg border">
           <Table>
             <TableHeader>
@@ -197,6 +198,10 @@ export function ModelsPage() {
             </div>
           )}
         </div>
+        {/* 7 列在最小窗口（760px）下约溢出 217px：表格可横向滚动，这里给出可见提示 */}
+        <p className="hidden text-[11px] text-muted-foreground max-lg:block">
+          窗口较窄：表格可左右滑动，查看「上下文 / 最大输出 / 模态 / 启用 / 操作」等列。
+        </p>
         </>
       )}
     </div>
@@ -319,7 +324,7 @@ function ModalityBadges({ list }: { list: Modality[] | null }) {
   return (
     <span className="inline-flex flex-wrap justify-center gap-0.5">
       {list.map((x) => (
-        <Badge key={x} variant="secondary" className="px-1 py-0 text-[10px] font-normal">
+        <Badge key={x} variant="secondary" className="px-1 py-0 text-[11px] font-normal">
           {MODALITY_LABEL[x]}
         </Badge>
       ))}

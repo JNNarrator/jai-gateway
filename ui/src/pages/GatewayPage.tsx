@@ -130,7 +130,7 @@ export function GatewayPage() {
             role="alert"
             className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm"
           >
-            <AlertTriangle className="size-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />
+            <AlertTriangle className="size-4 shrink-0 text-amber-700 dark:text-amber-400" aria-hidden />
             <span className="text-amber-700 dark:text-amber-300">
               上次健康检查 {new Date(health.checkedAtMs).toLocaleTimeString("zh-CN", { hour12: false })} ·
               {health.down.length} 个供应商不可用：

@@ -167,7 +167,27 @@ export function SettingsPage() {
     <div className="mx-auto max-w-2xl space-y-4">
       <PageHeader title="设置" description="端口、日志、安全策略与软件更新。" />
 
-      <Card>
+      {/* 吸顶锚点：设置页较长（多张卡片），让端口/代理/日志/CORS/凭据/更新随时可跳 */}
+      <nav className="sticky top-0 z-10 flex flex-wrap gap-1 rounded-md border border-border/60 bg-background/95 px-1.5 py-1 backdrop-blur">
+        {([["settings-port", "端口"], ["settings-proxy", "代理"], ["settings-logs", "日志"], ["settings-cors", "跨域"], ["settings-creds", "凭据"], ["settings-data", "数据"], ["settings-update", "更新"]] as Array<[string, string]>).map(
+          ([id, label]) => (
+            <Button
+              key={id}
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={() =>
+                document.getElementById(id)?.scrollIntoView({ block: "start", behavior: "smooth" })
+              }
+            >
+              {label}
+            </Button>
+          ),
+        )}
+      </nav>
+
+
+      <Card id="settings-port" className="scroll-mt-16">
         <CardHeader>
           <CardTitle>网关端口</CardTitle>
           <CardDescription>默认 1314；被占用时顺延，实际端口见「网关」页。</CardDescription>
@@ -183,11 +203,11 @@ export function SettingsPage() {
             />
             <Button onClick={savePort}>保存</Button>
           </div>
-          {portMsg && <div className="text-xs text-emerald-600 dark:text-emerald-400">{portMsg}</div>}
+          {portMsg && <div className="text-xs text-emerald-700 dark:text-emerald-400">{portMsg}</div>}
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id="settings-proxy" className="scroll-mt-16">
         <CardHeader>
           <CardTitle className="flex items-center gap-2.5">
             <Globe className="size-4" aria-hidden />
@@ -250,7 +270,7 @@ export function SettingsPage() {
             <div
               className={
                 proxyMsgOk
-                  ? "text-xs text-emerald-600 dark:text-emerald-400"
+                  ? "text-xs text-emerald-700 dark:text-emerald-400"
                   : "text-xs text-destructive"
               }
             >
@@ -260,7 +280,7 @@ export function SettingsPage() {
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id="settings-logs" className="scroll-mt-16">
         <CardHeader>
           <CardTitle className="flex items-center gap-2.5">
             请求日志
@@ -282,11 +302,11 @@ export function SettingsPage() {
           <Button variant="outline" size="sm" onClick={() => setRetentionOpen(true)}>
             编辑保留策略
           </Button>
-          {logMsg && <div className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">{logMsg}</div>}
+          {logMsg && <div className="mt-2 text-xs text-emerald-700 dark:text-emerald-400">{logMsg}</div>}
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id="settings-cors" className="scroll-mt-16">
         <CardHeader>
           <CardTitle>浏览器跨域白名单（CORS）</CardTitle>
           <CardDescription>
@@ -327,12 +347,12 @@ export function SettingsPage() {
             >
               填入示例
             </Button>
-            {saved && <span className="text-xs text-emerald-600 dark:text-emerald-400">已生效</span>}
+            {saved && <span className="text-xs text-emerald-700 dark:text-emerald-400">已生效</span>}
           </div>
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id="settings-creds" className="scroll-mt-16">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <KeyRound className="size-4" aria-hidden />
@@ -354,7 +374,7 @@ export function SettingsPage() {
         </CardContent>
       </Card>
 
-      <Card>
+      <Card id="settings-data" className="scroll-mt-16">
         <CardHeader>
           <CardTitle>数据位置</CardTitle>
         </CardHeader>
@@ -541,7 +561,7 @@ function UpdateCard() {
   }
 
   return (
-    <Card>
+    <Card id="settings-update" className="scroll-mt-16">
       <CardHeader>
         <CardTitle>软件更新</CardTitle>
         <CardDescription>
@@ -551,7 +571,7 @@ function UpdateCard() {
       </CardHeader>
       <CardContent className="space-y-3">
         {status === "latest" && (
-          <div className="text-sm text-emerald-600 dark:text-emerald-400">
+          <div className="text-sm text-emerald-700 dark:text-emerald-400">
             ✓ 已是最新版本{version ? `（v${version}）` : ""}
           </div>
         )}
@@ -583,7 +603,7 @@ function UpdateCard() {
           </div>
         )}
         {status === "ready" && (
-          <div className="text-sm text-emerald-600 dark:text-emerald-400">
+          <div className="text-sm text-emerald-700 dark:text-emerald-400">
             ✓ 更新已安装，重启应用后生效
           </div>
         )}
