@@ -10,6 +10,7 @@
 //! - die_after_response：回包后立即退出（模拟「回包即崩」）
 //! - slow：延迟 300ms 响应（测超时废弃）
 //! - sleep：按 arguments.ms 延迟后响应
+//! - fail：返回工具级失败（`isError: true`），供 `/mcp` 代理透传断言
 
 use std::io::{BufRead, Write};
 
@@ -69,6 +70,7 @@ fn main() {
                     {"name":"env","description":"返回 FAKE_POOL_ENV 环境变量值","inputSchema":{"type":"object"}},
                     {"name":"crash","description":"收到调用后立即退出（模拟崩溃）","inputSchema":{"type":"object"}},
                     {"name":"die_after_response","description":"回包后立即退出","inputSchema":{"type":"object"}},
+                    {"name":"fail","description":"返回工具级失败（isError=true），供代理透传断言","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},
                     {"name":"slow","description":"延迟 300ms 响应（测超时）","inputSchema":{"type":"object"}},
                     {"name":"sleep","description":"按 ms 延迟后响应","inputSchema":{"type":"object","properties":{"ms":{"type":"integer"}}}},
                 ]}),
@@ -113,6 +115,20 @@ fn main() {
                             &mut out,
                             id,
                             serde_json::json!({"content":[{"type":"text","text":v}]}),
+                        );
+                    }
+                    "fail" => {
+                        let text = arguments
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("boom");
+                        respond(
+                            &mut out,
+                            id,
+                            serde_json::json!({
+                                "content":[{"type":"text","text":text}],
+                                "isError": true
+                            }),
                         );
                     }
                     "crash" => std::process::exit(7),

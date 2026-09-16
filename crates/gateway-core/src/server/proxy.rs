@@ -273,6 +273,7 @@ fn emit_log(
     duration_ms: i64,
     is_stream: bool,
     usage: Option<&Value>,
+    tool_calls: i64,
     error_kind: Option<String>,
     error_summary: Option<String>,
 ) {
@@ -287,6 +288,7 @@ fn emit_log(
         duration_ms,
         is_stream,
         usage,
+        tool_calls,
         error_kind,
         error_summary,
     );
@@ -305,6 +307,7 @@ fn emit_log_with(
     duration_ms: i64,
     is_stream: bool,
     usage: Option<&Value>,
+    tool_calls: i64,
     error_kind: Option<String>,
     error_summary: Option<String>,
 ) {
@@ -324,10 +327,63 @@ fn emit_log_with(
         usage_cache_write: ucw,
         duration_ms,
         is_stream,
-        tool_calls: 0,
+        tool_calls,
         error_kind,
         error_summary,
     });
+}
+
+/// 统计 IR 响应里 assistant 发起的工具调用次数（落 `request_logs.tool_calls`）。
+fn count_ir_tool_uses(resp: &crate::codec::ir::CanonicalResponse) -> i64 {
+    resp.output
+        .iter()
+        .filter(|b| matches!(b, crate::codec::ir::Block::ToolUse { .. }))
+        .count() as i64
+}
+
+/// 统计**同族直通**响应体里的工具调用次数（按入站线形状取字段，不做完整解析）。
+/// 字节直通不解析语义，这里只按形状数数组元素；解析失败一律记 0——
+/// 该字段仅用于诊断，绝不能因为统计而影响转发。
+fn count_tool_calls_in_body(wire: InboundWire, bytes: &[u8]) -> i64 {
+    let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
+        return 0;
+    };
+    match wire {
+        // OpenAI Chat：choices[*].message.tool_calls
+        InboundWire::OpenAi | InboundWire::Completions => v
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|cs| {
+                cs.iter()
+                    .map(|c| {
+                        c.pointer("/message/tool_calls")
+                            .and_then(Value::as_array)
+                            .map_or(0, |a| a.len() as i64)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0),
+        // Anthropic：content[*].type == "tool_use"
+        InboundWire::Anthropic => v
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|bs| {
+                bs.iter()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .count() as i64
+            })
+            .unwrap_or(0),
+        // Responses：output[*].type == "function_call"
+        InboundWire::Responses => v
+            .get("output")
+            .and_then(Value::as_array)
+            .map(|is| {
+                is.iter()
+                    .filter(|i| i.get("type").and_then(Value::as_str) == Some("function_call"))
+                    .count() as i64
+            })
+            .unwrap_or(0),
+    }
 }
 
 fn empty_resp(status: StatusCode) -> Response {
@@ -720,6 +776,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
                 ms_since(started),
                 false,
                 None,
+                0,
                 Some("InvalidRequest".into()),
                 Some(msg.clone()),
             );
@@ -788,6 +845,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             ms_since(started),
             peeked.stream,
             None,
+            0,
             Some("InvalidRequest".into()),
             Some(msg.clone()),
         );
@@ -859,6 +917,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             ms_since(started),
             peeked.stream,
             None,
+            0,
             Some(last_kind.into()),
             Some(last_summary.clone()),
         );
@@ -882,6 +941,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
         ms_since(started),
         peeked.stream,
         None,
+        0,
         Some(last_kind.into()),
         Some(last_summary.clone()),
     );
@@ -967,6 +1027,7 @@ async fn try_candidate(
                 ms_since(started),
                 peeked.stream,
                 None,
+                0,
                 Some("UpstreamAuth".into()),
                 Some(msg.to_string()),
             );
@@ -1023,6 +1084,7 @@ async fn try_candidate(
                 ms_since(started),
                 peeked.stream,
                 None,
+                0,
                 Some("ProviderOther".into()),
                 Some(msg.clone()),
             );
@@ -1061,6 +1123,7 @@ async fn try_candidate(
                     ms_since(started),
                     peeked.stream,
                     None,
+                    0,
                     Some(kind.into()),
                     Some(if kind == "ContextTooLong" {
                         format!("{}：上下文长度超限（{kind}）", cand.provider_name)
@@ -1090,6 +1153,7 @@ async fn try_candidate(
                     ms_since(started),
                     peeked.stream,
                     None,
+                    0,
                     Some(kind.into()),
                     Some(format!(
                         "{}：「{kind}」即将切换渠道：{snippet}",
@@ -1232,6 +1296,7 @@ async fn try_converted_candidate(
             ms_since(started),
             peeked.stream,
             None,
+            0,
             Some("InvalidRequest".into()),
             Some(msg.clone()),
         );
@@ -1263,6 +1328,7 @@ async fn try_converted_candidate(
                 ms_since(started),
                 peeked.stream,
                 None,
+                0,
                 Some("InvalidRequest".into()),
                 Some(msg.clone()),
             );
@@ -1287,6 +1353,7 @@ async fn try_converted_candidate(
                 ms_since(started),
                 peeked.stream,
                 None,
+                0,
                 Some("CapabilityWarn".into()),
                 Some(outcome.warnings.join("；")),
             );
@@ -1444,6 +1511,7 @@ async fn try_converted_candidate(
                 ms_since(started),
                 req.stream,
                 None,
+                0,
                 Some("ProviderOther".into()),
                 Some(format!("[convert] {}：{msg}", cand.provider_name)),
             );
@@ -1480,6 +1548,7 @@ async fn try_converted_candidate(
                     ms_since(started),
                     req.stream,
                     None,
+                    0,
                     Some(kind.into()),
                     Some(format!("[convert] {}：{snippet}", cand.provider_name)),
                 );
@@ -1503,6 +1572,7 @@ async fn try_converted_candidate(
                     ms_since(started),
                     req.stream,
                     None,
+                    0,
                     Some(kind.into()),
                     Some(format!(
                         "[convert] {}：「{kind}」即将切换渠道：{snippet}",
@@ -1595,6 +1665,7 @@ async fn convert_plain_response(
                 ms_since(started),
                 false,
                 None,
+                0,
                 Some("ProviderOther".into()),
                 Some(format!("[convert] {msg}")),
             );
@@ -1617,6 +1688,7 @@ async fn convert_plain_response(
                 ms_since(started),
                 false,
                 None,
+                0,
                 Some("Overloaded".into()),
                 Some(format!(
                     "[convert] Overloaded read timeout (status={})",
@@ -1654,6 +1726,7 @@ async fn convert_plain_response(
                 ms_since(started),
                 false,
                 None,
+                0,
                 Some("ProviderOther".into()),
                 Some(format!("[convert] 解析失败: {msg}")),
             );
@@ -1700,6 +1773,7 @@ async fn convert_plain_response(
                 ms_since(started),
                 false,
                 None,
+                0,
                 Some("ProviderOther".into()),
                 Some(format!("[convert] {msg}")),
             );
@@ -1728,6 +1802,7 @@ async fn convert_plain_response(
         ms_since(started),
         false,
         Some(&uval),
+        count_ir_tool_uses(&resp),
         None,
         None,
     );
@@ -1885,6 +1960,10 @@ async fn convert_streaming_response(
             let mut line_buf: Vec<u8> = first_lines;
             // IR 累计的 usage：Finish 事件携带，自然结束时透传落库（修复日志输入/输出恒空）
             let mut last_usage: Option<crate::codec::ir::Usage> = None;
+            // 本回合 assistant 发起的工具调用 id 集合（落 request_logs.tool_calls）。
+            // 用 id 去重而非数事件：部分上游（如 Gemini）每帧都带 Start，且 index 恒为 0。
+            let mut tool_call_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             // 挂起的 Finish：上游常把 stop_reason 与 usage 拆成两帧（先 finish_reason 帧、
             // 后 usage 末帧），且 usage 帧可能带非空 choices。若逐帧渲染，客户端会先收到一个
             // usage 全 0 的收尾帧，第二帧再渲染就是重复的 completed/message_stop。故挂起
@@ -1948,6 +2027,7 @@ async fn convert_streaming_response(
                                                 t0.elapsed().as_millis() as i64,
                                                 true,
                                                 None,
+                                                0,
                                                 Some("SseParseWarn".into()),
                                                 Some(format!("[convert] anthropic SSE 帧解析失败已跳过: {e}")),
                                             );
@@ -1968,6 +2048,7 @@ async fn convert_streaming_response(
                                             t0.elapsed().as_millis() as i64,
                                             true,
                                             None,
+                                            0,
                                             Some("SseParseWarn".into()),
                                             Some(format!("[convert] gemini SSE 帧解析失败已跳过: {e}")),
                                         );
@@ -1988,6 +2069,7 @@ async fn convert_streaming_response(
                                             t0.elapsed().as_millis() as i64,
                                             true,
                                             None,
+                                            0,
                                             Some("SseParseWarn".into()),
                                             Some(format!("[convert] openai SSE 帧解析失败已跳过: {e}")),
                                         );
@@ -2007,6 +2089,7 @@ async fn convert_streaming_response(
                                         t0.elapsed().as_millis() as i64,
                                         true,
                                         None,
+                                        0,
                                         Some("SseParseWarn".into()),
                                         Some("[convert] openai_responses SSE 暂不支持流式转换".into()),
                                     );
@@ -2024,6 +2107,11 @@ async fn convert_streaming_response(
                             }
                         }
                         for ev in events {
+                            if let crate::codec::ir::StreamEvent::ToolCallStart { id, .. } = &ev {
+                                if !id.is_empty() {
+                                    tool_call_ids.insert(id.clone());
+                                }
+                            }
                             // Finish 不立刻下发：挂起合并（见 pending_finish 注释）。
                             // 一旦下发，客户端就会先看到一个 usage 全 0 的收尾帧，
                             // 后续真实 usage 只能变成重复的 completed/message_stop。
@@ -2067,6 +2155,7 @@ async fn convert_streaming_response(
                                         ms_since(t0),
                                         true,
                                         None,
+                                        0,
                                         Some("InvalidRequest".into()),
                                         Some("client disconnected mid-stream".into()),
                                     );
@@ -2094,6 +2183,7 @@ async fn convert_streaming_response(
                         ms_since(t0),
                         true,
                         None,
+                        0,
                         Some("Overloaded".into()),
                         Some(format!("[convert] {msg}")),
                     );
@@ -2127,6 +2217,7 @@ async fn convert_streaming_response(
                             ms_since(t0),
                             true,
                             None,
+                            0,
                             Some("Overloaded".into()),
                             Some(format!(
                                 "[convert] Overloaded upstream={} idle timeout",
@@ -2171,6 +2262,7 @@ async fn convert_streaming_response(
                             ms_since(t0),
                             true,
                             None,
+                            0,
                             Some("ProviderOther".into()),
                             Some(format!("[convert] {msg}")),
                         );
@@ -2212,6 +2304,7 @@ async fn convert_streaming_response(
                             ms_since(t0),
                             true,
                             usage_json.as_ref(),
+                            tool_call_ids.len() as i64,
                             None,
                             None,
                         );
@@ -2259,6 +2352,7 @@ fn internal_error(
         ms_since(*started),
         p.stream,
         None,
+        0,
         Some("ProviderOther".into()),
         Some("internal error".into()),
     );
@@ -2295,6 +2389,7 @@ async fn plain_response(
                 ms_since(started),
                 false,
                 None,
+                0,
                 Some("ProviderOther".into()),
                 Some(msg.clone()),
             );
@@ -2311,6 +2406,7 @@ async fn plain_response(
                 ms_since(started),
                 false,
                 None,
+                0,
                 Some("Overloaded".into()),
                 Some(format!(
                     "Overloaded upstream={} read timeout",
@@ -2340,6 +2436,7 @@ async fn plain_response(
         ms_since(started),
         false,
         usage.as_ref(),
+        count_tool_calls_in_body(wire, &bytes),
         None,
         None,
     );
@@ -2381,6 +2478,7 @@ async fn streaming_response(
                 ms_since(started),
                 true,
                 None,
+                0,
                 Some("ProviderOther".into()),
                 Some(msg.clone()),
             );
@@ -2404,6 +2502,7 @@ async fn streaming_response(
                 ms_since(started),
                 true,
                 None,
+                0,
                 Some("ProviderOther".into()),
                 Some(msg.to_string()),
             );
@@ -2425,6 +2524,7 @@ async fn streaming_response(
                 ms_since(started),
                 true,
                 None,
+                0,
                 Some("Overloaded".into()),
                 Some(format!(
                     "Overloaded upstream={} first-byte timeout",
@@ -2440,7 +2540,10 @@ async fn streaming_response(
         }
     };
 
-    // 通过管道把剩余流喂给客户端；usage 扫描伴随进行
+    // 通过管道把剩余流喂给客户端；usage 扫描伴随进行。
+    // 注意：直通流式的 `tool_calls` 落库为 0 —— 字节直通不解析 SSE 语义，
+    // 仅 UsageScanner 做关键字级扫描；诊断「模型有没有发起工具调用」请看
+    // 转换路径（跨族）的行，或本行同时看 is_stream=1 + route_mode=passthrough。
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
     let mut scanner = UsageScanner::new();
@@ -2458,6 +2561,7 @@ async fn streaming_response(
             ms_since(started),
             true,
             scanner.finish().as_ref(),
+            0,
             Some("InvalidRequest".into()),
             Some("client disconnected early".into()),
         );
@@ -2489,6 +2593,7 @@ async fn streaming_response(
                             ms_since(t0),
                             true,
                             scanner.finish().as_ref(),
+                            0,
                             Some("Overloaded".into()),
                             Some(format!(
                                 "Overloaded upstream={} idle timeout",
@@ -2510,6 +2615,7 @@ async fn streaming_response(
                                 ms_since(t0),
                                 true,
                                 scanner.finish().as_ref(),
+                                0,
                                 Some("InvalidRequest".into()),
                                 Some("client disconnected mid-stream".into()),
                             );
@@ -2531,6 +2637,7 @@ async fn streaming_response(
                             ms_since(t0),
                             true,
                             scanner.finish().as_ref(),
+                            0,
                             Some("ProviderOther".into()),
                             Some(msg),
                         );
@@ -2549,6 +2656,7 @@ async fn streaming_response(
                             ms_since(t0),
                             true,
                             scanner.finish().as_ref(),
+                            0,
                             None,
                             None,
                         );
@@ -2579,6 +2687,75 @@ async fn streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bug 11 回归：`tool_calls` 日志列必须真数工具调用，不能再恒 0。
+    /// 三种入站线的直通响应体形状各取一次（并行工具调用要全数到）。
+    #[test]
+    fn count_tool_calls_in_passthrough_bodies() {
+        // OpenAI Chat：两条并行 tool_calls
+        let openai = r#"{"choices":[{"message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"a","function":{"name":"f"}},{"id":"b","function":{"name":"g"}}]}}]}"#;
+        assert_eq!(
+            count_tool_calls_in_body(InboundWire::OpenAi, openai.as_bytes()),
+            2
+        );
+        // 纯文本响应 → 0
+        let text = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+        assert_eq!(
+            count_tool_calls_in_body(InboundWire::OpenAi, text.as_bytes()),
+            0
+        );
+        // Anthropic：content 里 text 与 tool_use 混排
+        let anthropic = r#"{"content":[{"type":"text","text":"thinking"},{"type":"tool_use","id":"t1","name":"f"},
+            {"type":"tool_use","id":"t2","name":"g"}]}"#;
+        assert_eq!(
+            count_tool_calls_in_body(InboundWire::Anthropic, anthropic.as_bytes()),
+            2
+        );
+        // Responses：output 里 function_call 与 message/reasoning 混排
+        let responses = r#"{"output":[{"type":"reasoning"},{"type":"function_call","call_id":"c1"},
+            {"type":"message"}]}"#;
+        assert_eq!(
+            count_tool_calls_in_body(InboundWire::Responses, responses.as_bytes()),
+            1
+        );
+        // 非 JSON / 空体：仅诊断字段，不 panic、也不影响转发
+        assert_eq!(
+            count_tool_calls_in_body(InboundWire::OpenAi, b"data: [DONE]"),
+            0
+        );
+        assert_eq!(count_tool_calls_in_body(InboundWire::Responses, b""), 0);
+    }
+
+    /// 转换路径按 IR 块计数（跨族请求的 tool_calls 落库口径）。
+    #[test]
+    fn count_ir_tool_uses_counts_tool_use_blocks() {
+        use crate::codec::ir::{Block, CanonicalResponse, StopReason, Usage};
+        let mk = |output: Vec<Block>| CanonicalResponse {
+            id: "r1".into(),
+            model: "m".into(),
+            output,
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        };
+        let with_tools = mk(vec![
+            Block::Text { text: "hi".into() },
+            Block::ToolUse {
+                id: "t1".into(),
+                name: "f".into(),
+                input: serde_json::json!({}),
+            },
+            Block::ToolUse {
+                id: "t2".into(),
+                name: "g".into(),
+                input: serde_json::json!({}),
+            },
+        ]);
+        assert_eq!(count_ir_tool_uses(&with_tools), 2);
+
+        let only_text = mk(vec![Block::Text { text: "hi".into() }]);
+        assert_eq!(count_ir_tool_uses(&only_text), 0);
+    }
 
     #[test]
     fn anthropic_error_sse_frame_shape() {

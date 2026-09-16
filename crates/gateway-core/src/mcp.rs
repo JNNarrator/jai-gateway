@@ -146,7 +146,9 @@ fn parse_tools_list(v: &Value) -> Result<Vec<McpTool>, String> {
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-fn env_duration_ms(name: &str, default: Duration) -> Duration {
+/// 读 `JAI_*_MS` 环境变量（毫秒）；缺失/非法则用 `default`。
+/// `pub(crate)`：registry 的代理转发预算也走同一套读取口径。
+pub(crate) fn env_duration_ms(name: &str, default: Duration) -> Duration {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

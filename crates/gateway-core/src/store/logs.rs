@@ -203,6 +203,9 @@ pub struct LogRowView {
     pub http_status: i64,
     pub duration_ms: i64,
     pub is_stream: bool,
+    /// assistant 发起的工具调用次数（转换路径按 IR 计数、直通非流式按响应体计数；
+    /// 直通**流式**不采集，恒 0 —— 字节直通不解析 SSE 语义）
+    pub tool_calls: i64,
     pub usage_input: Option<i64>,
     pub usage_output: Option<i64>,
     pub error_kind: Option<String>,
@@ -214,7 +217,7 @@ pub fn logs_recent(db: &super::Db, limit: i64) -> Result<Vec<LogRowView>, StoreE
     db.with(|c| {
         let mut stmt = c.prepare(
             "SELECT id,ts,inbound_family,route_mode,model_name,provider_id,http_status,\
-             duration_ms,is_stream,usage_input,usage_output,error_kind,error_summary \
+             duration_ms,is_stream,tool_calls,usage_input,usage_output,error_kind,error_summary \
              FROM request_logs ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -229,10 +232,11 @@ pub fn logs_recent(db: &super::Db, limit: i64) -> Result<Vec<LogRowView>, StoreE
                     http_status: r.get(6)?,
                     duration_ms: r.get(7)?,
                     is_stream: r.get::<_, i64>(8)? != 0,
-                    usage_input: r.get(9)?,
-                    usage_output: r.get(10)?,
-                    error_kind: r.get(11)?,
-                    error_summary: r.get(12)?,
+                    tool_calls: r.get(9)?,
+                    usage_input: r.get(10)?,
+                    usage_output: r.get(11)?,
+                    error_kind: r.get(12)?,
+                    error_summary: r.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

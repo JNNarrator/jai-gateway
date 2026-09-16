@@ -52,3 +52,28 @@
 4. 触发 `.github/workflows/release.yml`
 5. 人工验收 CI 产物（macOS + Windows，签名 + updater 元数据）
 6. 在 GitHub Releases 将草稿转正式发布并指向 updater feed
+
+## 6. 本地打 macOS 包（验证用，非发布产物）
+
+CI 与本地的前端钩子 cwd **不一致**，直接用仓库里的 `tauri.conf.json` 本地打包会失败：
+
+- **CI**（`tauri-apps/tauri-action`，未设 `projectPath`）：以 `src-tauri` 为 cwd 执行
+  `beforeBuildCommand`，故配置里的 `pnpm --dir ../ui build` 成立（v0.1.9 Release 运行日志可证）。
+- **本地** `cargo tauri build`（tauri-cli 2.11.4）：前端钩子 cwd = **仓库根**，`../ui` 会解析到仓库外
+  → `ERR_PNPM_ENOENT … lstat '<上级目录>/ui'`。**不要为此改仓库配置**（会弄坏 CI）。
+
+本地正确做法——用覆盖配置把钩子换掉（UI 产物路径不受影响，`frontendDist` 仍相对 `src-tauri` 解析）：
+
+```bash
+cd src-tauri
+cat > /tmp/jai-local-hook.json <<'EOF'
+{"build":{"beforeBuildCommand":"pnpm --dir ui build"}}
+EOF
+TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/jai.key)" \
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(cat ~/.tauri/jai.key.password)" \
+cargo tauri build --bundles app --config /tmp/jai-local-hook.json
+# 产物：target/release/bundle/macos/JAI.app（+ updater 用的 .app.tar.gz / .sig）
+```
+
+注意：本地包是 **ad-hoc 签名**（与 CI 未配 Apple 证书时的产物同级），仅供本机自测/自己更新，
+**不要**当作分发给用户的正式产物；正式产物一律由 tag 触发的 CI 生成，并据此更新 Release / updater feed。

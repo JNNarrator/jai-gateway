@@ -173,6 +173,24 @@ claude
 
 接入后 Agent 可查询网关登记的 MCP Server / Skill 台账（五个只读工具）。开启「代理执行」的 Server，其工具会以 `<server>__<tool>` 出现在工具列表中、由 Agent 主动调用并经网关转发到真实 Server；启用技能可用 `skill__<name>` 拉取全文。网关只做发现与转发，不注入对话链路。
 
+#### 代理转发的两条语义（排障必读）
+
+1. **结果原样透传**：`tools/call` 转发路径把上游 MCP 结果**按原语义**交回客户端——`content` 逐块保留（含 `image` / `resource_link`）、`isError` 原样冒泡、`structuredContent` 保留，另附一个非标准 `source` 字段（`jai-gateway-proxy/<server>`）便于审计。
+   因此「上游工具失败」在客户端就是 `isError: true`，不会被网关压成成功；静态台账/技能工具仍返回 JSON 文本。
+2. **等待预算**：单次代理调用有独立预算 `JAI_MCP_PROXY_CALL_TIMEOUT_MS`（默认 **55000**，即 55s）。
+   超时后网关**主动放弃等待**，返回工具级错误（`isError: true`）并提示长命令改用 `terminal_start` + `terminal_poll`。
+   默认值刻意**略低于常见 MCP 客户端的单次调用预算**（dsh 客户端默认 60s 硬中止，错误码 `-32001`）：
+   网关若比客户端更能等，agent 只会拿到无信息量的客户端超时，同批并行的其它调用还会一起作废。
+
+| 环节 | 预算 | 调参入口 |
+|---|---|---|
+| MCP 客户端（以 dsh 为例） | 60s 硬中止（`-32001`） | dsh 侧 `toolCallTimeoutMs` |
+| 网关代理转发 | 55s | `JAI_MCP_PROXY_CALL_TIMEOUT_MS` |
+| 网关 stdio 连接池单次交换 | 120s | `JAI_MCP_POOL_CALL_TIMEOUT_MS` |
+| 连接池空闲回收 | 30s | `JAI_MCP_POOL_IDLE_MS` |
+
+有状态/长时工具（终端会话类）建议把客户端预算调到网关之上，再用「先启动后轮询」的异步模式；`tools/list` 的动态部分有 30s TTL 缓存，单个 Server 拉取失败只跳过该 Server。
+
 ## 开发
 
 ### 目录结构

@@ -48,6 +48,20 @@ async fn spawn_openai_mock(mode: &'static str) -> u16 {
                         .body(Body::from(sse))
                         .unwrap()
                 }
+                "stream_tool" => {
+                    // 并行两个工具调用（index 0/1）：真实上游只在首帧带 id，
+                    // 后续 arguments 增量帧不带 —— tool_calls 落库按 id 去重计数。
+                    let sse = "data: {\"id\":\"chatcmpl_t\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_t\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"tokyo\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_t\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_t\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":7}}\n\n\
+                               data: [DONE]\n\n";
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
                 "text" => Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
@@ -262,6 +276,53 @@ async fn responses_to_openai_tool_call() {
     assert_eq!(fc["name"], "get_weather");
     assert_eq!(fc["call_id"], "call_gpt");
     assert!(fc["arguments"].as_str().unwrap().contains("tokyo"));
+
+    // bug 11 回归：tool_calls 必须真数（此前 emit_log_with 里写死 0，
+    // 排查 MCP/工具问题时被该列误导为「模型没发起工具调用」）。
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200)
+        .expect("应有成功日志");
+    assert_eq!(row.route_mode, "converted");
+    assert_eq!(row.tool_calls, 1, "非流式转换应落 1 次工具调用");
+}
+
+/// bug 11 回归（流式）：并行两个工具调用必须数到 2，且 Responses 出站
+/// 仍按 function_call item 渲染。
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_to_openai_stream_tool_calls_logged() {
+    let fx = fixture("stream_tool").await;
+    let body = json!({
+        "model":"gpt-4o",
+        "instructions":"Use tools",
+        "input":"weather and time in tokyo?",
+        "tools":[
+            {"type":"function","name":"get_weather","description":"w","parameters":{"type":"object"}},
+            {"type":"function","name":"get_time","description":"t","parameters":{"type":"object"}}
+        ],
+        "tool_choice":"auto",
+        "stream":true
+    });
+    let (status, text) = fx.post_responses_raw(body).await;
+    assert_eq!(status, 200);
+    assert!(
+        text.contains("\"type\":\"function_call\"") && text.contains("get_weather"),
+        "出站应含 function_call item: {text}"
+    );
+    assert!(
+        text.contains("call_a") && text.contains("call_b"),
+        "两个调用都要出现: {text}"
+    );
+
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200)
+        .expect("应有成功日志");
+    assert_eq!(row.route_mode, "converted");
+    assert!(row.is_stream);
+    assert_eq!(row.tool_calls, 2, "并行工具调用应数到 2（按 id 去重）");
 }
 
 /// M6 验收：Responses 流式文本 → Responses SSE 事件 + [DONE]

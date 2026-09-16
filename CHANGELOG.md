@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`/mcp` 代理转发的工具级失败被拉平成成功**（客户端把失败当成功）：
+  - 根因：`registry.rs` 的 `tools/call` 成功分支把上游结果包成 `{source, result}` 再 `to_string()`
+    塞进单个 text 块，且外层 `"isError": false` **硬编码** —— 上游 MCP 的 `isError: true`
+    （如 `Error: Session … is not in the current scope.`）被覆盖；dsh 侧按外层判定
+    （`dsh-mcp-client`：`if (result.isError === true) throw …`），于是失败被当成功交给模型。
+  - 修复：代理路径**原样透传**上游结果（`content` 逐块保留 + `isError` 冒泡 + `structuredContent`），
+    来源标注改为非标准 `source` 字段；静态台账/技能工具仍走「JSON 文本」。顺带救回 `image` /
+    `resource_link` 等块（此前被字符串化后客户端的图片投影永不触发）。
+- **`/mcp` 代理转发与客户端超时预算不匹配**（dsh 侧 `MCP error -32001: Request timed out`）：
+  - 根因：三方预算错位——dsh 客户端 60s 硬中止、网关 120s、Netcatty 长时工具（`terminal.execute`
+    `policy.longRunning`）60s 操作超时 + 5s RPC 缓冲 = 65s。网关比客户端更能等 → 实测网关等满
+    60.007s 才拿到上游结果、客户端 60.000s 已放弃，**差 7ms 输掉竞速**；agent 只看到无信息量的
+    客户端超时，同批并行的其它工具调用被一起作废。
+  - 修复：代理转发加独立预算 `JAI_MCP_PROXY_CALL_TIMEOUT_MS`（默认 55s，**低于**常见客户端预算），
+    超时返回**工具级错误** + 可执行指引（长命令改走 `terminal_start` + `terminal_poll`）。
+- **`request_logs.tool_calls` 恒 0**（该列此前写死，排查工具问题时误导判断）：
+  - 修复：`emit_log` / `emit_log_with` 增加 `tool_calls` 参数并落真值——跨族转换按 IR 计数
+    （非流式数 `Block::ToolUse`，流式按 `ToolCallStart` 的 id 去重，容忍 Gemini 恒 0 index），
+    同族直通非流式按入站线形状数响应体；`LogRowView` 同步暴露该字段。
+    直通**流式**不采集（字节直通不解析 SSE 语义），已在代码注释中标明。
+  - 单测 2 例（三种入站线形状 + IR 块计数）、集成断言 2 例（非流式 1 次 / 流式并行 2 次）。
+
 ### Added
 - **dsh 接入生成器**（`scripts/setup_dsh.mjs`）：把 JAI 结构化合并进 dsh 的
   `$DSH_HOME/settings.yaml`（`llm-pi-ai.providers.<route>`，`api: openai-responses`

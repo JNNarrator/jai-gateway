@@ -87,6 +87,15 @@
     ② 初始化握手不要复用调用超时（单列 `JAI_MCP_POOL_INIT_TIMEOUT_MS`，给 spawn 留足余量）；
     ③ 该文件测试是进程级共享状态，超时阈值不宜压到 100ms 量级。
 
+  - 【2026-09-16 补充】同族还有第二个坑（由本次新增测试踩到）：全局 stdio 池的连接键是
+    `(cmd, args, env)`，而池里缓存的**进程句柄绑定创建它的 tokio runtime**；同一测试进程内多个
+    `#[tokio::test]` 各自建 runtime，若两个测试用同一键（env 相同）就会跨 runtime 复用连接，报
+    `读取 MCP 响应失败: A Tokio 1.x context was found, but it is being shutdown.`
+    → registry 的 `build_proxy_tools` 静默跳过该 Server，表现为「动态工具时有时无」（本次在 6 路 CPU
+    负载下 15 轮复现 10 次）。**处置**：新增测试一律给 fixture 唯一 `env`（如 `FAKE_TEST_ID`）隔离池键
+    （`tests/mcp_pool.rs` 早有此先例与注释）；修复后同负载 15 轮 0 失败。
+    **生产不受影响**：Tauri 命令与网关都跑在 `tauri::async_runtime` 同一个 runtime 上。
+
 - [ ] 7. Responses **出站**丢弃消息级图片（`Block::Image` 在 user 消息里）
   - 位置：`crates/gateway-core/src/codec/responses.rs` 的 `encode_request`，注释写「Responses 上游 v1 不支持
     图片内联转换，Lenient 丢弃」——**该注释与官方 schema 存疑**：Responses 的 message content 支持
@@ -127,6 +136,96 @@
     `request/context.contextWindow=128000` 正常（上下文窗口没问题，是占用数字没了）。
   - 注意：本修复需**重建并重启 JAI** 才生效（线上跑的是旧二进制）；重启前 dsh-tui 仍显示 0%。
 
+- [x] 9. dsh 调 JAI 代理的 MCP 工具报 `MCP error -32001: Request timed out`（超时预算三方不匹配）
+  - 已解决（网关侧，2026-09-16）：代理转发加独立预算 `JAI_MCP_PROXY_CALL_TIMEOUT_MS`（默认 **55s**，
+    刻意低于常见客户端预算），超时**主动放弃等待**并返回工具级错误 + 可执行指引（长命令改走
+    `terminal_start` + `terminal_poll`）。修复位置 `crates/gateway-core/src/server/registry.rs`
+    （`DEFAULT_PROXY_CALL_TIMEOUT` / `proxy_call_timeout()` / `fmt_budget()`）。
+  - 验证：新增 `tests/mcp_proxy_timeout.rs`（假 stdio server 的 `sleep` 工具 3s vs 200ms 预算）——
+    断言「工具级 isError + 文案含 `未返回`/`terminal_start`/`JAI_MCP_PROXY_CALL_TIMEOUT_MS` +
+    耗时 < 2s」；**负控制**：把预算改成 5000ms（> sleep 3000ms）→ 用例如期失败
+    （返回 `{"content":[{"text":"slept"}],"isError":false,...}`、耗时 3.23s），还原即通过。
+  - 客户端侧（本次**未做**，用户选择只改网关）：`~/.dsh/cordis.patch.yml` 的 `mcp-jai-registry`
+    仍应择机加 `toolCallTimeoutMs`（建议 > 网关 55s，例如 150000），否则碰到网关刻意不接的长任务时
+    agent 仍会看到客户端级 -32001；README 已补「超时预算表」把三方预算与调参入口写清。
+  - 现象（dsh 会话日志实证，`$DSH_HOME/sessions/**/session.v3.jsonl.zstd`，2026-09-15 16:50，turn 10）：
+    调 `mcp__jai-registry__netcatty-external__terminal_execute` 后 dsh 侧报
+    `Error: MCP error -32001: Request timed out`；同一步并行发出的 `get_tool_schemas`、
+    `vault_hosts_list` 连带报 `Error: tool call aborted before dispatch`（一批并行调用全废）。
+  - 网关侧证据：`proxy_call_logs` 同一时刻只有一行
+    `netcatty-external | terminal_execute | stdio | ok | duration_ms=60007`
+    —— 网关等满 **60.007s** 才拿到上游结果，而 dsh 在 **60.000s** 已硬中止 → 差 7ms 输掉竞速。
+  - 根因：**三方超时预算不匹配**，上游允许的最坏耗时 > 客户端预算，而网关比客户端更能等（既不提前失败、也不收敛）。
+    | 环节 | 预算 | 出处（实证） |
+    |---|---|---|
+    | dsh MCP 客户端单次调用 | **60_000ms** 硬中止（MCP 错误码 -32001） | `@deepseek-ai/dsh-mcp-client/lib/index.js`：`DEFAULT_TOOL_CALL_TIMEOUT_MS = 6e4`；可用配置项 `toolCallTimeoutMs` 覆写 |
+    | JAI `/mcp` 代理转发 | **120_000ms**（`JAI_MCP_POOL_CALL_TIMEOUT_MS`）；转发路径无独立预算 | `crates/gateway-core/src/mcp.rs:147`（`DEFAULT_CALL_TIMEOUT`）、`server/registry.rs:435+`（`proxy_call_tool` 直接 await） |
+    | Netcatty 长时工具（`terminal.execute`：`policy.longRunning=true`） | **60_000ms 操作超时 + 5_000ms RPC 缓冲 = 65_000ms** | `/Applications/Netcatty.app/Contents/Resources/app.asar.unpacked/electron/capabilities/{rpcTimeouts.cjs,constants.cjs}`：`DEFAULT_OPERATION_TIMEOUT_MS / RPC_TIMEOUT_BUFFER_MS` |
+  - 影响面：凡「接近或超过 60s 才返回」的 MCP 代理调用，agent 侧看到的是客户端级 -32001（而非工具级 isError），
+    且会连带作废同批其它工具调用；agent 无法区分「工具真失败」与「网关还在等」。
+  - 建议修法（可组合）：
+    ① 客户端侧（立即见效、无需改网关）：`~/.dsh/cordis.patch.yml` 里 `mcp-jai-registry` 增 `toolCallTimeoutMs: 300000`；
+    ② 网关侧：代理转发加独立预算 `JAI_MCP_PROXY_CALL_TIMEOUT_MS`（默认略低于常见客户端预算，如 55s），
+       超时回**工具级 isError + 指引**（长命令改用 `terminal_start`/`terminal_poll`），别把 -32001 丢给 agent；
+    ③ 文档：README「MCP 代理执行」补一张超时预算表 + 调参说明。
+
+- [x] 10. JAI `/mcp` 代理把上游**工具级失败拉平成成功**（`isError` 恒 false）且 content 被二次字符串化
+  - 已解决（2026-09-16）：`registry.rs` 引入 `ToolOutcome`（`Info` / `Proxied`），代理路径经
+    `proxy_result_payload()` **原样透传**上游结果：`content` 逐块保留、`isError` 冒泡、
+    `structuredContent` 保留，来源改为非标准 `source` 字段（不再破坏 content 结构）；
+    静态台账/技能工具维持「JSON 文本」形态。
+  - 验证：新增 `tests/mcp_proxy_passthrough.rs` 3 例——失败冒泡（`isError:true` + 正文原样）、
+    成功透传（content 不被包裹/二次编码）、动态工具可见性 + 静态工具形态不变。
+    A/B 反证：旧行为即线上 v0.1.9（`/Applications/JAI.app`）实测响应
+    `{"content":[{"text":"{\"result\":{…\"isError\":true},\"source\":…}","type":"text"}],"isError":false}`。
+  - 实测（curl 直打网关 `POST /mcp`）：
+    `tools/call {"name":"netcatty-external__terminal_execute","arguments":{"sessionId":"<已失效 id>","command":"echo x"}}`
+    网关响应（原文）：
+    `{"result":{"content":[{"text":"{\"result\":{\"content\":[{\"text\":\"Error: Session \\"...\\" is not in the current scope.\",\"type\":\"text\"}],\"isError\":true},\"source\":\"jai-gateway-proxy/netcatty-external\"}","type":"text"}],"isError":false}`
+    —— 上游 `isError:true`（工具确实失败）被外层 **`isError:false` 覆盖**；dsh 侧按外层判定
+    （`dsh-mcp-client`：`if (result.isError === true) throw ...`），于是**把失败当成功**交给模型。
+  - 代码位置：`crates/gateway-core/src/server/registry.rs:570-580`（`Ok(payload) => {"isError": false}` 硬编码）；
+    `registry.rs:479-485` 把上游 result 包成 `{source, result}` 再 `to_string()` 塞进单个 text 块 →
+    上游 `content` 结构、`structuredContent`、`image` 块全丢（dsh 的 `containsImage` 图片投影因此永不触发）。
+  - 建议修法：代理路径**原样透传**上游 `result`（`content` 数组 + `isError` + `structuredContent`），
+    来源标注改成追加一个 text 块（或不动）；静态台账/技能工具维持「JSON 文本」形态。
+
+- [x] 11. `request_logs.tool_calls` 恒 0（1930/1930 行全 0，含真实工具循环的会话）
+  - 已解决（2026-09-16）：`emit_log` / `emit_log_with` 增加 `tool_calls` 参数并落真值：
+    跨族转换非流式按 IR 数 `Block::ToolUse`；跨族转换流式按 `StreamCallStart`(ToolCallStart)
+    的 **id 去重**计数（容忍 Gemini 每帧都发 Start 且 index 恒 0）；同族直通非流式按入站线形状
+    数响应体（openai `choices[].message.tool_calls` / anthropic `content[].type=="tool_use"` /
+    responses `output[].type=="function_call"`）。`store::logs::LogRowView` 同步暴露该字段。
+  - **已知未采集**：直通**流式**（`route_mode=passthrough` + `is_stream=1`）仍为 0 —— 该路径是
+    字节直通、不解析 SSE 语义（只有 UsageScanner 做关键字级扫描），已在 `streaming_response`
+    的代码注释里写明，避免再次误导排查。
+  - 验证：单测 `count_tool_calls_in_passthrough_bodies` / `count_ir_tool_uses_counts_tool_use_blocks`；
+    m6 集成 2 例（非流式工具调用落 1、流式并行两个工具调用落 2）。
+  - 现象：本机 `jai.db` 全表 `select tool_calls, count(*) group by tool_calls` → 只有 `0 | 1930`；
+    而同一时段 dsh 会话里有大量工具调用（含 MCP 代理调用）。
+  - 影响：无法用日志判断「模型到底有没有发起工具调用」，本次排查即被该列误导（一度以为 MCP 调用没进网关）。
+  - 根因（已定位）：`crates/gateway-core/src/server/proxy.rs:327` 的 `emit_log_with` 里 `tool_calls: 0` 是**写死的**，
+    函数签名里根本没有该参数（对比 bug 8 给 `route_mode` 加参数的做法，这一列当时没跟着做）；`store/logs.rs:307` 同理。
+  - 建议修法：给 `emit_log_with` 加 `tool_calls: usize` 参数，由各调用点从 IR 响应块（`Block::ToolUse` 计数）传入；
+    直通路径可从 upstream body 里数 `tool_calls`，或在文档里把该列标注为「暂未采集」以免再次误导排查。
+
+
+- [x] 12. 本地 `cargo tauri build` 与 CI 的前端钩子 **cwd 不一致**（`../ui` 只对 CI 成立）
+  - 现象（本次打 release 时踩到）：本地 `cd src-tauri && cargo tauri build --bundles app` 报
+    `Running beforeBuildCommand `pnpm --dir ../ui build`` → `ERR_PNPM_ENOENT: no such file or directory,
+    lstat '/Users/jiangnan/Documents/workspace/ui'`（`../ui` 被解析到仓库外）。
+  - 根因（两侧都有实证）：
+    - **本地** tauri-cli 2.11.4 执行前端钩子的 cwd = **仓库根**。探针验证（`beforeBuildCommand`
+      设成 `sh -c 'pwd > /tmp/f.txt'`，`cargo tauri` 与 `cargo-tauri` 两种调用、从仓库根与 `src-tauri`
+      两个目录都试过）→ 输出恒为 `/Users/jiangnan/Documents/workspace/JAI`，故 `../ui` 落到 `<上级>/ui`。
+    - **CI** `tauri-apps/tauri-action`（未设 `projectPath`）以 `src-tauri` 为 cwd：v0.1.9 的 Release 运行
+      日志（run 34556631183）里 `Running beforeBuildCommand `pnpm --dir ../ui build`` **成功**、
+      vite 构建通过、macOS + Windows 均出包 → 仓库里这个 `../ui` 对 CI 是**正确**的。
+  - 处置（**不改仓库配置**，否则会弄坏 CI）：本地打包用覆盖配置把钩子换成「仓库根 cwd 下可用」的形式，
+    做法已写进 `docs/design/release.md` §6「本地打 macOS 包」。
+  - 教训：`tauri.conf.json` 的 `beforeDevCommand` / `beforeBuildCommand` 是 **CI 口径**（cwd=`src-tauri`），
+    别为了本地能跑就改成 `pnpm --dir ui …`；同理本地 `cargo tauri dev` 也会踩同一坑（仓库一直用
+    `scripts/dev.sh` 绕过，所以没暴露）。
 
 
 ## 2. 优化清单

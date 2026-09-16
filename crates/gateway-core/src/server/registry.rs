@@ -431,26 +431,79 @@ fn parse_proxy_name(name: &str) -> Option<(&str, &str)> {
     Some((server, tool))
 }
 
+/// 代理转发单次调用的等待预算。
+///
+/// 取「略低于常见 MCP 客户端的单次调用预算」：dsh 客户端默认 **60s 硬中止**
+/// （MCP 错误码 -32001），若网关比客户端更能等，agent 只会拿到一个毫无信息量
+/// 的客户端超时，同批并行的其它工具调用还会一起被作废
+/// （2026-09-15 实测：网关等满 60.007s 才拿到上游结果，客户端 60.000s 已放弃，
+/// 差 7ms 输掉竞速 → `MCP error -32001: Request timed out`）。
+/// 这里提前失败，让 agent 拿到一条**可执行的工具级错误**而不是客户端超时。
+/// 需要更长预算时用 `JAI_MCP_PROXY_CALL_TIMEOUT_MS` 覆写。
+const DEFAULT_PROXY_CALL_TIMEOUT: Duration = Duration::from_secs(55);
+
+fn proxy_call_timeout() -> Duration {
+    crate::mcp::env_duration_ms("JAI_MCP_PROXY_CALL_TIMEOUT_MS", DEFAULT_PROXY_CALL_TIMEOUT)
+}
+
+/// 预算的人类可读形式：整秒用 `55s`，否则用毫秒（测试会压到几百毫秒）。
+fn fmt_budget(d: Duration) -> String {
+    if d.as_secs() >= 1 && d.subsec_millis() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
+    }
+}
+
+/// `tools/call` 的返回形态：
+/// - `Info`：网关自产信息（静态台账 / 技能投递）→ 序列化成单个 text 块；
+/// - `Proxied`：代理转发的上游 MCP 结果 → 按 MCP 语义**原样透传**
+///   （content 逐块保留 / isError 原样冒泡 / structuredContent 保留）。
+///
+/// 代理结果绝不能像早期实现那样「包成 {source,result} 再 to_string()」：那会
+/// ① 把上游工具级失败（isError=true）压成外层 isError=false，客户端按外层判定
+///    → agent 把失败当成功；② 丢掉 content 结构（image / resource_link）与
+///    structuredContent，客户端再也做不了图片投影。
+#[derive(Debug)]
+enum ToolOutcome {
+    Info(Value),
+    Proxied { server: String, result: Value },
+}
+
 /// 代理转发：`<server>__<tool>` → 真实 MCP Server 执行。
 async fn proxy_call_tool(
     ctx: &GatewayCtx,
     server_name: &str,
     tool_name: &str,
     args: &Value,
-) -> Result<Value, String> {
+) -> Result<ToolOutcome, String> {
     let servers = proxy_servers(ctx);
     let Some(server) = servers.iter().find(|s| s.name == server_name) else {
         return Err(format!(
             "Server「{server_name}」不存在或未开启代理执行（proxy_allowed）"
         ));
     };
+    let budget = proxy_call_timeout();
     let start = Instant::now();
-    let result = crate::mcp::call_tool(server, tool_name, args.clone())
-        .await
-        .map_err(|e| format!("[proxy: {server_name}] {tool_name} 调用失败: {e}"));
+    let result = match tokio::time::timeout(
+        budget,
+        crate::mcp::call_tool(server, tool_name, args.clone()),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(|e| format!("[proxy: {server_name}] {tool_name} 调用失败: {e}")),
+        Err(_) => Err(format!(
+            "[proxy: {server_name}] {tool_name} 超过 {} 未返回，网关已主动放弃本次等待。\
+             长时命令请改用「先启动后轮询」类工具（如 terminal_start + terminal_poll）；\
+             确需更长等待可调 JAI_MCP_PROXY_CALL_TIMEOUT_MS。",
+            fmt_budget(budget)
+        )),
+    };
     let duration_ms = start.elapsed().as_millis() as i64;
 
-    // 审计落库（独立 proxy_call_logs 表；失败也要记，便于排查）
+    // 审计落库（独立 proxy_call_logs 表；失败也要记，便于排查）。
+    // 注意：status 只反映「转发层是否拿到结果」；上游工具级失败（isError=true）
+    // 仍是 ok —— 那是 MCP 语义下的成功调用，不是网关错误。
     let audit = result
         .as_ref()
         .map(|_| ("ok", None))
@@ -475,21 +528,41 @@ async fn proxy_call_tool(
         });
     });
 
-    // 附来源标注，便于 Agent 理解结果出处
-    let payload = result.map(|v| {
-        json!({
-            "source": format!("jai-gateway-proxy/{server_name}"),
-            "result": v,
-        })
-    })?;
-    Ok(payload)
+    Ok(ToolOutcome::Proxied {
+        server: server_name.to_string(),
+        result: result?,
+    })
 }
 
-async fn dispatch_tool(ctx: &GatewayCtx, name: &str, args: &Value) -> Result<Value, String> {
+/// 代理结果 → `tools/call` 的 MCP 结果形状（原样透传 + 来源标注）。
+fn proxy_result_payload(server: &str, upstream: Value) -> Value {
+    let mut content = upstream
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if content.is_empty() {
+        // 上游没给 content（异常形状）：退化成整包 JSON 文本，至少不丢信息
+        content.push(json!({"type": "text", "text": upstream.to_string()}));
+    }
+    let mut out = json!({
+        "content": content,
+        // 关键：上游工具级失败必须冒泡，否则客户端会把失败当成功
+        "isError": upstream.get("isError").and_then(Value::as_bool).unwrap_or(false),
+        // 非 MCP 标准字段：客户端会忽略，仅供审计/排查定位来源
+        "source": format!("jai-gateway-proxy/{server}"),
+    });
+    if let Some(sc) = upstream.get("structuredContent") {
+        out["structuredContent"] = sc.clone();
+    }
+    out
+}
+
+async fn dispatch_tool(ctx: &GatewayCtx, name: &str, args: &Value) -> Result<ToolOutcome, String> {
     // Skill 投递优先：`skill__<name>` —— 必须先于 proxy 判断，
     // 否则 `skill__code-review` 会被 parse_proxy_name 拆成 server="skill"。
     if let Some(skill_name) = name.strip_prefix("skill__") {
-        return deliver_skill(ctx, skill_name).await;
+        return deliver_skill(ctx, skill_name).await.map(ToolOutcome::Info);
     }
     // 代理工具：命中 `server__tool` 且 server 可代理才转发
     if let Some((server, tool)) = parse_proxy_name(name) {
@@ -498,28 +571,28 @@ async fn dispatch_tool(ctx: &GatewayCtx, name: &str, args: &Value) -> Result<Val
         return proxy_call_tool(ctx, server, tool, args).await;
     }
     match name {
-        "list_mcp_servers" => Ok(tool_list_mcp_servers(ctx).await),
+        "list_mcp_servers" => Ok(ToolOutcome::Info(tool_list_mcp_servers(ctx).await)),
         "get_mcp_server_detail" => {
             let name = args
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or("缺少参数 name")?;
-            Ok(tool_server_detail(ctx, name).await)
+            Ok(ToolOutcome::Info(tool_server_detail(ctx, name).await))
         }
         "get_tool_schemas" => {
             let name = args
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or("缺少参数 name")?;
-            Ok(tool_tool_schemas(ctx, name).await)
+            Ok(ToolOutcome::Info(tool_tool_schemas(ctx, name).await))
         }
-        "list_skills" => Ok(tool_list_skills(ctx).await),
+        "list_skills" => Ok(ToolOutcome::Info(tool_list_skills(ctx).await)),
         "get_skill_detail" => {
             let name = args
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or("缺少参数 name")?;
-            Ok(tool_skill_detail(ctx, name).await)
+            Ok(ToolOutcome::Info(tool_skill_detail(ctx, name).await))
         }
         other => Err(format!("未知工具: {other}")),
     }
@@ -568,11 +641,15 @@ async fn handle_rpc(ctx: &GatewayCtx, v: &Value) -> Option<Value> {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             match dispatch_tool(ctx, name, &args).await {
-                // MCP tools/call 结果包裹在 content 数组里
-                Ok(payload) => json!({
+                // 网关自产信息（静态台账 / 技能全文）：序列化进单个 text 块
+                Ok(ToolOutcome::Info(payload)) => json!({
                     "content": [{"type": "text", "text": payload.to_string()}],
                     "isError": false
                 }),
+                // 代理转发：上游 MCP 结果原样透传（含 isError，失败必须让 agent 看见）
+                Ok(ToolOutcome::Proxied { server, result }) => {
+                    proxy_result_payload(&server, result)
+                }
                 Err(e) => json!({
                     "content": [{"type": "text", "text": e}],
                     "isError": true
@@ -640,6 +717,17 @@ mod tests {
         let db = Db::open(path.to_str().unwrap()).unwrap();
         let (logs, _t) = crate::store::logs::spawn_logger(path.to_str().unwrap()).unwrap();
         GatewayCtx::new(db.clone(), logs)
+    }
+
+    /// 测试辅助：断言结果是「网关自产信息」（静态台账 / 技能投递）并取出 JSON。
+    /// 代理转发路径返回 `ToolOutcome::Proxied`，需用 `proxy_result_payload` 单独断言。
+    fn info(v: Result<ToolOutcome, String>) -> Value {
+        match v.expect("dispatch_tool 失败") {
+            ToolOutcome::Info(v) => v,
+            ToolOutcome::Proxied { server, .. } => {
+                panic!("期望 Info，实际是 Proxied（server={server}）")
+            }
+        }
     }
 
     fn seed(ctx: &GatewayCtx) {
@@ -941,9 +1029,7 @@ mod tests {
     async fn skill_delivery_returns_full_content() {
         let ctx = test_ctx();
         seed(&ctx);
-        let payload = dispatch_tool(&ctx, "skill__code-review", &json!({}))
-            .await
-            .unwrap();
+        let payload = info(dispatch_tool(&ctx, "skill__code-review", &json!({})).await);
         assert_eq!(payload["skill"], "code-review");
         assert_eq!(payload["truncated"], false);
         assert_eq!(payload["content"], "按提交做评审。");
@@ -1011,9 +1097,7 @@ mod tests {
             })
             .unwrap();
 
-        let payload = dispatch_tool(&ctx, "skill__big-skill", &json!({}))
-            .await
-            .unwrap();
+        let payload = info(dispatch_tool(&ctx, "skill__big-skill", &json!({})).await);
         assert_eq!(payload["truncated"], true);
         let text = payload["content"].as_str().unwrap();
         assert!(
