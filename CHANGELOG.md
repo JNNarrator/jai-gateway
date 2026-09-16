@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-16
+
+### Fixed
+- **WebDAV 本地快照自引用递归：单行涨到 595 MB，且每次推送翻一倍**（磁盘/WAL/远端备份链无界增长）：
+  - 现象：`jai.db` 938 MB、WAL 629 MB；`dbstat` 显示 `meta` 表占 **596 MB**，其中单行
+    `webdav_last_snapshot` = **624,552,032 字节**（内含自己 **19 层**）。远端同源：`/jai-config.json`
+    = 42.06 MB，时间戳备份链逐轮翻倍 `0.01→0.02→0.03→0.05→0.08→0.12→0.21→0.38→0.72→1.38→2.69→
+    5.32→21.07 MB`，相邻间隔约 30 分钟（= `webdav_auto_push_interval_min`）。
+  - 根因：`build_export_json` 用 `SELECT key,value FROM meta` **全量导出 meta**，而
+    `webdav_last_snapshot` 就是「上一版导出物」本身；`push_now()` 的顺序是「构建导出 → 存为快照 →
+    PUT 远端」→ 每次推送把上一版快照嵌进新快照。**导入侧一直有白名单过滤该 key，导出侧漏了**。
+  - 影响：本地磁盘与 WAL 无界增长，每次推送体量翻倍（595 MB → 下次约 1.19 GB），远端备份链同步膨胀；
+    删行后 DB 文件不会自动缩小（实测 298 MB 空闲页）。不会跨设备传染（导入白名单挡住）。
+  - 修复：① 导出侧 `WHERE key <> ?1`（`sync::snapshot_meta_key()` 单一常量）排除自引用 key；
+    ② `snapshot_put` 体积硬上限（默认 4 MB，`JAI_SNAPSHOT_MAX_BYTES` 可覆盖）——超限跳过写入并 WARN，
+    **不返回 Err**（快照只是回退手段，不得阻塞配置推送）；③ 启动自愈 `heal_oversized_snapshot`：
+    存量 > 2 MB 的快照用当前配置重建（失败则删 key）；④ `try_pull` 体积护栏（默认 32 MB，
+    `JAI_REMOTE_CONFIG_MAX_BYTES` 可覆盖），远端被撑大时给出指向根因条目的错误而非读进内存；
+    ⑤ 新增 `store::meta_delete`。
+  - 回归：`export_size_stable_across_push_cycles` **在修复前实测必红**——8 轮「构建导出 → 存快照」
+    体积为 `1206→2628→4334→6604→10002→15656→25822→45012` 字节（逐轮翻倍），修复后恒定 1206 字节；
+    另含 `export_excludes_self_snapshot_key`、`snapshot_put_refuses_oversized_text_without_blocking_push`、
+    `heal_rebuilds_oversized_snapshot`、`oversized_remote_error_is_actionable` 与集成测试
+    `m7_import_webdav::pull_rejects_oversized_remote_config`。
+- **存量被撑大的快照自动修复**：升级后首次启动即重建（无需手工清库），日志打印旧体积。
+
 ## [0.2.1] - 2026-09-16
 
 ### Fixed

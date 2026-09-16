@@ -260,6 +260,41 @@
     阈值按"单轮声明数"判定，不随会话增长，安全。
 
 
+- [x] 14. **WebDAV 本地快照自引用递归**：`meta.webdav_last_snapshot` 单行涨到 595 MB，且每次推送翻一倍
+  - 现象（本轮排查 Skill 时顺带撞到）：`jai.db` = 938 MB、WAL = 629 MB；`dbstat` 显示 `meta` 表占
+    **596 MB**，其中单行 `webdav_last_snapshot` = **624,552,032 字节**。用
+    `(length(value)-length(replace(value,'webdav_last_snapshot','')))/length('webdav_last_snapshot')`
+    数出该值**内含自己 19 层**。远端同源现象：`/jai-config.json` = **42.06 MB**，时间戳备份链清晰翻倍
+    `0.01→0.02→0.03→0.05→0.08→0.12→0.21→0.38→0.72→1.38→2.69→5.32→21.07 MB`（13+ 个），
+    相邻间隔约 **30 分钟** = `webdav_auto_push_interval_min`，即**每轮自动推送翻一倍**。
+  - 根因：`store/export.rs::build_export_json` 用 `SELECT key,value FROM meta` **全量导出 meta**，
+    而 `webdav_last_snapshot` 正是「上一版导出物」本身；`src-tauri/src/main.rs::push_now()` 的顺序是
+    「构建导出 → `sync::snapshot_put` 存为快照 → PUT 远端」→ 每次推送把上一版快照封进新快照。
+    导入侧一直用白名单过滤该 key（`store/import.rs`），**导出侧漏了** —— 两侧不对称即根因。
+  - 影响面：本地磁盘/WAL 无界增长；每次推送体量逐轮翻倍（本地 595 MB → 下次约 1.19 GB）；
+    远端备份链同步膨胀；删行后 DB 文件也不会自动缩小（实测 298 MB 空闲页）。**不跨设备传染**
+    （导入白名单挡住了 `webdav_last_snapshot`）。
+  - 修复（v0.2.2）：
+    1. 导出侧改为 `WHERE key <> ?1`（用 `sync::snapshot_meta_key()` 单一常量，杜绝字面量散落再漏改）；
+    2. `sync::snapshot_put` 加体积硬上限（默认 4 MB，`JAI_SNAPSHOT_MAX_BYTES` 可覆盖）：超限
+       **跳过写入并 WARN**、**不返回 Err**（快照只是回退手段，绝不能反过来阻塞用户的配置推送）；
+    3. 启动自愈 `sync::heal_oversized_snapshot`：存量 > 2 MB 的快照用当前配置重建（重建失败则删 key）；
+    4. `sync::try_pull` 体积护栏（默认 32 MB，`JAI_REMOTE_CONFIG_MAX_BYTES` 可覆盖）：远端被撑大时
+       报出指向本条的明确错误，不把几百 MB 读进内存；
+    5. 新增 `store::meta_delete`（「没有此设置」≠「设置为空」，避免回退路径误用空快照）。
+  - 回归（**含守门人实证**）：`store::export::tests::export_excludes_self_snapshot_key` +
+    `export_size_stable_across_push_cycles`。后者在修复前**实测必红**：连续 8 轮「构建导出 → 存快照」
+    的体积序列为 `1206 → 2628 → 4334 → 6604 → 10002 → 15656 → 25822 → 45012` 字节（逐轮翻倍），
+    修复后恒定 1206 字节 —— 生产 19 轮 → 595 MB 的缩影。另加
+    `snapshot_put_refuses_oversized_text_without_blocking_push`、`heal_rebuilds_oversized_snapshot`、
+    `heal_is_noop_for_normal_or_absent_snapshot`、`oversized_remote_error_is_actionable`
+    与集成测试 `m7_import_webdav::pull_rejects_oversized_remote_config`。
+  - 教训：**任何"把当前完整状态存下来"的逻辑，都必须先问一句"这份状态里有没有它自己"** ——
+    快照/导出/备份三件套最容易踩。对策是把"导出物必须自引用安全"写成**断言**（连续 N 轮体积恒定），
+    而不是靠 review 记住；同族风险点复核：`export_config_json` 命令（复用同一 `build_export_json`，
+    随本次修复一并干净）、远端时间戳备份（内容同样来自导出物，随之变干净）。
+
+
 ## 2. 优化清单
 
 - [x] 1. 创建供应商弹框应该有按钮可以测试能不能获取到模型。
