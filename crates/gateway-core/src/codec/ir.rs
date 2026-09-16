@@ -13,8 +13,12 @@ use serde_json::{Map, Value};
 /// 按 Anthropic 单消息 content block 上限语义，按单条消息校验、不跨消息累计——
 /// agent 客户端（dsh 等）每轮请求全量重放历史，跨消息累计会把正常长会话误伤。
 pub const MAX_BLOCKS_PER_REQUEST: usize = 64;
-/// 工具参数累计上限（roadmap M4 护栏，越界 400）
-pub const MAX_TOTAL_TOOL_ARGS_BYTES: usize = 256 * 1024;
+/// 单条消息内工具参数累计上限（roadmap M4 护栏，越界 400）。
+/// **按单条消息校验、不跨消息累计**——与 blocks 同理：agent 客户端（dsh 等）每轮请求
+/// 全量重放历史，按整请求累计会在历史参数合计越过上限后把该会话**每一轮**都判 400
+/// （客户端表现为 turn error，会话彻底卡死且无自愈路径）。
+/// 护栏只拦「单次工具调用参数异常巨大」这类畸形输入；整请求体大小由上游自身限制兜底。
+pub const MAX_TOOL_ARGS_BYTES_PER_MESSAGE: usize = 256 * 1024;
 
 // ================================================================ 角色与请求
 
@@ -362,27 +366,34 @@ fn base58_decode(s: &str) -> Option<Vec<u8>> {
 
 // ================================================================ 护栏校验
 
-/// M4 护栏：单条消息 blocks ≤ 64（Anthropic 单消息上限语义）且工具参数累计 ≤ 256KB。
+/// M4 护栏：单条消息 blocks ≤ 64（Anthropic 单消息上限语义）；
+/// 单条消息内 tool_use 参数累计 ≤ 256KB。两项均**按单条消息**校验、**不跨消息累计**——
+/// agent 客户端每轮全量重放历史，按整请求累计会把正常长会话误伤（历史越大越必然触发）。
 /// 返回 Err(描述)。
 pub fn validate_guards(req: &CanonicalRequest) -> Result<(), String> {
-    let mut tool_args_bytes = 0usize;
-    for m in &req.messages {
+    for (idx, m) in req.messages.iter().enumerate() {
         if m.blocks.len() > MAX_BLOCKS_PER_REQUEST {
             return Err(format!(
-                "单条消息内容块超过 {} 个上限（护栏）",
-                MAX_BLOCKS_PER_REQUEST
+                "单条消息内容块超过 {} 个上限（护栏）：第 {} 条消息 {} 块",
+                MAX_BLOCKS_PER_REQUEST,
+                idx + 1,
+                m.blocks.len()
             ));
         }
+        let mut msg_tool_args_bytes = 0usize;
         for b in &m.blocks {
             if let Block::ToolUse { input, .. } = b {
-                tool_args_bytes += serde_json::to_string(input).unwrap_or_default().len();
-                if tool_args_bytes > MAX_TOTAL_TOOL_ARGS_BYTES {
-                    return Err(format!(
-                        "工具参数累计超过 {} 字节上限（护栏）",
-                        MAX_TOTAL_TOOL_ARGS_BYTES
-                    ));
-                }
+                msg_tool_args_bytes += serde_json::to_string(input).unwrap_or_default().len();
             }
+        }
+        if msg_tool_args_bytes > MAX_TOOL_ARGS_BYTES_PER_MESSAGE {
+            return Err(format!(
+                "单条消息工具参数累计超过 {} 字节上限（护栏）：第 {} 条消息 {} 字节；\
+                 请缩小单次工具调用参数，或新开会话丢弃历史中的超大参数",
+                MAX_TOOL_ARGS_BYTES_PER_MESSAGE,
+                idx + 1,
+                msg_tool_args_bytes
+            ));
         }
     }
     Ok(())
@@ -432,12 +443,12 @@ mod tests {
             vec![Block::Text { text: "x".into() }; MAX_BLOCKS_PER_REQUEST + 1];
         assert!(validate_guards(&too_many).is_err());
 
-        // 工具参数超限
+        // 工具参数超限（单条消息内）
         let mut too_big = req_with_messages();
         too_big.messages[0].blocks = vec![Block::ToolUse {
             id: "t1".into(),
             name: "f".into(),
-            input: json!({"big": "x".repeat(MAX_TOTAL_TOOL_ARGS_BYTES + 1)}),
+            input: json!({"big": "x".repeat(MAX_TOOL_ARGS_BYTES_PER_MESSAGE + 1)}),
         }];
         assert!(validate_guards(&too_big).is_err());
     }
@@ -456,6 +467,59 @@ mod tests {
         // 单条消息仍受 64 上限约束
         req.messages[0].blocks = vec![Block::Text { text: "x".into() }; MAX_BLOCKS_PER_REQUEST + 1];
         assert!(validate_guards(&req).is_err());
+    }
+
+    /// 回归（2026-09-16 turn error）：工具参数护栏曾按**整请求**累计，
+    /// agent 客户端每轮全量重放历史 → 历史参数合计越过 256KB 后每一轮都 400，会话死锁。
+    #[test]
+    fn guards_tool_args_per_message_not_request() {
+        fn tool_use_message(bytes: usize) -> CanonMessage {
+            CanonMessage {
+                role: Role::Assistant,
+                blocks: vec![Block::ToolUse {
+                    id: "t".into(),
+                    name: "f".into(),
+                    // JSON 编码后 ≈ bytes（键名 + 引号开销仅几字节）
+                    input: json!({"p": "x".repeat(bytes)}),
+                }],
+            }
+        }
+
+        // 4 条历史消息各 ~200KB：整请求合计远超 256KB，但没有任何单条越限 → 必须放行
+        let mut req = req_with_messages();
+        req.messages = (0..4).map(|_| tool_use_message(200 * 1024)).collect();
+        let total: usize = req
+            .messages
+            .iter()
+            .map(|m| match &m.blocks[0] {
+                Block::ToolUse { input, .. } => serde_json::to_string(input).unwrap().len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            total > MAX_TOOL_ARGS_BYTES_PER_MESSAGE,
+            "夹具需真的跨消息超限，实际合计 {total}"
+        );
+        assert!(
+            validate_guards(&req).is_ok(),
+            "跨消息累计不应触发工具参数护栏（长会话每轮重放历史）"
+        );
+
+        // 单条消息内多变体累计超限仍要拦（累加是在消息内部做的）
+        let one = req.messages[1].blocks[0].clone();
+        req.messages[1].blocks = vec![one.clone(), one];
+        let two: usize = req.messages[1]
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::ToolUse { input, .. } => serde_json::to_string(input).unwrap().len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(two > MAX_TOOL_ARGS_BYTES_PER_MESSAGE);
+        let err = validate_guards(&req).unwrap_err();
+        assert!(err.contains("工具参数累计"), "{err}");
+        assert!(err.contains("第 2 条消息"), "错误应指明越界消息：{err}");
     }
 
     #[test]
