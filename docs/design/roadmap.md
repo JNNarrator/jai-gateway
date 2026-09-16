@@ -120,7 +120,8 @@
 - 结构合规变换：相邻同角色合并、system 提升、tool_result 打包、块序约束
 - Gemini 无调用 id 的合成与 name 关联；http 图片拉取转 base64（8s 超时，失败明确 400）
 - `response_format`(json_schema) 跨族 400（OpenAI 族目标仍透传）；Extensions Lenient 丢弃 + 单条 WARN 汇总
-- 护栏常量：单请求 blocks ≤ 64、累计 args ≤ 256KB，越界 400
+- 护栏常量：**单条消息** blocks ≤ 64、**单条消息内**工具参数累计 ≤ 256KB（不跨消息累计——
+  agent 客户端每轮全量重放历史，跨消息累计会锁死长会话，见 bug 清单 13），越界 400
 - `GET /v1/models` 跨族聚合输出去重
 
 **内部闸门（顺序推进）**：G-a 文本链路 → G-b 流式 → G-c tools 循环 → G-d 图片。
@@ -252,7 +253,7 @@
 | 重点客户端行为漂移（CC/Codex/zcode/harness） | 每次发版用当日版本回归 §2 对应验收脚本；破坏性漂移记 CHANGELOG 并评估兼容垫片 |
 | Responses API 表面大于预期（事件类型繁多） | M6 先落 Codex 实际触达的事件子集，未触达事件夹具标记 skip 而非臆造行为；预算超支则砍图片输入先行 |
 | Gemini functionCall 无 id 的并发同名歧义 | 合成 id 冲突后缀策略 + 专项夹具（M4 验收 4） |
-| 流式重排缓冲内存失控 | 护栏常量（≤64 blocks / ≤256KB args）统一在 M4 落地、M8 审计 |
+| 流式重排缓冲内存失控 | 护栏常量（单条消息 ≤64 blocks / ≤256KB args）统一在 M4 落地、M8 审计 |
 | 平台密钥环差异 | M0 起启动三连探测；不支持环境在添加供应商前拦截（storage §4） |
 | WebDAV 误覆盖造成配置丢失 | M7 推送前快照留存；LLW 先于定时自动同步开放 |
 
@@ -307,7 +308,7 @@
 
 - IR 类型落地（`codec/ir.rs`）：CanonicalRequest/Response、Block、ToolSpec、ToolChoice、
   SampleParams、StreamEvent、StopReason、Usage + 结构合规变换（相邻同角色合并）+ 护栏
-  （blocks ≤ 64 / args ≤ 256KB，`validate_guards`）
+  （单条消息 blocks ≤ 64 / 单条消息内 args ≤ 256KB，`validate_guards`）
 - InboundCodec::OpenAI 全量（`codec/openai.rs`）：decode_request（含 image_url/base64、tool_calls、
   tool 结果）、render_response、render_stream_event + RenderState
 - UpstreamCodec::Anthropic 全量（`codec/anthropic.rs`）：encode_request（system 提升、tool_result
@@ -365,7 +366,7 @@
 - 全矩阵回归一键脚本：`scripts/regression.sh`（fmt / clippy / test / 前端 build）
 - fuzz 简表：`tests/m8_hardening.rs` 500 个确定性随机 body 覆盖四类入站解码器与
   SSE 解析器，无 panic/悬挂
-- 护栏常量审计：现有 `ir::validate_guards` 单测（blocks ≤ 64 / args ≤ 256KB）持续全绿
+- 护栏常量审计：现有 `ir::validate_guards` 单测（单条消息 blocks ≤ 64 / 单条消息内 args ≤ 256KB）持续全绿
 - 文档一致性：README / roadmap 随 M1–M8 同步更新
 - 资源/性能基线与 48h 本机观察：见文末附录 A（2026-09-01 macOS release 实测，性能项已过，48h 观察进行中）
 
