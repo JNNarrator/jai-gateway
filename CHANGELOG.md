@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-16
+
+### Changed
+- **MCP 代理转发（`/mcp`）语义收紧**，两处行为变化：
+  - **结果原样透传**：`content` 逐块保留（含 `image` / `resource_link`）、`isError` 原样冒泡、
+    `structuredContent` 保留，来源降为非标准 `source` 字段。**上游工具级失败不再被当作成功**。
+  - **独立等待预算** `JAI_MCP_PROXY_CALL_TIMEOUT_MS`（默认 **55s**，低于常见 MCP 客户端的 60s
+    硬中止）：接近/超过客户端预算的长时调用改为网关提前返回工具级错误（含「改用
+    `terminal_start` + `terminal_poll`」指引），而不是让客户端报 `-32001` 并连带作废同批调用。
+  - 迁移提示：有状态/长时工具（终端会话类）建议把客户端 `toolCallTimeoutMs` 调到网关预算之上。
+    详细语义与预算表见 README「MCP 元数据服务 / 代理转发的两条语义」。
+
 ### Fixed
 - **`/mcp` 代理转发的工具级失败被拉平成成功**（客户端把失败当成功）：
   - 根因：`registry.rs` 的 `tools/call` 成功分支把上游结果包成 `{source, result}` 再 `to_string()`
