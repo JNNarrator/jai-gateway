@@ -86,6 +86,13 @@
   - 建议修法：① 用 RAII guard（Drop 时还原环境变量），别把清理写在断言之后；
     ② 初始化握手不要复用调用超时（单列 `JAI_MCP_POOL_INIT_TIMEOUT_MS`，给 spawn 留足余量）；
     ③ 该文件测试是进程级共享状态，超时阈值不宜压到 100ms 量级。
+  - 【2026-09-16 v0.2.1 发版实测】门禁又红一次，失败集 `{timeout_discards_connection,
+    rebuilds_when_process_dies_after_response}`，错误均为 `MCP initialize 超时`——与既有签名一致；
+    处置与判据（可复用）：① `cargo test -p gateway-core --test mcp_pool` **单跑 7/7 通过**；
+    ② `JAI_MCP_POOL_CALL_TIMEOUT_MS=30` 能复现该签名（证明是阈值/负载敏感而非功能回归）；
+    ③ 本轮改动（`codec/ir.rs` 护栏）与该测试无调用关系。随后重跑 `release_check.sh` 全绿（EXIT=0）。
+    → 结论：**这是门禁噪音，不是本次回归**；但每次发版都要靠"重跑+复现签名"来排除它，成本在持续累积，
+    建议尽快按下述修法根治（属独立小任务，不阻塞本次发布）。
 
   - 【2026-09-16 补充】同族还有第二个坑（由本次新增测试踩到）：全局 stdio 池的连接键是
     `(cmd, args, env)`，而池里缓存的**进程句柄绑定创建它的 tokio runtime**；同一测试进程内多个
