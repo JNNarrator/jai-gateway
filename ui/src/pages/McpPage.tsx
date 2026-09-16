@@ -29,6 +29,29 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+
+/** 两个 per-server 开关的说明文案（顶部提示条 / hover 详情共用，避免两处漂移） */
+const SWITCH_HELP = {
+  enabled: {
+    label: "启用",
+    short: "网关是否连接它 —— 关闭后不进入台账与工具列表，也不能被代理执行",
+    detail:
+      "是否让网关连接这个 MCP Server。关闭后：它不出现在台账与 /mcp 工具列表里，也无法被代理执行（即使「代理执行」仍开着）。",
+  },
+  proxy: {
+    label: "代理执行",
+    short:
+      "是否让 Agent 能调它的工具 —— 开启后工具以 <server>__<tool> 暴露给 Agent 并经网关转发执行",
+    detail:
+      "是否把这个 Server 的工具交给 Agent：开启后其工具以 <server>__<tool> 出现在 /mcp 工具列表，Agent 可主动调用、由网关转发给真实 Server 执行。需先「启用」；默认关闭（最小权限），有状态/长时工具建议先评估。",
+  },
+} as const;
 
 /** 安全解析 env JSON 的键名列表；非法或非对象时返回占位文案，避免渲染抛错白屏 */
 function envKeySummary(env: string): string {
@@ -73,7 +96,7 @@ export function McpPage() {
   }
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4">
+    <div className="mx-auto max-w-4xl space-y-4">
       <PageHeader
         title="MCP Server 管理"
         description="本机 MCP Server 登记台账。网关不再把工具注入对话链路；Agent 可通过网关 /mcp 元数据服务查询此台账（见「网关」页接入说明）。"
@@ -136,33 +159,89 @@ export function McpPage() {
         />
       )}
 
+      {list.length > 0 && (
+        <div
+          className="flex flex-wrap gap-x-5 gap-y-1 rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+          data-testid="mcp-switch-help"
+        >
+          <span>
+            <span className="font-medium text-foreground">{SWITCH_HELP.enabled.label}</span>
+            ：{SWITCH_HELP.enabled.short}
+          </span>
+          <span>
+            <span className="font-medium text-foreground">{SWITCH_HELP.proxy.label}</span>
+            ：{SWITCH_HELP.proxy.short}
+          </span>
+        </div>
+      )}
+
       <div className="space-y-3">
+        <TooltipProvider delayDuration={200}>
         {list.map((m) => (
           <div
             key={m.id}
             className="rounded-lg border bg-card p-4 text-card-foreground shadow-sm"
           >
-            <div className="flex items-center gap-3">
-              <Switch
-                checked={m.enabled}
-                onCheckedChange={(v) => act(() => api.mcpSetEnabled(m.id, v))}
-                aria-label={`启用/停用 ${m.name}`}
-              />
-              <label className="flex shrink-0 cursor-pointer items-center gap-1.5">
-                <Switch
-                  checked={m.proxyAllowed}
-                  onCheckedChange={(v) => act(() => api.mcpSetProxyAllowed(m.id, v))}
-                  aria-label={`允许代理执行 ${m.name}`}
-                />
-                <span className="text-xs text-muted-foreground">代理</span>
-              </label>
-              <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+              <div className="flex shrink-0 items-center gap-3">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <label className="flex cursor-pointer items-center gap-1.5">
+                      <Switch
+                        checked={m.enabled}
+                        onCheckedChange={(v) => act(() => api.mcpSetEnabled(m.id, v))}
+                        aria-label={`启用/停用 ${m.name}`}
+                      />
+                      <span className="text-xs text-muted-foreground">
+                        {SWITCH_HELP.enabled.label}
+                      </span>
+                    </label>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-xs text-left">
+                    {SWITCH_HELP.enabled.detail}
+                  </TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <label className="flex cursor-pointer items-center gap-1.5">
+                      <Switch
+                        checked={m.proxyAllowed}
+                        onCheckedChange={(v) => act(() => api.mcpSetProxyAllowed(m.id, v))}
+                        aria-label={`允许代理执行 ${m.name}`}
+                      />
+                      <span
+                        className={cn(
+                          "text-xs",
+                          // 停用时该开关虽然还能保留配置，但此刻不生效 —— 标签随之变淡
+                          m.enabled ? "text-muted-foreground" : "text-muted-foreground/50",
+                        )}
+                      >
+                        {SWITCH_HELP.proxy.label}
+                      </span>
+                    </label>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-xs text-left">
+                    {SWITCH_HELP.proxy.detail}
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+              <div className="min-w-0 flex-1 basis-40">
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium text-foreground">{m.name}</span>
                   <Badge variant="secondary" className="text-[11px] font-normal">
                     {m.kind}
                   </Badge>
                   {!m.enabled && <Badge variant="outline">已停用</Badge>}
+                  {/* 「已停用 + 代理执行开」是最容易被误读的组合：光看开关看不出此刻不生效。
+                      放在徽标行（而非下方 truncate 的路径行），否则会被裁掉看不见。 */}
+                  {!m.enabled && m.proxyAllowed && (
+                    <span
+                      className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                      data-testid="mcp-proxy-inactive"
+                    >
+                      停用中，代理执行暂不生效
+                    </span>
+                  )}
                 </div>
                 <div className="truncate font-mono text-xs text-muted-foreground">
                   {m.kind === "stdio"
@@ -184,6 +263,8 @@ export function McpPage() {
                 <Button
                   variant="outline"
                   size="sm"
+                  aria-label={`测试连接 ${m.name}`}
+                  title="测试连接"
                   onClick={() =>
                     act(async () => {
                       await api.mcpToolsList(m.id);
@@ -192,11 +273,13 @@ export function McpPage() {
                   }
                 >
                   <PlugZap aria-hidden />
-                  测试连接
+                  <span className="hidden lg:inline">测试连接</span>
                 </Button>
                 <Button
                   variant="outline"
                   size="sm"
+                  aria-label={`列出工具 ${m.name}`}
+                  title="列出工具"
                   onClick={() =>
                     act(async () => {
                       const tools = await api.mcpToolsList(m.id);
@@ -209,29 +292,34 @@ export function McpPage() {
                   }
                 >
                   <ListTree aria-hidden />
-                  列出工具
+                  <span className="hidden lg:inline">列出工具</span>
                 </Button>
                 <Button
                   variant="outline"
                   size="sm"
+                  aria-label={`编辑 ${m.name}`}
+                  title="编辑"
                   onClick={() => setDialog({ mode: "edit", row: m })}
                 >
                   <Pencil aria-hidden />
-                  编辑
+                  <span className="hidden lg:inline">编辑</span>
                 </Button>
                 <Button
                   variant="outline"
                   size="sm"
                   className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  aria-label={`删除 ${m.name}`}
+                  title="删除"
                   onClick={() => setConfirmDelete(m)}
                 >
                   <Trash2 aria-hidden />
-                  删除
+                  <span className="hidden lg:inline">删除</span>
                 </Button>
               </div>
             </div>
           </div>
         ))}
+        </TooltipProvider>
       </div>
 
       {dialog?.mode === "import" && (

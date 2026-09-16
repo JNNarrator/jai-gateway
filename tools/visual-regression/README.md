@@ -1,4 +1,4 @@
-# 视觉回归探针（默认窗口 980×640）
+# 视觉回归探针（默认窗口 1180×800，最小 900×600）
 
 配套文档：`docs/视觉回归整改plan.md`（问题清单、验收标准、进度记录）。
 证据输出（截图/JSON/日志）落在 `.vr/`，该目录在 `.gitignore` 中只保留在本地。
@@ -22,7 +22,11 @@ node tools/visual-regression/fold.mjs   --size=980x640   # 折叠线/横向溢�
 node tools/visual-regression/deep2.mjs  --size=980x640   # 弹窗结构：滚动容器、footer、主按钮可见性
 node tools/visual-regression/audit.mjs  --size=980x640 --theme=dark   # 对比度/字号/命中区/截断（light 另跑）
 node tools/visual-regression/run.mjs    --mode=walk --size=980x640    # 动态点击遍历（慢，建议后台）
-node tools/visual-regression/audit-summarize.mjs .vr/audit-dark-980x640.json
+node tools/visual-regression/audit-summarize.mjs .vr/audit-dark-1180x800.json
+
+# MCP 页两个开关的说明性回归（标签/解释条/hover 详情/点文字能切换/无溢出）
+node tools/visual-regression/mcp-switches.mjs --size=1180x800
+node tools/visual-regression/mcp-switches.mjs --size=900x600
 ```
 
 `probe-colors3.mjs` 用于复核某个按钮的真实对比度（`DARK=1` 强制暗色主题）。
