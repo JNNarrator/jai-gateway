@@ -169,9 +169,80 @@ pub fn snapshot_get(c: &Connection) -> Result<Option<String>, StoreError> {
     crate::store::meta_get(c, SNAPSHOT_META_KEY)
 }
 
+/// 快照体积硬上限（纵深防御）。正常导出的配置仅十几 KB。
+///
+/// 兜住的场景：导出物意外自包含（bug 清单 14 —— 导出曾带上 `webdav_last_snapshot`
+/// 自身，导致每次推送把上一版快照嵌进新快照、体积逐次翻倍，实测 19 轮后单行 595 MB）。
+/// 即便上游逻辑再次漏过滤，这里也会拒绝写入，不让 meta 无界增长。
+pub const SNAPSHOT_MAX_BYTES_DEFAULT: usize = 4 * 1024 * 1024;
+
+/// 快照上限（`JAI_SNAPSHOT_MAX_BYTES` 可覆盖，取正整数；非法值回落默认）。
+pub fn snapshot_max_bytes() -> usize {
+    std::env::var("JAI_SNAPSHOT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(SNAPSHOT_MAX_BYTES_DEFAULT)
+}
+
 /// 保存推送前本地快照。
+///
+/// 超上限时**跳过写入并告警**而不是返回 Err：快照是「误操作回退」的尽力而为手段，
+/// 不能反过来把用户的正常配置推送阻塞掉（宁可不留快照，也要让配置同步成功）。
 pub fn snapshot_put(c: &Connection, text: &str) -> Result<(), StoreError> {
+    let max = snapshot_max_bytes();
+    if text.len() > max {
+        eprintln!(
+            "[sync] 拒绝写入快照：{} 字节 > 上限 {} 字节；疑似导出物自包含（见 bug 清单 14），已保留旧快照",
+            text.len(),
+            max
+        );
+        return Ok(());
+    }
     crate::store::meta_set(c, SNAPSHOT_META_KEY, text)
+}
+
+/// 启动自愈：快照体积异常（历史自引用 bug 遗留）时，用当前配置重建一份干净快照。
+///
+/// 返回 `Some(旧字节数)` 表示执行了自愈。重建失败则删除该 key（宁可没有快照，
+/// 也不让一条 600 MB 的记录继续参与后续导出与 PUT）。
+pub fn heal_oversized_snapshot(c: &Connection) -> Result<Option<usize>, StoreError> {
+    let Some(text) = crate::store::meta_get(c, SNAPSHOT_META_KEY)? else {
+        return Ok(None);
+    };
+    if text.len() <= OVERSIZED_SNAPSHOT_BYTES {
+        return Ok(None);
+    }
+    let old = text.len();
+    match crate::store::export::build_export_json(c) {
+        Ok(fresh) => crate::store::meta_set(c, SNAPSHOT_META_KEY, &fresh)?,
+        Err(_) => {
+            crate::store::meta_delete(c, SNAPSHOT_META_KEY)?;
+        }
+    }
+    Ok(Some(old))
+}
+
+/// 判定快照「异常大」的阈值：远超任何正常配置导出（十几 KB 级）。
+pub const OVERSIZED_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
+
+/// 远端配置文件体积上限：正常配置 10–100 KB 量级；超限直接报错，
+/// 不把几百 MB 读进内存再解析（bug 清单 14 的远端侧护栏）。
+pub const REMOTE_CONFIG_MAX_BYTES_DEFAULT: usize = 32 * 1024 * 1024;
+
+fn remote_config_max_bytes() -> usize {
+    std::env::var("JAI_REMOTE_CONFIG_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(REMOTE_CONFIG_MAX_BYTES_DEFAULT)
+}
+
+fn oversized_remote_err(len: usize, max: usize) -> String {
+    format!(
+        "远端配置文件异常过大（{len} 字节 > 上限 {max} 字节）：疑似被历史自引用快照撑大（见 bug 清单 14）。\
+         请检查远端 jai-config.json 与 jai-config.<时间戳>.json 备份，必要时删除后用本机配置重新推送"
+    )
 }
 
 /// 覆盖式推送：先尝试读取远端旧版并留存时间戳备份，再 PUT 覆盖主文件。
@@ -262,10 +333,23 @@ pub async fn try_pull(
         };
         return Err(format!("WebDAV 拉取失败 HTTP {status}{hint}: {text}"));
     }
-    resp.text()
+    // 体积护栏：先看 Content-Length，再兜一次实读长度（服务器可能不给长度）。
+    // 目的：远端文件若被历史自引用快照撑大（bug 清单 14），直接给出可操作的错误，
+    // 而不是把几百 MB 读进内存再解析。
+    let max = remote_config_max_bytes();
+    if let Some(len) = resp.content_length() {
+        if len as usize > max {
+            return Err(oversized_remote_err(len as usize, max));
+        }
+    }
+    let text = resp
+        .text()
         .await
-        .map(Some)
-        .map_err(|e| format!("WebDAV 响应读取失败: {e}"))
+        .map_err(|e| format!("WebDAV 响应读取失败: {e}"))?;
+    if text.len() > max {
+        return Err(oversized_remote_err(text.len(), max));
+    }
+    Ok(Some(text))
 }
 
 /// WebDAV GET：拉取远端配置文本（404 转「远端尚无配置文件」提示）。
@@ -1027,5 +1111,72 @@ mod tests {
         assert!(!should_pull(local, local, Some(100)));
         // 远端非 JSON → 不拉
         assert!(!should_pull(local, "not json", Some(100)));
+    }
+
+    /// 回归（bug 清单 14）：超上限快照被拒绝写入，但**不阻塞调用方**（返回 Ok）。
+    /// 快照只是"误操作回退"的尽力而为手段，不能反过来让配置推送失败。
+    #[test]
+    fn snapshot_put_refuses_oversized_text_without_blocking_push() {
+        let c = open_and_migrate(":memory:").unwrap();
+        snapshot_put(&c, "{}").unwrap();
+        assert_eq!(snapshot_get(&c).unwrap().as_deref(), Some("{}"));
+
+        let huge = "x".repeat(SNAPSHOT_MAX_BYTES_DEFAULT + 1);
+        snapshot_put(&c, &huge).expect("超限不应返回 Err（不能阻塞推送）");
+        assert_eq!(
+            snapshot_get(&c).unwrap().as_deref(),
+            Some("{}"),
+            "超限写入应被跳过，旧快照原样保留"
+        );
+    }
+
+    /// 回归（bug 清单 14）：存量被撑大的快照在启动自愈时被重建为干净小快照。
+    #[test]
+    fn heal_rebuilds_oversized_snapshot() {
+        let c = open_and_migrate(":memory:").unwrap();
+        let huge = "x".repeat(OVERSIZED_SNAPSHOT_BYTES + 1);
+        crate::store::meta_set(&c, snapshot_meta_key(), &huge).unwrap();
+
+        let healed = heal_oversized_snapshot(&c).unwrap();
+        assert_eq!(healed, Some(huge.len()), "应报告被替换掉的旧体积");
+
+        let now = snapshot_get(&c).unwrap().unwrap();
+        assert!(
+            now.len() < 64 * 1024,
+            "重建后应为 KB 级，实际 {}",
+            now.len()
+        );
+        let v: Value = serde_json::from_str(&now).unwrap();
+        assert_eq!(v["format"], "jai-export/v1");
+        assert!(
+            !now.contains(snapshot_meta_key()),
+            "重建后的快照自身也不得自引用"
+        );
+    }
+
+    #[test]
+    fn heal_is_noop_for_normal_or_absent_snapshot() {
+        let c = open_and_migrate(":memory:").unwrap();
+        // 没有快照
+        assert_eq!(heal_oversized_snapshot(&c).unwrap(), None);
+        // 正常体积快照
+        snapshot_put(&c, "{}").unwrap();
+        assert_eq!(heal_oversized_snapshot(&c).unwrap(), None);
+        assert_eq!(snapshot_get(&c).unwrap().as_deref(), Some("{}"));
+    }
+
+    /// 远端体积护栏的错误信息必须可定位、可操作（含 bug 编号与实测值）。
+    #[test]
+    fn oversized_remote_error_is_actionable() {
+        let over = REMOTE_CONFIG_MAX_BYTES_DEFAULT + 1;
+        let msg = oversized_remote_err(over, REMOTE_CONFIG_MAX_BYTES_DEFAULT);
+        assert!(msg.contains("异常过大"), "{msg}");
+        assert!(msg.contains(&over.to_string()), "应给出实测字节数：{msg}");
+        assert!(
+            msg.contains(&REMOTE_CONFIG_MAX_BYTES_DEFAULT.to_string()),
+            "应给出上限值：{msg}"
+        );
+        assert!(msg.contains("bug 清单 14"), "应指向根因条目：{msg}");
+        assert_eq!(remote_config_max_bytes(), REMOTE_CONFIG_MAX_BYTES_DEFAULT);
     }
 }

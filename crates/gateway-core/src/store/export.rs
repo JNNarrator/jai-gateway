@@ -23,9 +23,18 @@ pub fn build_export_json(c: &Connection) -> Result<String, StoreError> {
 
     // meta KV 全量导出（webdav_url/username/directory/auto_push_*/webdav_password 随行；
     // 端口/CORS 等本机设置由导入侧白名单过滤）
+    //
+    // 必须排除 `webdav_last_snapshot`：它是「上一版导出物」本身，若随导出携带，
+    // 每次推送都会把上一版快照嵌进新快照（自引用递归），体积逐次翻倍 ——
+    // 实测 19 轮后单行 595 MB、DB 938 MB、WAL 629 MB、远端 `jai-config.json` 42 MB
+    // 且远端时间戳备份链 0.01→0.02→…→21 MB 同步翻倍（bug 清单 14）。
+    // 导入侧白名单一直过滤该 key，导出侧此前漏了；此处用 `sync::snapshot_meta_key()`
+    // 单一常量比对，避免字面量散落导致再次漏改。
     let meta_rows: Vec<(String, String)> = {
-        let mut stmt = c.prepare("SELECT key,value FROM meta ORDER BY key")?;
-        let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut stmt = c.prepare("SELECT key,value FROM meta WHERE key <> ?1 ORDER BY key")?;
+        let it = stmt.query_map([crate::sync::snapshot_meta_key()], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
         it.collect::<Result<Vec<_>, _>>()?
     };
 
@@ -167,5 +176,57 @@ mod tests {
             "keyring 引用不得出现（字段名也不要）"
         );
         assert!(!s.contains("jai/provider"), "密钥环引用地址不得出现");
+    }
+
+    /// 回归（bug 清单 14）：导出物必须**自引用安全**。
+    /// 修复前导出带上 `webdav_last_snapshot` 自己，推送即把上一版快照嵌进新快照。
+    #[test]
+    fn export_excludes_self_snapshot_key() {
+        let conn = open_and_migrate(":memory:").unwrap();
+        seed(&conn);
+        crate::store::meta_set(
+            &conn,
+            crate::sync::snapshot_meta_key(),
+            "SENTINEL-OLD-SNAPSHOT",
+        )
+        .unwrap();
+
+        let s = build_export_json(&conn).unwrap();
+        assert!(
+            !s.contains(crate::sync::snapshot_meta_key()),
+            "导出物不得包含快照 key 本身"
+        );
+        assert!(
+            !s.contains("SENTINEL-OLD-SNAPSHOT"),
+            "导出物不得含上一版快照内容"
+        );
+        // 白名单内的其它 meta 仍随导出（同步契约不变）
+        assert!(s.contains("dav-pass"), "WebDAV 密码仍应随导出");
+    }
+
+    /// 回归守门人（bug 清单 14）：`push_now` 的顺序是「构建导出 → 存为快照 → PUT」，
+    /// 因此**连续推送轮次后导出体积必须恒定**。修复前每轮翻倍
+    /// （实测 19 轮后本地单行 595 MB、远端 42 MB）。
+    #[test]
+    fn export_size_stable_across_push_cycles() {
+        let conn = open_and_migrate(":memory:").unwrap();
+        seed(&conn);
+
+        let mut sizes = Vec::new();
+        for _ in 0..8 {
+            let s = build_export_json(&conn).unwrap();
+            sizes.push(s.len());
+            crate::sync::snapshot_put(&conn, &s).unwrap();
+        }
+        assert_eq!(
+            sizes[0],
+            *sizes.last().unwrap(),
+            "8 轮推送后导出体积必须不变（存在自引用则会翻倍）：{sizes:?}"
+        );
+        assert!(
+            sizes[0] < 8 * 1024,
+            "正常配置导出应为 KB 级，实际 {} 字节",
+            sizes[0]
+        );
     }
 }

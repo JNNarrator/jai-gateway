@@ -825,6 +825,12 @@ pub fn meta_set(c: &Connection, key: &str, value_json: &str) -> Result<(), Store
     Ok(())
 }
 
+/// 删除一个 meta 键（「没有此设置」而非「设置为空」）。
+/// 用于快照自愈：重建失败时宁可让快照不存在，也不留 `{}` 让回退路径误用空配置。
+pub fn meta_delete(c: &Connection, key: &str) -> Result<usize, StoreError> {
+    Ok(c.execute("DELETE FROM meta WHERE key=?1", [key])?)
+}
+
 // ================================================================ tool_id_map（协议 IR §5-B）
 
 /// 超长 tool_use id 映射 TTL（storage §5：7 天滚动过期）。

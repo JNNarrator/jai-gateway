@@ -2609,6 +2609,12 @@ fn main() {
             let (log_handle, _log_task) = logs::spawn_logger(&db_str)?;
             println!("[store] db ready at {}", db_path.display());
 
+            // 存量自愈（bug 清单 14）：历史自引用快照可能已把 meta 单行撑到几百 MB，
+            // 启动时用当前配置重建一份干净快照。失败不阻塞启动（快照只是回退手段）。
+            if let Ok(Some(old)) = db.with(sync::heal_oversized_snapshot) {
+                eprintln!("[sync] 已重建异常快照：旧 {old} 字节（自引用递归遗留，见 bug 14）");
+            }
+
             // 读取持久化设置（meta KV）：端口 / 日志开关（roadmap M2 设置页）
             let preferred_port: u16 = db
                 .with(|c| {

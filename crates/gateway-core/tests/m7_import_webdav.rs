@@ -147,6 +147,64 @@ async fn spawn_dav_mock() -> (u16, Arc<Mutex<HashMap<String, String>>>) {
 
 // ---------------------------------------------------------------- 用例
 
+/// 进程级环境变量守卫：drop 时还原（含 panic 路径）。
+/// 教训来自 bug 清单 6：env 清理绝不能写在断言之后，否则一次 panic 会污染后续用例。
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, val: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, val);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// 回归（bug 清单 14）：远端 `jai-config.json` 若被历史自引用快照撑大，
+/// 拉取必须直接给出可操作错误，而不是把几百 MB 读进内存再解析。
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_rejects_oversized_remote_config() {
+    let (port, remote) = spawn_dav_mock().await;
+    // 阈值压到 4KB，避免测试真去构造 32MB 字符串
+    let _guard = EnvGuard::set("JAI_REMOTE_CONFIG_MAX_BYTES", "4096");
+    remote
+        .lock()
+        .unwrap()
+        .insert("/jai-config.json".into(), "x".repeat(8 * 1024));
+
+    let client = reqwest::Client::new();
+    let cfg = WebDavConfig {
+        url: format!("http://127.0.0.1:{port}"),
+        username: "u".into(),
+        directory: String::new(),
+        auto_push_enabled: false,
+        auto_push_interval_min: 60,
+        auto_pull_enabled: false,
+    };
+
+    let e = sync::try_pull(&client, &cfg, "pw").await.unwrap_err();
+    assert!(e.contains("异常过大"), "应报体积异常：{e}");
+    assert!(e.contains("bug 清单 14"), "应指向根因条目：{e}");
+
+    // 正常体积仍然通过（护栏不能误伤）
+    remote.lock().unwrap().insert(
+        "/jai-config.json".into(),
+        r#"{"format":"jai-export/v1","exportedAt":1}"#.into(),
+    );
+    assert!(sync::try_pull(&client, &cfg, "pw").await.unwrap().is_some());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn import_creates_providers_and_models() {
     let db = Db::in_memory().unwrap();
