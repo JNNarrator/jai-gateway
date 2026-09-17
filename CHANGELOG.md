@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **换台电脑后同步「从来没成功过」**（bug 19）：新机器第一次拉取会把自己刚打开的
+  「自动拉取」关掉，此后再也收不到对方机器的更新。
+  - 根因：`webdav_auto_*` 三个键（自动推送开关/间隔、自动拉取开关）被当作**共享配置**随
+    meta 同步，而 `apply_import` 对白名单键是**无条件覆盖**。但它们是**本机调度偏好**：
+    A 机出厂默认 `auto_pull_enabled=0` 就这样"旅行"到 B 机，把 B 机用户刚打开的开关
+    在第一次拉取时自己关掉——一个自我否定的闭环。对称地还会把 B 机刻意关掉的自动推送翻回开，
+    让新机器反过来覆盖远端。
+  - 修复：三个键定为**本机调度偏好，双向不参与同步**。单一事实源
+    `sync::MACHINE_LOCAL_META_KEYS`；导出侧剔除（顺带让「只升级一台机器」也安全），
+    导入侧白名单 7 → 4 并保留纵深防御判断。
+  - 回归：`tests/m7_import_webdav.rs` 新增 4 条（`pull_must_not_clobber_local_auto_switches`
+    修复前必红、`export_omits_machine_local_switches`、`second_machine_pull_lands_data_and_keys`
+    等），13 条全绿。排查中另验证并排除了 5 个假设（凭据不同步 / 不热加载 / 尾斜杠 / 远端数据 /
+    认证协议），详见 `docs/bug和优化清单.md` 第 19 条。
+  - 升级须知：需两台都升级；新机器仍须**先手工填一次 WebDAV 地址/账号/密码**（拉取的前提无法自举）。
+
 ## [0.2.4] - 2026-09-17
 
 ### Fixed

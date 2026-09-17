@@ -496,3 +496,231 @@ async fn webdav_backups_list_restore_delete_roundtrip() {
         .unwrap(); // 已删 → 幂等成功
     assert!(remote.lock().unwrap().contains_key("/jai-config.json"));
 }
+
+// ---------------------------------------------------------------- bug 19：换台电脑
+
+/// 造一台「老机器 A」的完整导出物：带 key 的供应商 + 模型 + 网关 Key + A 机调度偏好。
+///
+/// **刻意注入**三个 `webdav_auto_*`（模拟 v0.2.3 及更早推上去的远端内容——
+/// 也就是升级前真实存在于用户远端的那种 payload）：只有 payload 里带着它们，
+/// 才真正压住导入侧；若只依赖本版本的导出器（已剔除这三个键），
+/// 导入侧即使退化回「照单全收」也测不出来。
+async fn machine_a_export(port: u16) -> String {
+    let a = Db::in_memory().unwrap();
+    a.with_any(|c| {
+        // A 机本机偏好：自动推送开、自动拉取关（默认值）、间隔 30
+        sync::config_set(
+            c,
+            &WebDavConfig {
+                url: format!("http://127.0.0.1:{port}"),
+                username: "u".into(),
+                directory: String::new(),
+                auto_push_enabled: true,
+                auto_push_interval_min: 30,
+                auto_pull_enabled: false,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        store::meta_set(c, "webdav_password", "pw").map_err(|e| e.to_string())?;
+        store::import::apply_import(
+            c,
+            &json!({
+                "format": "jai-export/v1",
+                "gateway_key": "sk-jai-from-a",
+                "meta": [],
+                "providers": [{
+                    "id": "pa", "name": "A机供应商", "base_url": "https://api.a.test/v1",
+                    "family": "openai_compat", "enabled": true, "priority": 50,
+                    "extra_headers": null, "api_key": "sk-upstream-from-a"
+                }],
+                "models": [{
+                    "id": "ma", "providerId": "pa", "modelName": "gpt-4o",
+                    "upstreamModelId": null, "contextWindow": 128000,
+                    "maxOutputTokens": 4096, "enabled": true
+                }]
+            })
+            .to_string(),
+            false,
+        )?;
+        Ok::<(), String>(())
+    })
+    .unwrap();
+
+    let built = a
+        .with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
+        .unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&built).unwrap();
+    // 旧版形态：这三个键曾被导出、并随 payload 旅行到对方机器
+    let meta = v.get_mut("meta").unwrap().as_array_mut().unwrap();
+    meta.push(json!(["webdav_auto_push_enabled", "1"]));
+    meta.push(json!(["webdav_auto_push_interval_min", "30"]));
+    meta.push(json!(["webdav_auto_pull_enabled", "0"]));
+    v.to_string()
+}
+
+/// 导出侧：本机调度偏好不得随配置离开这台机器（半升级状态下保护旧版本的关键）。
+#[test]
+fn export_omits_machine_local_switches() {
+    let db = Db::in_memory().unwrap();
+    db.with_any(|c| {
+        sync::config_set(
+            c,
+            &WebDavConfig {
+                url: "https://dav.example.com".into(),
+                username: "u".into(),
+                directory: "jai".into(),
+                auto_push_enabled: true,
+                auto_push_interval_min: 30,
+                auto_pull_enabled: true,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        store::meta_set(c, "webdav_password", "pw").map_err(|e| e.to_string())
+    })
+    .unwrap();
+    let text = db
+        .with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let keys: Vec<String> = v["meta"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|kv| kv.get(0).and_then(|k| k.as_str()).map(str::to_string))
+        .collect();
+    for k in sync::MACHINE_LOCAL_META_KEYS {
+        assert!(
+            !keys.iter().any(|x| x == k),
+            "{k} 属本机调度偏好，不该出现在导出物里（会被对方机器导入并覆盖其开关）"
+        );
+    }
+    // 共享的连接配置与凭据仍必须随行
+    for k in [
+        "webdav_url",
+        "webdav_username",
+        "webdav_directory",
+        "webdav_password",
+    ] {
+        assert!(keys.iter().any(|x| x == k), "{k} 应随配置同步");
+    }
+}
+
+fn cfg_for(port: u16) -> WebDavConfig {
+    WebDavConfig {
+        url: format!("http://127.0.0.1:{port}"),
+        username: "u".into(),
+        directory: String::new(),
+        auto_push_enabled: true,
+        auto_push_interval_min: 30,
+        auto_pull_enabled: false,
+    }
+}
+
+/// 「换台电脑」的第一步：新机器拉取后**数据必须到位**（供应商/上游密钥/模型/网关 Key）。
+#[tokio::test(flavor = "multi_thread")]
+async fn second_machine_pull_lands_data_and_keys() {
+    let (port, _remote) = spawn_dav_mock().await;
+    let export = machine_a_export(port).await;
+    let client = reqwest::Client::new();
+    sync::push(&client, &cfg_for(port), "pw", export)
+        .await
+        .unwrap();
+
+    // B 机：全新库
+    let b = Db::in_memory().unwrap();
+    let text = sync::pull(&client, &cfg_for(port), "pw").await.unwrap();
+    let report = b
+        .with_any(|c| store::import::apply_import(c, &text, false))
+        .unwrap();
+    assert_eq!(report.providers_imported, 1, "新机器应拿到供应商");
+    assert_eq!(report.models_imported, 1, "新机器应拿到模型");
+
+    let (name, key) = b
+        .with_any(|c| {
+            let p = store::provider_list(c)
+                .map_err(|e| e.to_string())?
+                .remove(0);
+            Ok::<_, String>((p.name, p.api_key))
+        })
+        .unwrap();
+    assert_eq!(name, "A机供应商");
+    assert_eq!(
+        key.as_deref(),
+        Some("sk-upstream-from-a"),
+        "上游 API Key 必须随配置到达新机器（否则新机器上所有请求 401 = 用不了）"
+    );
+    let gw = b
+        .with_any(|c| store::gw_key_active(c).map_err(|e| e.to_string()))
+        .unwrap();
+    assert_eq!(
+        gw.map(|k| k.key),
+        Some("sk-jai-from-a".to_string()),
+        "网关 Key 必须随配置到达新机器"
+    );
+}
+
+/// bug 19 守门人：**拉取不得改掉本机的自动同步开关**。
+///
+/// 用户实报「换台电脑就没成功过」的机制：
+/// A 机 `auto_pull_enabled=0`（默认关）→ 导出物里带着这个 0 →
+/// B 机（新电脑）用户打开「自动拉取」想让本机接收 A 的更新 → 点一次「拉取」→
+/// 导入白名单把 A 的 0 照单收下 → **自动拉取被这次拉取自己关掉**，
+/// 此后 B 再也不自动拉，用户看到的就是「怎么都同步不过来」。
+/// 同一机制还会把 B 的 `auto_push_enabled` 翻成 A 的值，让新机器反过来覆盖远端。
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_must_not_clobber_local_auto_switches() {
+    let (port, _remote) = spawn_dav_mock().await;
+    let export = machine_a_export(port).await;
+    let client = reqwest::Client::new();
+    sync::push(&client, &cfg_for(port), "pw", export)
+        .await
+        .unwrap();
+
+    // B 机：用户已按自己的意愿设定本机偏好 —— 自动拉取开、自动推送关、间隔 360
+    let b = Db::in_memory().unwrap();
+    b.with_any(|c| {
+        sync::config_set(
+            c,
+            &WebDavConfig {
+                url: format!("http://127.0.0.1:{port}"),
+                username: "u".into(),
+                directory: String::new(),
+                auto_push_enabled: false,
+                auto_push_interval_min: 360,
+                auto_pull_enabled: true,
+            },
+        )
+        .map_err(|e| e.to_string())
+    })
+    .unwrap();
+
+    // B 机拉取
+    let text = sync::pull(&client, &cfg_for(port), "pw").await.unwrap();
+    b.with_any(|c| store::import::apply_import(c, &text, false))
+        .unwrap();
+
+    // 前半段：数据确实到位（否则是另一个问题，不该被这条断言掩盖）
+    assert_eq!(
+        b.with_any(|c| Ok::<_, String>(store::provider_list(c).unwrap().len()))
+            .unwrap(),
+        1
+    );
+
+    // 后半段：本机调度偏好不被远端覆盖
+    let after = b
+        .with_any(|c| sync::config_get(c).map_err(|e| e.to_string()))
+        .unwrap()
+        .unwrap();
+    assert!(
+        after.auto_pull_enabled,
+        "拉取不得关掉本机的自动拉取（远端 auto_pull=0 不该被导入）"
+    );
+    assert!(
+        !after.auto_push_enabled,
+        "拉取不得打开本机的自动推送（否则新机器会反过来覆盖远端）"
+    );
+    assert_eq!(
+        after.auto_push_interval_min, 360,
+        "拉取不得改掉本机的自动推送间隔"
+    );
+}

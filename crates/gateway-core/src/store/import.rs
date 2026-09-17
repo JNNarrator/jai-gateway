@@ -2,7 +2,8 @@
 //!
 //! 密钥随配置同步：远端 `api_key` 非空才覆盖本地（空不清空）；新建供应商直接带 key/website，
 //! 导入后立即可路由。顶层 `gateway_key` 非空且与本地 active 不同时轮换（吊销旧 key）。
-//! meta 白名单：`webdav_url/username/directory/auto_push_enabled/auto_push_interval_min/webdav_password`。
+//! meta 白名单：`webdav_url/username/directory/webdav_password`。
+//! **不含** `webdav_auto_*`（本机调度偏好）——见 `sync::MACHINE_LOCAL_META_KEYS`。
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -16,14 +17,18 @@ use super::{
     ProviderRow,
 };
 
-/// 导入 meta 的白名单键（同步契约：仅连接配置与凭据，端口/CORS 等本机设置不迁移）。
-const META_IMPORT_WHITELIST: [&str; 7] = [
+/// 导入 meta 的白名单键（同步契约：仅**共享的**连接配置与凭据；端口/CORS 等本机设置不迁移）。
+///
+/// 三个 `webdav_auto_*`（自动推送开关/间隔、自动拉取开关）**故意不在列**：
+/// 它们描述「这台机器多久同步一次」，属本机偏好。此前在列内会造成确定性故障 ——
+/// A 机 `auto_pull_enabled=0`（默认关）随导出物到达新机器 B，把 B 用户刚打开的
+/// 「自动拉取」在第一次拉取时自己关掉，此后 B 再也不自动拉，表现为
+/// 「换台电脑就没成功过」（bug 清单 19）。排除清单以 `sync::MACHINE_LOCAL_META_KEYS`
+/// 为单一事实源，导出侧同样剔除。
+const META_IMPORT_WHITELIST: [&str; 4] = [
     "webdav_url",
     "webdav_username",
     "webdav_directory",
-    "webdav_auto_push_enabled",
-    "webdav_auto_push_interval_min",
-    "webdav_auto_pull_enabled",
     "webdav_password",
 ];
 
@@ -284,7 +289,9 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
         }
     }
 
-    // meta 白名单应用：仅 WebDAV 连接配置与密码
+    // meta 白名单应用：仅 WebDAV 连接配置与密码。
+    // 第二个条件（本机调度偏好）是纵深防御：即便日后有人把 `webdav_auto_*` 又加回白名单，
+    // 这里也会拦住，不让对方机器的同步开关覆盖本机（bug 清单 19 的守门线）。
     if let Some(meta) = v.get("meta").and_then(Value::as_array) {
         for kv in meta {
             let (Some(k), Some(val)) = (
@@ -293,7 +300,10 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
             ) else {
                 continue;
             };
-            if META_IMPORT_WHITELIST.contains(&k) && !val.trim().is_empty() {
+            if META_IMPORT_WHITELIST.contains(&k)
+                && !crate::sync::is_machine_local_meta_key(k)
+                && !val.trim().is_empty()
+            {
                 meta_set(c, k, val).map_err(|e| e.to_string())?;
             }
         }

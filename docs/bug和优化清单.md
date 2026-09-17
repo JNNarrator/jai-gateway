@@ -388,6 +388,50 @@
   - 教训：**主题有两种传递路径**（CSS 类 + React context），只驱动其一会让"跟随主题"的第三方
     组件静默走错分支；`richColors` 这类自带调色板的组件尤其容易踩。
 
+- [x] 19. **换台电脑后同步「从来没成功过」**：新机器第一次拉取会把本机的自动同步开关改掉
+  - 现象（用户实报「我换台电脑就没成功过」）：A 机同步正常；在 B 机（新电脑）配好 WebDAV、
+    打开「自动拉取」并点一次「拉取」后，**B 机的自动拉取会变成关闭**，之后 B 再也收不到 A 的更新；
+    对称地，B 机刻意关掉的「自动推送」会被翻成开，让新机器反过来覆盖远端。
+  - 根因：`webdav_auto_*` 三个键（自动推送开关/间隔、自动拉取开关）被当作共享配置同步 ——
+    导出侧随 meta 携带、导入侧在 `META_IMPORT_WHITELIST` 里，且 `apply_import` 对白名单键
+    **无条件 `meta_set` 覆盖**。但它们是**本机调度偏好**（「这台机器多久同步一次」），
+    不是共享配置。A 机 `auto_pull_enabled=0`（出厂默认关）就这样"旅行"到 B 机，
+    把 B 机用户刚打开的开关在**第一次拉取时自己关掉** —— 一个自我否定的闭环：
+    拉取这个动作本身把「以后自动拉取」的能力关闭了。
+  - 排查过程中**先排除**的假设（都验证过，避免误判）：
+    ① 密钥不随同步 → 否：0006 起凭据明文入库，导出携带 `api_key`/`gateway_key`/`webdav_password`；
+    ② 导入后网关不热加载 → 否：路由每请求实时读库（`store::route_candidates`）；
+    ③ 路径拼接因尾部斜杠不一致 → 否：`join_path`/`join_remote_file` 已归一化；
+    ④ 远端数据缺失/损坏 → 否：实测远端 `jai-config.json` 完整（2 供应商带 Key、25 模型、网关 Key）；
+    ⑤ 认证/协议不支持 → 否：curl 实测 GET 200；A 机推送正常（远端 exportedAt 与 A 机 last_sync 一致）。
+  - 修复（2026-09-17）：把三个 `webdav_auto_*` 定为**本机调度偏好**，双向不参与同步：
+    - 新增单一事实源 `sync::MACHINE_LOCAL_META_KEYS` + `is_machine_local_meta_key()`；
+    - 导出侧剔除（`store/export.rs`）—— 这一层额外让「只升级一台机器」的半升级状态也安全
+      （旧版本导入侧仍会收这些键，收不到就不会覆盖）；
+    - 导入侧白名单 `7 → 4`，并保留 `!is_machine_local_meta_key(k)` 作为纵深防御
+      （即便日后有人把键加回白名单也拦得住）。
+  - 回归（`tests/m7_import_webdav.rs` 新增 4 条，共 13 条全绿）：
+    - `pull_must_not_clobber_local_auto_switches`：**修复前必红**（实跑复现「拉取关掉自动拉取」）；
+      刻意在 payload 里**注入**旧版本形态的三个键，保证导入侧单独退化也能测出来；
+    - `export_omits_machine_local_switches`：导出物不得含这三个键，但 url/username/directory/password 必须随行；
+    - `second_machine_pull_lands_data_and_keys`：新机器拉取后供应商/上游密钥/模型/网关 Key **全部到位**
+      （证明数据链路本身是好的，把"开关被关"和"数据没到"两类问题分开）。
+    - 双向守门人实证：只回退导入侧 → `pull_must_not_clobber_local_auto_switches` 必红；
+      只回退导出侧 → `export_omits_machine_local_switches` 必红。
+  - **注意（用户须知）**：修的是"新机器上的开关被覆盖"，要两台都升级到本版本才完全生效；
+    且**新机器必须先手工填一次 WebDAV 地址/账号/密码**（凭据是"能拉取"的前提，无法自举）。
+    升级后建议在新机器上按自己的意愿重新设置「自动拉取/自动推送」开关——从此不再被对方改掉。
+
+- [ ] 20. 自动拉取的时间节奏被自动推送的间隔绑住（相邻缺陷，本次未改）
+  - 位置：`src-tauri/src/main.rs::spawn_autopush` —— `let wait = push_interval.or(pull_interval)`，
+    一个 tick 只取**其中一个**间隔；且定时分支里「开了自动推送就每 tick 都推」。
+  - 后果：若自动推送设 360 分钟、自动拉取设 30 分钟，则拉取实际也是 360 分钟一次
+    （用户会以为「自动拉取没生效」）。bug 19 修好后三个开关各自独立，这个耦合反而更容易被踩到。
+  - 建议修法：tick 取启用项的最小间隔，并按各自「上次执行时间」分别判定是否该跑
+    （状态已在 `autopush.last` / `autopush.last_pull` 里，`at_ms` 可直接用），
+    避免把 360 分钟的推送也压成 30 分钟。需要一个可控时钟的测试。
+  - 影响面：仅调度节奏，不影响数据正确性（`should_pull` 的 last-write-wins 仍会拦住重复导入）。
+
 
 ## 2. 优化清单
 

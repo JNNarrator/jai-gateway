@@ -21,21 +21,28 @@ pub fn build_export_json(c: &Connection) -> Result<String, StoreError> {
         }
     }
 
-    // meta KV 全量导出（webdav_url/username/directory/auto_push_*/webdav_password 随行；
-    // 端口/CORS 等本机设置由导入侧白名单过滤）
+    // meta KV 导出（webdav_url/username/directory/webdav_password 随行；
+    // 端口/CORS 等本机设置由导入侧白名单过滤）。
     //
-    // 必须排除 `webdav_last_snapshot`：它是「上一版导出物」本身，若随导出携带，
-    // 每次推送都会把上一版快照嵌进新快照（自引用递归），体积逐次翻倍 ——
-    // 实测 19 轮后单行 595 MB、DB 938 MB、WAL 629 MB、远端 `jai-config.json` 42 MB
-    // 且远端时间戳备份链 0.01→0.02→…→21 MB 同步翻倍（bug 清单 14）。
-    // 导入侧白名单一直过滤该 key，导出侧此前漏了；此处用 `sync::snapshot_meta_key()`
-    // 单一常量比对，避免字面量散落导致再次漏改。
+    // 排除两类 key：
+    // 1) `webdav_last_snapshot`：它是「上一版导出物」本身，若随导出携带，
+    //    每次推送都会把上一版快照嵌进新快照（自引用递归），体积逐次翻倍 ——
+    //    实测 19 轮后单行 595 MB、DB 938 MB、WAL 629 MB、远端 `jai-config.json` 42 MB
+    //    且远端时间戳备份链 0.01→0.02→…→21 MB 同步翻倍（bug 清单 14）。
+    //    导入侧白名单一直过滤该 key，导出侧此前漏了；此处用 `sync::snapshot_meta_key()`
+    //    单一常量比对，避免字面量散落导致再次漏改。
+    // 2) `webdav_auto_*`（本机调度偏好）：见 `sync::MACHINE_LOCAL_META_KEYS` 的说明。
+    //    带出去会让对方机器的开关互相覆盖（bug 清单 19「换台电脑就没成功过」）；
+    //    导出侧一并剔除，还能在「只升级了一台机器」的半升级状态下保护旧版本。
     let meta_rows: Vec<(String, String)> = {
         let mut stmt = c.prepare("SELECT key,value FROM meta WHERE key <> ?1 ORDER BY key")?;
         let it = stmt.query_map([crate::sync::snapshot_meta_key()], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         it.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(k, _)| !crate::sync::is_machine_local_meta_key(k))
+            .collect()
     };
 
     let providers_out: Vec<Value> = providers

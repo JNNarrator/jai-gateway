@@ -110,6 +110,28 @@ pub fn snapshot_meta_key() -> &'static str {
     SNAPSHOT_META_KEY
 }
 
+/// **本机调度偏好**键：自动推送开关/间隔、自动拉取开关。
+///
+/// 它们描述的是「这台机器多久同步一次」，不是共享配置，因此**不参与同步**：
+/// 导出侧剔除、导入侧忽略（两处共用本常量，避免再次漏改）。
+///
+/// 为什么必须排除（bug 清单 19，「换台电脑就没成功过」的根因）：
+/// A 机 `auto_pull_enabled=0`（默认关）会随导出物到达 B 机，B 机用户在新电脑上
+/// 打开的「自动拉取」会被**第一次拉取自己关掉** → 此后 B 再也不自动拉；
+/// 对称地，B 机刻意关掉的「自动推送」也会被翻回开，让新机器反过来覆盖远端。
+/// 两处共用同一常量；导出侧也剔除，可在「只升级了一台机器」的半升级状态下
+/// 保护旧版本（旧版导入侧仍会收这些键，收不到就不会覆盖）。
+pub const MACHINE_LOCAL_META_KEYS: [&str; 3] = [
+    "webdav_auto_push_enabled",
+    "webdav_auto_push_interval_min",
+    "webdav_auto_pull_enabled",
+];
+
+/// 判断某个 meta key 是否属于「本机调度偏好」（同步时双向跳过）。
+pub fn is_machine_local_meta_key(key: &str) -> bool {
+    MACHINE_LOCAL_META_KEYS.contains(&key)
+}
+
 /// 读取 WebDAV 连接配置（密码不入库，由钥匙串单独保存）。
 pub fn config_get(c: &Connection) -> Result<Option<WebDavConfig>, StoreError> {
     let Some(url) = crate::store::meta_get(c, "webdav_url")? else {
