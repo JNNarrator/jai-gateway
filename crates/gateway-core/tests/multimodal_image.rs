@@ -480,3 +480,87 @@ fn capability_warns_only_for_families_without_native_tool_result_images() {
         );
     }
 }
+
+// ── bug 7：Responses 出站此前丢弃「消息级」图片（只修了工具结果内嵌图片）──
+
+/// 取出 Responses 出站 body 里第一条 message 的 content 数组。
+fn responses_first_message_content(v: &Value) -> &Vec<Value> {
+    v["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["type"] == "message")
+        .expect("应产出 message")["content"]
+        .as_array()
+        .expect("content 应为数组")
+}
+
+#[test]
+fn responses_outbound_user_message_keeps_image_in_block_order() {
+    // OpenAI chat 入站（text + data URL 图）→ Responses 出站：
+    // 图片必须原生承载为 `input_image`，且块序与入站一致（文本在前）。
+    let req = openai_inbound();
+    let v = responses_codec::encode_request(&req).unwrap();
+    let content = responses_first_message_content(&v);
+
+    assert_eq!(content.len(), 2, "text + image 应各占一个内容项: {content:?}");
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[0]["text"], "这张图里有什么？");
+    assert_eq!(
+        content[1]["type"], "input_image",
+        "用户消息里的图片不得被丢弃（bug 7）"
+    );
+    assert_eq!(
+        content[1]["image_url"],
+        format!("data:image/jpeg;base64,{JPEG_B64}"),
+        "media_type 应原样还原，不得退化为 png"
+    );
+}
+
+#[test]
+fn responses_outbound_image_only_user_message_is_not_dropped() {
+    // 只有图片、没有文本的用户消息：旧实现连 message 都不产出（整轮图丢失）。
+    // 同时覆盖 http url 形式的图片块（不臆造 base64）。
+    let body = json!({
+        "model": "claude-sonnet-4",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/webp", "data": JPEG_B64}},
+                {"type": "image",
+                 "source": {"type": "url", "url": "https://x.com/a.png"}}
+            ]
+        }]
+    });
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let req = anthropic_codec::decode_request(&bytes).unwrap();
+    let v = responses_codec::encode_request(&req).unwrap();
+    let content = responses_first_message_content(&v);
+
+    assert_eq!(content.len(), 2, "两张图应产出两个 input_image: {content:?}");
+    assert_eq!(content[0]["type"], "input_image");
+    assert_eq!(
+        content[0]["image_url"],
+        format!("data:image/webp;base64,{JPEG_B64}")
+    );
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(content[1]["image_url"], "https://x.com/a.png");
+}
+
+#[test]
+fn responses_outbound_text_only_user_message_shape_unchanged() {
+    // 无图片时保持既有形状（一段文本一个 input_text 项），避免无谓改变上游请求体口径
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "只问一句"}]
+    });
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let req = openai_codec::decode_request(&bytes).unwrap();
+    let v = responses_codec::encode_request(&req).unwrap();
+    let content = responses_first_message_content(&v);
+
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[0]["text"], "只问一句");
+}

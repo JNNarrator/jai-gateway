@@ -950,7 +950,7 @@ fn build_usage(u: &Usage) -> Value {
     usage
 }
 
-/// 渲染一个 `input_image` 内容项（工具结果内嵌图片用）。
+/// 渲染一个 `input_image` 内容项（用户消息与工具结果内嵌图片共用）。
 ///
 /// 口径与 openai 编码器一致：url 优先；否则把 base64 载荷包回 data URL，
 /// media_type 缺失时回落 png。既无 url 也无载荷 → `None`（不产出空图片项）。
@@ -992,13 +992,32 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
     for m in &req.messages {
         match m.role {
             Role::User => {
-                let mut text_parts: Vec<String> = Vec::new();
+                // 文本与图片按**块序**合成 content 数组：Responses 的 message content
+                // 原生支持 `input_image`（与工具结果内嵌图片同一承载口径，见
+                // docs/design/tool-result-image-protocol-factcheck.md）。
+                // 纯文本消息的产出形状与旧实现逐字节一致（一段文本一个 `input_text` 项）。
+                let mut content_parts: Vec<Value> = Vec::new();
                 let mut tool_results: Vec<Value> = Vec::new();
                 for b in &m.blocks {
                     match b {
-                        Block::Text { text } => text_parts.push(text.clone()),
-                        Block::Image { .. } => {
-                            // Responses 上游 v1 不支持图片内联转换，Lenient 丢弃
+                        Block::Text { text } => content_parts.push(json!({
+                            "type": "input_text",
+                            "text": text,
+                        })),
+                        Block::Image {
+                            media_type,
+                            data_base64,
+                            url,
+                        } => {
+                            // 旧实现此处静默丢弃（注释称「Responses 上游不支持图片内联
+                            // 转换」，与官方 schema 存疑）——即 bug 7：只有图片没有文本的
+                            // 用户消息甚至不会产出 message，整轮图丢失。
+                            match render_input_image(media_type, data_base64, url) {
+                                Some(part) => content_parts.push(part),
+                                None => eprintln!(
+                                    "[responses-out] 用户消息图片既无 url 也无 base64 载荷，已 Lenient 丢弃"
+                                ),
+                            }
                         }
                         Block::ToolResult {
                             call_id,
@@ -1059,14 +1078,11 @@ pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
                         _ => {}
                     }
                 }
-                if !text_parts.is_empty() {
+                if !content_parts.is_empty() {
                     input.push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": text_parts.iter().map(|t| json!({
-                            "type": "input_text",
-                            "text": t,
-                        })).collect::<Vec<_>>(),
+                        "content": content_parts,
                     }));
                 }
                 input.extend(tool_results);

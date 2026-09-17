@@ -15,6 +15,34 @@ const FAKE: &str = env!("CARGO_BIN_EXE_mcp_fake_server");
 /// 本文件测试串行执行（池参数环境变量是进程级全局，避免互相污染）。
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// 进程级环境变量的 RAII 守卫：`Drop` 时还原原值（缺失则删除）。
+///
+/// 旧写法把 `remove_var` 放在断言**之后**，只在成功路径执行；一旦断言 panic 就
+/// 跳过清理，变量残留（如 `JAI_MCP_POOL_CALL_TIMEOUT_MS=100`）→ 后续用例连带超时，
+/// 表现为「每轮失败的用例集合都不同」的失败级联（bug 6 的根因之二）。
+/// 用 Drop 兜住 panic 与提前 return 两条路径。
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 fn row(name: &str, env: Option<&str>) -> McpServerRow {
     McpServerRow {
         id: name.into(),
@@ -108,7 +136,9 @@ async fn rebuilds_when_process_dies_after_response() {
 #[tokio::test]
 async fn timeout_discards_connection() {
     let _g = SERIAL.lock().await;
-    std::env::set_var("JAI_MCP_POOL_CALL_TIMEOUT_MS", "100");
+    // 只压「调用」超时；握手预算不受影响（独立 `JAI_MCP_POOL_INIT_TIMEOUT_MS`），
+    // 故负载机器上的冷启动+握手不会被 100ms 判死。
+    let _t = EnvGuard::set("JAI_MCP_POOL_CALL_TIMEOUT_MS", "100");
     let s = row("timeout", Some(r#"{"FAKE_TEST_ID":"timeout"}"#));
 
     // fake slow 工具 300ms 响应 > 100ms 超时
@@ -118,22 +148,39 @@ async fn timeout_discards_connection() {
     // 超时后连接已废弃，下次调用自动重建、恢复正常
     let t = call_text(&s, "echo", json!({"text": "ok"})).await;
     assert_eq!(t.unwrap(), "ok");
+}
 
-    std::env::remove_var("JAI_MCP_POOL_CALL_TIMEOUT_MS");
+#[tokio::test]
+async fn init_handshake_uses_separate_budget() {
+    let _g = SERIAL.lock().await;
+    // 调用超时被压到 1ms（握手必然超不过它），但初始化仍应成功——
+    // 证明握手不再复用调用超时（bug 6 根因一的回归防线）。
+    let _c = EnvGuard::set("JAI_MCP_POOL_CALL_TIMEOUT_MS", "1");
+    let s = row("init-budget", Some(r#"{"FAKE_TEST_ID":"init-budget"}"#));
+
+    // pid 工具自身会被 1ms 的调用超时判死（报「MCP pid 超时（1ms）」），
+    // 但握手用独立预算，不应出现「initialize 超时」——回退到复用调用超时
+    // 的旧实现时，本断言必红（1ms 内不可能完成进程冷启动 + 握手）。
+    let r = mcp::call_tool(&s, "pid", json!({})).await;
+    match r {
+        Ok(_) => {} // 极快机器上 1ms 内竟也成功，握手同样已通过
+        Err(e) => assert!(
+            !e.contains("initialize"),
+            "初始化不应受调用超时约束，实际报错: {e}"
+        ),
+    }
 }
 
 #[tokio::test]
 async fn idle_reclaim_reaps_process() {
     let _g = SERIAL.lock().await;
-    std::env::set_var("JAI_MCP_POOL_IDLE_MS", "100");
+    let _t = EnvGuard::set("JAI_MCP_POOL_IDLE_MS", "100");
     let s = row("idle", Some(r#"{"FAKE_TEST_ID":"idle"}"#));
 
     let p1 = pid_of(&s).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     let p2 = pid_of(&s).await;
     assert_ne!(p1, p2, "空闲超时后应回收并重建进程");
-
-    std::env::remove_var("JAI_MCP_POOL_IDLE_MS");
 }
 
 #[tokio::test]

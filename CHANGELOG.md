@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Responses 出站丢弃「消息级」图片**（bug 7，多模态链路最后一块静默丢失）：
+  - 现象：`codec/responses.rs::encode_request` 的 user 消息分支对 `Block::Image` 直接跳过
+    （注释称「Responses 上游 v1 不支持图片内联转换」），图片被无声吃掉；**只有图片没有文本**
+    的用户消息更严重——连 `message` 都不产出，整轮图消失。同族的「工具结果内嵌图片」此前已修，
+    只剩这条路径没接上。
+  - 修复：按**块序**把图片渲染为 `input_image` 内容项，复用已有的 `render_input_image()`
+    （url 优先，base64 包回带真实 media_type 的 data URL）。纯文本消息的产出形状**逐字节不变**。
+  - 风险评估：`input_image` 已在 `function_call_output.output` 上生产使用并通过跨族实测，
+    此处是同 schema 类型、同族协议，不新增风险面；能力声明侧本就视「user 消息带图」为原生支持，
+    本次是让 encoder 与已声明能力面对齐。
+  - 回归：`tests/multimodal_image.rs` 新增 3 例；临时恢复丢弃逻辑时含图用例必红
+    （`text + image` 只产出 1 个内容项、仅图片时「应产出 message」panic）。
+- **`mcp_pool` 集成测试负载敏感 + 失败级联**（bug 6，长期污染 `scripts/regression.sh` 门禁）：
+  - 根因一：`initialize` 握手复用了 `JAI_MCP_POOL_CALL_TIMEOUT_MS`（测试压到 100ms），
+    机器有负载时「spawn 假 server + 握手」超标 → 误报 `MCP initialize 超时`。
+    现单列 `JAI_MCP_POOL_INIT_TIMEOUT_MS`（默认与调用超时一致，**生产行为不变**）。
+  - 根因二：测试的 `remove_var` 写在断言**之后**，panic 即跳过清理 → 环境变量残留
+    → 后续用例连带超时（表现为「每轮失败的用例集合都不同」）。现改 `EnvGuard` RAII，
+    `Drop` 时还原，panic 与提前 return 都能收回。
+  - 回归：新增 `init_handshake_uses_separate_budget`（调用超时压到 1ms，断言报错不含
+    `initialize`），旧实现下必红；原复现命令 `JAI_MCP_POOL_CALL_TIMEOUT_MS=30` 下
+    `MCP initialize 超时` 出现次数由 5/7 → **0**；6 路 CPU 负载连跑 15 轮 **0 失败**。
+
 ## [0.2.3] - 2026-09-17
 
 ### Fixed

@@ -69,7 +69,7 @@
   - 新增单测：`reasoning_content_roundtrip`、`decode_assistant_embedded_function_call`。
   - ✅ curl 实测：纯 MCP 循环（thinking 模型）成功、内嵌格式 + reasoning 回传成功、日志 200。
 
-- [ ] 6. `mcp_pool` 集成测试负载敏感 + **失败级联**（会污染 `scripts/regression.sh` 门禁）
+- [x] 6. `mcp_pool` 集成测试负载敏感 + **失败级联**（会污染 `scripts/regression.sh` 门禁）
   - 现象：`cargo test --workspace` 偶发 3 个用例 FAILED，报 `MCP initialize 超时`；**每轮失败的用例集合都不同**
     （实测两次分别为 {timeout_discards_connection, rebuilds_after_crash, env_participates_in_pool_key}
     与 {timeout_discards_connection, rebuilds_when_process_dies_after_response, idle_reclaim_reaps_process}）。
@@ -103,13 +103,45 @@
     （`tests/mcp_pool.rs` 早有此先例与注释）；修复后同负载 15 轮 0 失败。
     **生产不受影响**：Tauri 命令与网关都跑在 `tauri::async_runtime` 同一个 runtime 上。
 
-- [ ] 7. Responses **出站**丢弃消息级图片（`Block::Image` 在 user 消息里）
+  - **已解决（2026-09-17）**：按上述建议修法 ①② 根治，不再依赖「重跑 + 复现签名」发版。
+    1. **初始化握手独立预算**（`mcp.rs`）：新增 `DEFAULT_INIT_TIMEOUT` + `JAI_MCP_POOL_INIT_TIMEOUT_MS`，
+       `spawn_ready` 里的 `initialize` 超时由 `pool_call_timeout()` 改为 `pool_init_timeout()`。
+       默认值与调用超时一致（120s），故**生产行为不变**——只是不再被调用侧的短预算误伤。
+    2. **环境变量清理改 RAII**（`tests/mcp_pool.rs`）：新增 `EnvGuard`（`Drop` 时还原原值/删除），
+       取代原先「断言之后 `remove_var`」的写法，panic 与提前 return 两条路径都能收回，
+       失败级联的传播链被切断。
+    3. 新增回归用例 `init_handshake_uses_separate_budget`：把调用超时压到 **1ms**（握手必然超不过它），
+       断言报错不含 `initialize` → 旧实现下必红。
+  - 验证（2026-09-17）：
+    ① 临时把 `initialize` 回退为复用 `pool_call_timeout()` → 新用例必红，且报错与生产签名逐字一致
+      （`MCP initialize 超时`）；
+    ② 原复现命令 `JAI_MCP_POOL_CALL_TIMEOUT_MS=30 cargo test -p gateway-core --test mcp_pool`
+      → **8/8 通过**，日志中 `MCP initialize 超时` 出现 **0 次**（旧实现在此命令下 5/7 报该签名）；
+    ③ 6 路 CPU 负载下连跑 15 轮 → **0 轮失败**；④ `cargo test --workspace` 全绿（EXIT=0）。
+
+- [x] 7. Responses **出站**丢弃消息级图片（`Block::Image` 在 user 消息里）
   - 位置：`crates/gateway-core/src/codec/responses.rs` 的 `encode_request`，注释写「Responses 上游 v1 不支持
     图片内联转换，Lenient 丢弃」——**该注释与官方 schema 存疑**：Responses 的 message content 支持
     `input_image`（依据见 `docs/design/tool-result-image-protocol-factcheck.md`）。
   - 与「工具结果内嵌图片」（本次已修）属同一类静默丢失，但**本次未动**：改动会让原本「静默丢图但请求成功」
     的请求变成「带图请求」，若某些中转上游不接受可能由 200 变 4xx，需单独评估。
   - 建议：先确认目标上游对 `input_image` 的接受度，再按与本次相同的「原生承载 / 显式降级 + CapabilityWarn」口径处理。
+  - **已解决（2026-09-17）**：改为**原生承载**，与「工具结果内嵌图片」同一口径。
+    1. `responses.rs::encode_request` 的 `Role::User` 分支不再丢弃 `Block::Image`：content 数组按
+       **块序**混排 `input_text` / `input_image`，复用已有的 `render_input_image()`（url 优先，
+       否则把 base64 包回带真实 media_type 的 data URL）。
+    2. 顺带修掉一个更隐蔽的后果：**只有图片没有文本**的用户消息此前连 `message` 都不产出
+       （`text_parts` 为空即跳过），整轮图静默消失；现在有内容项就产出消息。
+    3. 纯文本消息的产出形状与旧实现**逐字节一致**（仍是一段文本一个 `input_text` 项），
+       不改动绝大多数请求的请求体口径。
+  - **接受度评估**（回应原「需单独评估」的顾虑）：同一请求体里 `input_image` 已在
+    `function_call_output.output`（工具结果内嵌图片）上生产使用，并通过 v0.1.9 起的跨族实测；
+    message content 的 `input_image` 是**同一个 schema 类型、同一族协议**，故不新增风险面。
+    能力声明侧本就把「user 消息带图」视为各族原生支持（`capability.rs` 注释），
+    本次是让 encoder 与已声明能力面对齐，而非新增能力。
+  - 验证（2026-09-17）：`tests/multimodal_image.rs` 新增 3 例（含图 user 消息保块序 / 仅图片消息不被丢 /
+    纯文本形状不变）；临时恢复「丢弃」逻辑时前两例**必红**且症状与 bug 描述逐字一致
+    （`text + image` 只产出 1 个内容项、仅图片时「应产出 message」panic）；18/18 全绿。
 
 - [x] 8. dsh-tui 上下文占比统计不出来（走 JAI 网关时 `ctx 0/128k 0.0%`）
   - 现象：dsh-tui 状态栏 `ctx 0/128k 0.0%`（本机 dsh-tui + JAI，模型 `超算/Qwen3.8-Flash-Event`）；

@@ -145,6 +145,13 @@ fn parse_tools_list(v: &Value) -> Result<Vec<McpTool>, String> {
 /// stdio 连接池默认参数（测试可用环境变量覆写为短值）。
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// 初始化握手（spawn 子进程 + `initialize` 往返）的独立预算。
+///
+/// **不复用调用超时**：调用超时会被压到 100ms 量级（测试或短预算场景），而
+/// 「进程冷启动 + 握手」在负载机器上本就可能超过该值 → 误报
+/// `MCP initialize 超时`（bug 6 的根因之一：阈值与用途错配）。
+/// 默认值与调用超时一致，故生产行为不变。
+const DEFAULT_INIT_TIMEOUT: Duration = DEFAULT_CALL_TIMEOUT;
 
 /// 读 `JAI_*_MS` 环境变量（毫秒）；缺失/非法则用 `default`。
 /// `pub(crate)`：registry 的代理转发预算也走同一套读取口径。
@@ -162,6 +169,12 @@ fn pool_idle_timeout() -> Duration {
 
 fn pool_call_timeout() -> Duration {
     env_duration_ms("JAI_MCP_POOL_CALL_TIMEOUT_MS", DEFAULT_CALL_TIMEOUT)
+}
+
+/// 初始化握手预算（见 [`DEFAULT_INIT_TIMEOUT`] 的说明）。
+/// 单列环境变量，便于测试只压调用超时而不误伤冷启动。
+fn pool_init_timeout() -> Duration {
+    env_duration_ms("JAI_MCP_POOL_INIT_TIMEOUT_MS", DEFAULT_INIT_TIMEOUT)
 }
 
 struct StdioPool {
@@ -348,7 +361,8 @@ async fn spawn_ready(
             "clientInfo":{"name":"jai-gateway","version":env!("CARGO_PKG_VERSION")}
         }
     });
-    let init = tokio::time::timeout(pool_call_timeout(), async {
+    // 握手走独立预算：这里含子进程冷启动时间，不能与「已建连接的调用超时」同口径。
+    let init = tokio::time::timeout(pool_init_timeout(), async {
         ready
             .stdin
             .write_all(format!("{initialize}\n").as_bytes())
