@@ -293,6 +293,53 @@
     快照/导出/备份三件套最容易踩。对策是把"导出物必须自引用安全"写成**断言**（连续 N 轮体积恒定），
     而不是靠 review 记住；同族风险点复核：`export_config_json` 命令（复用同一 `build_export_json`，
     随本次修复一并干净）、远端时间戳备份（内容同样来自导出物，随之变干净）。
+  - 【2026-09-17 追加】永久解法已并入 v0.2.3：启动时按需回收磁盘
+    （`store::retention::reclaim_if_bloated`，空闲页占比 ≥ 60% 且库 ≥ 32 MB 才触发；
+    `JAI_VACUUM_ON_START=0` 可关、`JAI_VACUUM_FREELIST_RATIO` / `JAI_VACUUM_MIN_MB` 可调）。
+    起因：删除大行后 SQLite 文件不会自动缩小，本机实测「895 MB 库里 894 MB 全是空洞」，
+    只能靠人工 VACUUM 收尾；现在由启动路径兜底（实测回收 894.6 MB → 0.7 MB）。
+    注意接线位置：必须早于日志连接建立（VACUUM 需独占），见 `main.rs` 启动段注释。
+
+
+- [x] 15. **技能名未校验 → 工具名违反 MCP 规范**（严格客户端可能拒绝整份 tools/list）
+  - 现象（2026-09-17 手工验证时发现，并经临时回退复现）：`skill_create` 只校验名称非空
+    （前端同样只查 `!name.trim()`），插入名为 `代码 评审/甲` 的技能后，`tools/list`
+    真的广告出工具名 `skill__代码 评审/甲` —— 违反 MCP 名契约 `[A-Za-z0-9_-]{1,64}`。
+  - 影响面：dsh 客户端会自行 sanitize（`replace(INVALID_NAME_CHARS,'_')` + 12 位摘要）再映射回原名，
+    所以**对 dsh 不致命**；但严格校验的客户端可能拒绝**整份** tools/list —— 连累全部代理工具
+    （本机实测 67 个），属"一个怪名技能打翻整个 MCP 面"的高爆炸半径场景。
+  - 修复（v0.2.3）：工具名走确定性编码映射 `skill_tool_names()`：
+    ① 原名本身合法且未占用 → 保持 `skill__<原名>`（**向后兼容**，历史会话见过的
+    `skill__code-review` 仍有效）；② 否则 → `skill__<sanitized>_<hash6>`（非法字符替换为 `_` +
+    6 位名字摘要，合法且唯一）；③ 真实技能名始终出现在工具 description 里，模型仍看到可读名；
+    ④ `dispatch_tool` 反解时先查映射表，再回退「原样名字」形式（兼容手工调用与旧会话）。
+  - 回归（含守门人实证）：新增 `tests/skill_lifecycle.rs::advertised_tool_names_are_spec_legal`
+    —— 断言**所有**广告出的工具名满足契约；临时回退为修复前逻辑时该测试必红，报错为
+    `工具名违反 MCP 契约: "skill__代码 评审/甲"`（与生产症状逐字一致），修复后 6/6 通过。
+  - 教训：**凡是「用户自由输入的名字会被拼进协议标识符」的地方，都要做编码或白名单**；
+    命名自由与协议约束的冲突应该由**编码**吸收（保住可读名），而不是靠"客户端大概会自愈"。
+
+- [x] 16. **`get_skill_detail` 可绕过 `enabled` 闸门**（台账与投递语义不一致）
+  - 现象：`skill__<name>` 投递对 `enabled=0` 明确拒绝（「未启用，暂不投递」），但
+    `get_skill_detail` 无论启用与否都返回**全文** → 「只投递给已启用技能」这道闸门可被旁路。
+  - 影响：语义自相矛盾，用户以为"关掉=不投递给 Agent"，实际 Agent 换个工具就能拿到全文。
+  - 修复（v0.2.3）：`tool_skill_detail` 与投递口径统一——未启用即拒绝，错误信息指引到
+    「技能」页启用；`list_skills` 仍照常返回 `enabled` 标记供 Agent 判断。
+  - 回归：`skill_lifecycle.rs::skill_detail_follows_enabled_gate`（未启用 → `isError=true`
+    且错误文本里不得出现技能内容）。
+
+- [x] 17. **台账类工具把失败拉平成成功**（`isError=false` + 错误埋在文本里）
+  - 现象：`skill__不存在` 返回 `isError=true`，而 `get_skill_detail(不存在)` 返回
+    `isError=false` 且错误藏在内容 JSON 的 `error` 字段里；`get_mcp_server_detail` /
+    `get_tool_schemas` 同样（未找到/未启用/上游 tools/list 超时都被拉平）。
+  - 影响：只看 `isError` 的客户端会把「未找到」当成功，进而可能拿空载荷继续推理
+    （幻觉来源）；这正是 v0.2.0 bug 10「工具级失败被拉平成成功」的同族问题，只是残留在静态台账路径。
+  - 修复（v0.2.3）：台账类工具失败一律走 `ToolOutcome::Err`（→ `isError=true`），
+    成功路径仍 `isError=false`。
+  - 回归：`skill_lifecycle.rs::ledger_tools_fail_loudly`（三类失败 + 缺参数都必须冒泡）、
+    `skill_detail_follows_enabled_gate`。
+  - 教训：**错误语义要按"调用方怎么判断成败"设计**——只要客户端习惯看 `isError`，
+    把错误塞进成功载荷就是隐性谎言。
 
 
 ## 2. 优化清单

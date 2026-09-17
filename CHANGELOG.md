@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-17
+
+### Fixed
+- **技能工具名可能违反 MCP 规范**（严格客户端会拒绝整份 `tools/list`，连累全部代理工具）：
+  - 现象：技能名只校验非空，`代码 评审/甲` 这类名字会被原样拼成工具名 `skill__代码 评审/甲`，
+    违反 MCP 名契约 `[A-Za-z0-9_-]{1,64}`。dsh 会自行 sanitize 后映射回原名（不致命），
+    但严格校验的客户端可能整份拒绝 —— 本机实测一次广告 72 个工具，其中 67 个是代理工具。
+  - 修复：工具名走**确定性编码映射**——原名合法且不占用时保持 `skill__<原名>`（向后兼容），
+    否则编码为 `skill__<sanitized>_<hash6>`；真实技能名仍在工具 description 里；
+    反解时先查映射表、再回退原样名字（兼容历史会话与手工调用）。
+  - 回归：`tests/skill_lifecycle.rs::advertised_tool_names_are_spec_legal` 断言所有工具名合法；
+    **临时回退修复前逻辑时该测试必红**（报错与生产症状逐字一致：
+    `工具名违反 MCP 契约: "skill__代码 评审/甲"`）。
+- **`get_skill_detail` 可绕过 `enabled` 闸门**：投递（`skill__*`）拒绝未启用技能，台账却照返全文，
+  语义自相矛盾。现在两者口径一致：未启用即拒绝，并指引到「技能」页启用。
+- **台账类工具把失败拉平成成功**（`isError=false` + 错误埋在内层 JSON）：`get_skill_detail` 未找到、
+  `get_mcp_server_detail` / `get_tool_schemas` 的未找到/未启用/上游超时，现在一律 `isError=true`，
+  与 v0.2.0「失败不得被拉平成成功」的修复哲学统一（只看 `isError` 的客户端不再把失败当成功）。
+
+### Added
+- **启动时按需回收磁盘**（bug 清单 14 的永久解法）：删除大行后 SQLite 文件不会自动缩小，
+  本机实测出现过「895 MB 库里 894 MB 全是空洞」，只能人工 `VACUUM` 收尾。现在启动时按
+  空闲页占比判定并自动回收：默认占比 ≥ 60% 且库 ≥ 32 MB 才触发，仅告警不阻塞启动；
+  `JAI_VACUUM_ON_START=0` 可关，`JAI_VACUUM_FREELIST_RATIO` / `JAI_VACUUM_MIN_MB` 可调。
+  实测效果：894.6 MB → 0.7 MB。
+- `tests/skill_lifecycle.rs`：技能全生命周期端到端回归（6 条，真实 HTTP + 断言 `isError` 真值），
+  覆盖工具名合法性、向后兼容、逐字节无损投递、未启用拒绝、32KB UTF-8 边界截断、台账错误语义。
+
 ## [0.2.2] - 2026-09-16
 
 ### Fixed
