@@ -503,7 +503,11 @@ fn responses_outbound_user_message_keeps_image_in_block_order() {
     let v = responses_codec::encode_request(&req).unwrap();
     let content = responses_first_message_content(&v);
 
-    assert_eq!(content.len(), 2, "text + image 应各占一个内容项: {content:?}");
+    assert_eq!(
+        content.len(),
+        2,
+        "text + image 应各占一个内容项: {content:?}"
+    );
     assert_eq!(content[0]["type"], "input_text");
     assert_eq!(content[0]["text"], "这张图里有什么？");
     assert_eq!(
@@ -538,7 +542,11 @@ fn responses_outbound_image_only_user_message_is_not_dropped() {
     let v = responses_codec::encode_request(&req).unwrap();
     let content = responses_first_message_content(&v);
 
-    assert_eq!(content.len(), 2, "两张图应产出两个 input_image: {content:?}");
+    assert_eq!(
+        content.len(),
+        2,
+        "两张图应产出两个 input_image: {content:?}"
+    );
     assert_eq!(content[0]["type"], "input_image");
     assert_eq!(
         content[0]["image_url"],
