@@ -272,7 +272,7 @@ export function LogsPage() {
                   {r.usageOutput ?? "·"}
                 </TableCell>
                 <TableCell
-                  className="max-w-64 truncate text-red-600 dark:text-red-400"
+                  className="max-w-64 truncate text-red-700 dark:text-red-400"
                   title={r.errorSummary ?? ""}
                 >
                   {r.errorKind ?? ""}
@@ -338,7 +338,7 @@ export function LogsPage() {
               </div>
               {(sel.errorKind || sel.errorSummary) && (
                 <div className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs">
-                  <div className="font-semibold text-red-600 dark:text-red-400">
+                  <div className="font-semibold text-red-700 dark:text-red-400">
                     {sel.errorKind ?? "错误"}
                   </div>
                   {sel.errorSummary && (

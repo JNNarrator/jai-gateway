@@ -251,13 +251,18 @@ export function SkillsPage() {
             className="rounded-lg border bg-card p-4 text-card-foreground shadow-sm"
           >
             <div className="flex items-center gap-3">
-              <input
-                type="checkbox"
-                checked={selected.has(s.id)}
-                onChange={() => toggleSelect(s.id)}
-                className="size-4 accent-primary"
-                aria-label={`选择 ${s.name} 用于批量操作`}
-              />
+              {/* 视觉 16×16，命中区靠 label 内边距扩到 28×28（`-m-1.5` 抵消，
+                  故不影响行内布局与间距）。`<input>` 是替换元素，::after 不生效，
+                  所以这里用 label 而非伪元素。 */}
+              <label className="-m-1.5 inline-flex cursor-pointer items-center justify-center p-1.5">
+                <input
+                  type="checkbox"
+                  checked={selected.has(s.id)}
+                  onChange={() => toggleSelect(s.id)}
+                  className="size-4 accent-primary"
+                  aria-label={`选择 ${s.name} 用于批量操作`}
+                />
+              </label>
               <Switch
                 checked={s.enabled}
                 onCheckedChange={(v) => act(() => api.skillSetEnabled(s.id, v))}

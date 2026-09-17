@@ -27,6 +27,29 @@ All notable changes to this project will be documented in this file.
   - 回归：新增 `init_handshake_uses_separate_budget`（调用超时压到 1ms，断言报错不含
     `initialize`），旧实现下必红；原复现命令 `JAI_MCP_POOL_CALL_TIMEOUT_MS=30` 下
     `MCP initialize 超时` 出现次数由 5/7 → **0**；6 路 CPU 负载连跑 15 轮 **0 失败**。
+- **暗色主题下 toast 不可读**（近白字 + 浅绿底，对比度 1.01）:
+  - 根因：`main.tsx` 把 `<Toaster>` 挂在 `<ThemeProvider>` **外面**，sonner 里的 `useTheme()`
+    取不到主题、永远退回 `system`，`richColors` 于是给浅色调色板（成功底色浅绿）；
+    而 `toastOptions.style` 又把文字色写死为 `var(--foreground)`（暗色下近白）→ 两者叠加不可读。
+  - 修复：`<Toaster>` 移入 `<ThemeProvider>` 内部；暗色下实测对比度 1.01 → **16.73**。
+
+### Changed
+- **UI 可读性与可达性整改**（视觉回归审计复核，`docs/bug和优化清单.md` §3 第 4/8/9/10 条）：
+  - 对比度：浅色主题 4 个根因逐条修掉（日志表 muted 小字 `--muted-foreground` 0.552 → 0.52、
+    日志 `errorKind` 列 `text-red-600` → `text-red-700`、主按钮 hover 由「冲淡」改「加深」：
+    新增 `--primary-hover` token 取代 shadcn 默认的 `hover:bg-primary/90`，把原 4.27 提到 6.16）。
+    **双主题不达标项均清零**（审计分组 浅色 0 组 / 暗色 0 组）。
+  - 命中区：模型页「复制模型名」16→**30×30**、技能页批量勾选框 16→**26×26**、
+    供应商页「官网」链接 40×16→**54×26**（视觉尺寸不变，靠 `::after` / `<label>` 外扩，均达 WCAG 2.2 AA）。
+  - 截断：MCP 注册路径/URL 与供应商 base URL 补 `title`（hover 可读全量），审计截断项 3 → 0。
+  - 主操作可达：网关页新增吸顶操作条（`启动/停止` + `复制 MCP 配置`），移除会被折叠线切掉
+    的浮动按钮；网关页折叠线下控件 1 → **0**。
+- 视觉回归探针加固（`tools/visual-regression/`）：
+  - `audit.mjs` 主题改为**页面加载前**写入 `localStorage.theme`（原先加载后才加 `.dark` 类，
+    next-themes 已初始化完毕，造成「应用暗色 + 组件库浅色」错配，使 toast 报出假结论）；
+  - `audit.mjs` 的 `truncated` 检测**原为死代码**（只初始化、从不 push，字段恒空）→ 补上实现；
+  - 新增 `probe-hits.mjs`（有效命中区）、`probe-toast2.mjs`（toast 主题与对比度）、
+    `probe-sticky.mjs`（吸顶条是否真的常驻）。
 
 ## [0.2.3] - 2026-09-17
 

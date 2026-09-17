@@ -243,7 +243,15 @@ export function McpPage() {
                     </span>
                   )}
                 </div>
-                <div className="truncate font-mono text-xs text-muted-foreground">
+                {/* 路径/URL 会被截断（310px 容器放不下），补 title 让 hover 可读全量 */}
+                <div
+                  className="truncate font-mono text-xs text-muted-foreground"
+                  title={
+                    m.kind === "stdio"
+                      ? `${m.command ?? ""} ${m.args ?? ""}`
+                      : m.url ?? ""
+                  }
+                >
                   {m.kind === "stdio"
                     ? `${m.command ?? ""} ${m.args ?? ""}`
                     : m.url ?? ""}

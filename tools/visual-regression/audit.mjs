@@ -170,6 +170,26 @@ const EXT_PROBE = function () {
     }
   }
 
+  // 3b) 文本截断：视觉被 ellipsis 截掉、且没有 title 可读全量。
+  //     （原实现只初始化了 `res.truncated` 却从不 push，字段恒为空——
+  //      「MCP 注册 URL 截 22px、供应商 base URL 截 21px」这类问题因此无法被追踪。）
+  for (const el of document.querySelectorAll("body *")) {
+    if (!vis(el)) continue;
+    const cs = getComputedStyle(el);
+    const ellipsis = cs.textOverflow === "ellipsis" || /\btruncate\b/.test(String(el.className || ""));
+    if (!ellipsis || el.scrollWidth <= el.clientWidth + 1) continue;
+    if (!(el.textContent || "").trim()) continue;
+    if (el.getAttribute("title")) continue; // 有 title：hover 可读全量，不算问题
+    res.truncated.push({
+      text: (el.textContent || "").trim().slice(0, 40),
+      w: Math.round(el.clientWidth),
+      need: Math.round(el.scrollWidth),
+      cut: Math.round(el.scrollWidth - el.clientWidth),
+      path: pathOf(el),
+      inDlg: !!el.closest('[role="dialog"]'),
+    });
+  }
+
   // 4) 横向溢出（页面级 & 容器级不可滚动）
   for (const el of document.querySelectorAll("body *")) {
     if (!vis(el)) continue;
@@ -228,6 +248,11 @@ const ctx = await browser.newContext({ viewport: { width: VW, height: VH }, devi
 await ctx.addInitScript({ content: `window.__JAI_FIX__ = ${JSON.stringify(fixtures)}; window.__VR_VW__=${VW}; window.__VR_VH__=${VH};` });
 await ctx.addInitScript({ content: `(${mockSrc})();` });
 await ctx.addInitScript({ content: `try{localStorage.setItem('jai-sidebar-collapsed','0');}catch(e){}` });
+// 主题必须在**页面加载前**写进 localStorage：next-themes 只在初始化时读一次，
+// 之前只在 goto 之后 add/remove `.dark` 类，导致「应用是暗色、组件库仍是浅色」的错配——
+// toast 走 sonner 自带调色板（受 next-themes 驱动），于是测出「浅绿底 + 近白字」的
+// 假失败（比值 1.01）。预置 localStorage 后两者同源，暗色审计才可信。
+await ctx.addInitScript({ content: `try{localStorage.setItem('theme','${THEME}');}catch(e){}` });
 const page = await ctx.newPage();
 const errors = [];
 page.on("pageerror", (e) => errors.push(String(e.message).slice(0, 160)));

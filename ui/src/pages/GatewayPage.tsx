@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, HeartPulse, Play, Square } from "lucide-react";
+import { AlertTriangle, Copy, HeartPulse, Play, Square } from "lucide-react";
 import { api } from "../api";
 import type { GatewayKeyInfo, GwStatus, HealthSummary } from "../types";
 import { toast } from "../lib/toast";
@@ -115,6 +115,30 @@ export function GatewayPage() {
         description="本机回环地址上的 OpenAI 兼容入口，启动后即可接入各类 Agent 客户端。"
       />
 
+      {/* 主操作条：吸顶常驻。此页内容高 ~1093px（默认窗口 764 可视），
+          「复制配置」原在 MCP 卡片里，滚动时会被折叠线切掉一截；
+          启停与复制是本页高频操作，因此上移到常驻条（状态卡内不再重复放一份）。 */}
+      <div className="sticky top-0 z-10 -mx-2 flex flex-wrap items-center gap-2 border-b border-border/60 bg-card px-2 py-3">
+        {status?.running ? (
+          <Button variant="destructive" disabled={busy} onClick={() => toggle(false)}>
+            <Square aria-hidden />
+            停止
+          </Button>
+        ) : (
+          <Button disabled={busy} onClick={() => toggle(true)}>
+            <Play aria-hidden />
+            启动
+          </Button>
+        )}
+        <Button variant="outline" disabled={busy} onClick={() => void doCopyMcpConfig()}>
+          <Copy aria-hidden />
+          复制 MCP 配置
+        </Button>
+        <span className="ml-auto font-mono text-xs text-muted-foreground">
+          127.0.0.1:{port}
+        </span>
+      </div>
+
       {err && (
         <div
           role="alert"
@@ -172,19 +196,9 @@ export function GatewayPage() {
             <span className="font-mono text-lg font-bold text-foreground">
               127.0.0.1:{port}
             </span>
-            <div className="ml-auto">
-              {status?.running ? (
-                <Button variant="destructive" disabled={busy} onClick={() => toggle(false)}>
-                  <Square aria-hidden />
-                  停止
-                </Button>
-              ) : (
-                <Button disabled={busy} onClick={() => toggle(true)}>
-                  <Play aria-hidden />
-                  启动
-                </Button>
-              )}
-            </div>
+            <span className="ml-auto text-xs text-muted-foreground">
+              启停与复制配置在顶部常驻操作条
+            </span>
           </div>
           <p className="text-xs leading-relaxed text-muted-foreground">
             所有业务端点强制鉴权：Host 仅接受本机回环地址，浏览器跨域需在「设置」中添加白名单。
@@ -260,17 +274,10 @@ export function GatewayPage() {
   }
 }`}
             </pre>
-            <Button
-              variant="outline"
-              size="sm"
-              className="absolute right-2 top-2 h-7"
-              onClick={doCopyMcpConfig}
-            >
-              复制配置
-            </Button>
           </div>
           <p className="text-xs leading-relaxed text-muted-foreground">
-            复制时自动填入真实密钥，粘贴即用；接入后 Agent 可用 list_mcp_servers /
+            用顶部常驻操作条的「复制 MCP 配置」复制：自动填入真实密钥，粘贴即用；
+            接入后 Agent 可用 list_mcp_servers /
             get_mcp_server_detail / get_tool_schemas / list_skills / get_skill_detail 查询台账。
           </p>
         </CardContent>

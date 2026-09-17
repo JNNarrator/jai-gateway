@@ -239,8 +239,10 @@ function ModelRowEditor({
       <TableCell className="font-mono text-xs">
         <span className="inline-flex items-center gap-1">
           {m.modelName}
+          {/* 视觉 16×16，命中区靠伪元素扩到 32×32（与 Switch 同一手法：
+              图标按钮不做视觉放大，避免撑开表格行高） */}
           <button
-            className="rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground"
+            className="relative rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground after:absolute after:-inset-2 after:content-['']"
             title="复制模型名"
             aria-label={`复制模型名 ${m.modelName}`}
             onClick={() => copyText(m.modelName)}

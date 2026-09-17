@@ -296,18 +296,18 @@ function ProviderCard(props: {
                 </Badge>
               )}
               {lastFailed && (
-                <Badge variant="outline" className="border-red-500/30 text-red-600 dark:text-red-400">
+                <Badge variant="outline" className="border-red-500/30 text-red-700 dark:text-red-400">
                   最近失败
                 </Badge>
               )}
             </div>
-            <div className="truncate font-mono text-xs text-muted-foreground">
+            <div className="truncate font-mono text-xs text-muted-foreground" title={p.baseUrl}>
               {p.baseUrl}
             </div>
             {p.website && (
               <button
                 type="button"
-                className="inline-flex items-center gap-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                className="relative inline-flex items-center gap-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline after:absolute after:-inset-x-2 after:-inset-y-1.5 after:content-['']"
                 onClick={() => {
                   api.openWebsite(p.website!).catch((e) =>
                     toast(`打开官网失败: ${e}`)

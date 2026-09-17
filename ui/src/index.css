@@ -13,10 +13,16 @@
   --popover-foreground: oklch(0.141 0.005 285.823);
   --primary: oklch(0.546 0.245 262.881);        /* 蓝紫：indigo-600 风格 */
   --primary-foreground: oklch(0.985 0 0);
+  /* hover 专用底色：shadcn 默认的 `hover:bg-primary/90` 是**冲淡**主色，
+     实测对比度 5.03 → 4.27 掉到 AA 以下（审计在 hover 态测到 4.27）。
+     改为「加深」，既保住 hover 反馈又留足余量（6.16）。 */
+  --primary-hover: oklch(0.5 0.245 262.881);
   --secondary: oklch(0.967 0.001 286.375);
   --secondary-foreground: oklch(0.21 0.006 285.885);
   --muted: oklch(0.967 0.001 286.375);
-  --muted-foreground: oklch(0.552 0.016 285.938);
+  /* 0.552 → 0.52：日志表等 12px muted 小字在「窗口毛玻璃透出深色桌面」时
+     实测只有 4.24（AA 需 4.5）。加深一档后最差 4.82，白底仍有 5.51。 */
+  --muted-foreground: oklch(0.52 0.016 285.938);
   --accent: oklch(0.967 0.001 286.375);
   --accent-foreground: oklch(0.21 0.006 285.885);
   --destructive: oklch(0.577 0.245 27.325);
@@ -36,6 +42,8 @@
   /* 亮蓝 (#00A6F4) 配白字只有 2.59:1，不到 AA 4.5；改深色前景后约 7.3:1，
      且不影响 text-primary 链接/焦点环在暗背景上的可读性。 */
   --primary-foreground: oklch(0.145 0 0);
+  /* 暗色下 hover 反向：**提亮**（7.32 → 8.23），与浅色主题的加深语义对称 */
+  --primary-hover: oklch(0.72 0.169 237.323);
   --secondary: oklch(0.274 0.006 286.033);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.274 0.006 286.033);
@@ -57,6 +65,7 @@
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-primary-hover: var(--primary-hover);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
