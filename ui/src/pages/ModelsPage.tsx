@@ -161,7 +161,9 @@ export function ModelsPage() {
                 <TableHead className="w-1/5">上游模型 ID</TableHead>
                 <TableHead className="w-1/6">上下文</TableHead>
                 <TableHead className="w-1/6">最大输出</TableHead>
-                <TableHead className="w-28 text-center">模态（入/出）</TableHead>
+                <TableHead className="hidden w-28 text-center lg:table-cell">
+                  模态（入/出）
+                </TableHead>
                 <TableHead className="w-1/12 text-center">启用</TableHead>
                 <TableHead className="w-20 text-right">操作</TableHead>
               </TableRow>
@@ -198,9 +200,10 @@ export function ModelsPage() {
             </div>
           )}
         </div>
-        {/* 7 列在最小窗口（760px）下约溢出 217px：表格可横向滚动，这里给出可见提示 */}
+        {/* 窄窗（<1024px）下「模态（入/出）」列隐藏、该信息并回「模型名」列的 badge，
+            以收回 112px 宽度（最小 900 窗口实测原溢出 77px）；其余列仍可横向滚动 */}
         <p className="hidden text-[11px] text-muted-foreground max-lg:block">
-          窗口较窄：表格可左右滑动，查看「上下文 / 最大输出 / 模态 / 启用 / 操作」等列。
+          窗口较窄：模态标注已并入「模型名」列（悬停可见完整集合），其余列可左右滑动。
         </p>
         </>
       )}
@@ -249,11 +252,14 @@ function ModelRowEditor({
           >
             <Copy className="size-3" aria-hidden />
           </button>
+          {/* <lg 时「模态（入/出）」列被隐藏（列降级，见 §3 第 5 条），
+              模态信息降级为一行紧凑 badge，避免信息凭空消失。 */}
+          <ModalityCompact m={m} />
         </span>
       </TableCell>
       <TableCell>
         <Input
-          className="h-8 w-32 text-xs"
+          className="h-8 w-32 max-lg:w-24 text-xs"
           value={alias}
           placeholder="同模型名"
           title="发给上游时使用的真实模型 ID；留空表示同名"
@@ -265,7 +271,7 @@ function ModelRowEditor({
       </TableCell>
       <TableCell>
         <Input
-          className="h-8 w-28 text-xs"
+          className="h-8 w-28 max-lg:w-20 text-xs"
           type="number"
           step={1024}
           value={ctx}
@@ -277,7 +283,7 @@ function ModelRowEditor({
       </TableCell>
       <TableCell>
         <Input
-          className="h-8 w-24 text-xs"
+          className="h-8 w-24 max-lg:w-20 text-xs"
           type="number"
           step={1024}
           value={out}
@@ -287,7 +293,7 @@ function ModelRowEditor({
           }}
         />
       </TableCell>
-      <TableCell className="text-center">
+      <TableCell className="hidden text-center lg:table-cell">
         <ModalityEditor m={m} onChange={onSetModalities} />
       </TableCell>
       <TableCell className="text-center">
@@ -317,6 +323,45 @@ const MODALITY_LABEL: Record<Modality, string> = {
   audio: "音频",
   video: "视频",
 };
+/** 窄窗口降级 badge 用的单字缩写（见 `ModalityCompact`）。 */
+const MODALITY_SHORT: Record<Modality, string> = {
+  text: "文",
+  image: "图",
+  audio: "音",
+  video: "视",
+};
+
+/**
+ * 窄窗口下的模态降级展示（`lg` 以下替代整列）。
+ *
+ * 必须**极紧凑**：badge 挂在「模型名」单元内，文案一长就把该列撑宽、
+ * 把隐藏整列省下的宽度又吃回去（实测「模态 文本/图像→文本」这种完整句式
+ * 反而让表宽从 801 涨到 804）。故只显示非文本模态的单字缩写
+ * （图/音/视），完整集合放 `title`；入/出都只有文本时不显示（默认情形，显示等于噪音）。
+ */
+function ModalityCompact({ m }: { m: ModelRow }) {
+  const inList = m.inputModalities;
+  const outList = m.outputModalities;
+  const label = (l: Modality[] | null) =>
+    !l || l.length === 0 ? "未知" : l.map((x) => MODALITY_LABEL[x]).join("/");
+  const plainTextOnly =
+    !!inList?.length &&
+    !!outList?.length &&
+    inList.every((x) => x === "text") &&
+    outList.every((x) => x === "text");
+  if (plainTextOnly) return null;
+  const unknown = !inList?.length && !outList?.length;
+  const short = (inList ?? []).filter((x) => x !== "text").map((x) => MODALITY_SHORT[x]).join("");
+  return (
+    <Badge
+      variant={unknown ? "outline" : "secondary"}
+      className="px-1 py-0 text-[11px] font-normal lg:hidden"
+      title={`模态标注 — 输入：${label(inList)}；输出：${label(outList)}（宽窗口下可直接编辑）`}
+    >
+      {unknown ? "模态?" : short || "非文本"}
+    </Badge>
+  );
+}
 
 /** 只读徽标：一维模态集合（null/空 = 未知，不臆断）。 */
 function ModalityBadges({ list }: { list: Modality[] | null }) {
