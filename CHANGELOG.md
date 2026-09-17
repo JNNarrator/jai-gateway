@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-09-17
+
 ### Fixed
 - **换台电脑后同步「从来没成功过」**（bug 19）：新机器第一次拉取会把自己刚打开的
   「自动拉取」关掉，此后再也收不到对方机器的更新。
