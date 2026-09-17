@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-09-17
+
 ### Fixed
 - **Responses 出站丢弃「消息级」图片**（bug 7，多模态链路最后一块静默丢失）：
   - 现象：`codec/responses.rs::encode_request` 的 user 消息分支对 `Block::Image` 直接跳过
