@@ -22,7 +22,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use super::proxy::GatewayCtx;
-use crate::store::McpServerRow;
+use crate::store::{McpServerRow, SkillRow};
 
 /// MCP 实现版本与协议版本（客户端据此协商）。
 const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -31,6 +31,98 @@ const SERVER_VERSION: &str = "0.1.0";
 
 /// 动态工具列表 TTL：避免每次 tools/list 都去 spawn MCP 子进程拉工具。
 const PROXY_TOOLS_TTL: Duration = Duration::from_secs(30);
+
+/// 技能工具名前缀。
+const SKILL_TOOL_PREFIX: &str = "skill__";
+/// MCP 规范的工具名契约：`[A-Za-z0-9_-]{1,64}`（客户端可能整份 tools/list 校验）。
+const TOOL_NAME_MAX: usize = 64;
+const TOOL_NAME_HASH_LEN: usize = 6;
+
+fn is_tool_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// 把任意字符串压成合法工具名片段（非法字符 → `_`，并按需截断）。
+fn sanitize_tool_segment(s: &str, max: usize) -> String {
+    s.chars()
+        .map(|c| if is_tool_name_char(c) { c } else { '_' })
+        .take(max)
+        .collect()
+}
+
+/// 取名字摘要前 `n` 位十六进制（n 为偶数）。
+fn name_hash(name: &str, n: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(name.as_bytes());
+    let mut out = String::with_capacity(n);
+    for b in d.iter() {
+        if out.len() >= n {
+            break;
+        }
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// 技能 → 工具名映射（确定性、可逆；与输入顺序无关，按技能名排序分配）。
+///
+/// 规则：
+/// - 技能名**本身**已是合法工具名片段且未被占用 → `skill__<原名>`（向后兼容，历史会话里
+///   模型见过的 `skill__code-review` 仍然有效）；
+/// - 否则（含中文/空格/斜杠/超长/重名）→ `skill__<sanitized>_<hash6>`：
+///   非法字符替换为 `_` 并附 6 位名字摘要，保证**合法且唯一**；真实名字始终出现在
+///   工具 description 里，模型仍能看到可读名。
+///
+/// 背景（bug 清单 15）：此前直接用 `skill__<原名>`，技能名未做任何校验，
+/// 一个名为 `probe 带空格/斜杠 的技能` 的技能会广告出违反 MCP 名契约的工具名，
+/// 严格校验的客户端可能拒绝整份 tools/list（连累全部代理工具）。
+fn skill_tool_names(list: &[SkillRow]) -> Vec<(String, String)> {
+    let suffix_max = TOOL_NAME_MAX - SKILL_TOOL_PREFIX.len();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ordered: Vec<&SkillRow> = list.iter().collect();
+    ordered.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut out = Vec::with_capacity(ordered.len());
+    for s in ordered {
+        let mut n = TOOL_NAME_HASH_LEN;
+        let mut seg = loop {
+            // 合法原名优先（仅当确实等于原名时才算"原名"）
+            let clean = sanitize_tool_segment(&s.name, suffix_max.saturating_sub(n + 1));
+            let cand = if clean == s.name && s.name.len() <= suffix_max && !used.contains(&clean) {
+                clean
+            } else {
+                format!("{}_{}", clean, name_hash(&s.name, n))
+            };
+            if !used.contains(&cand) {
+                break cand;
+            }
+            // 摘要碰撞（极罕见）：加长摘要重试
+            n += 2;
+            if n > 32 {
+                break format!(
+                    "{}_{}",
+                    sanitize_tool_segment(&s.name, 8),
+                    name_hash(&s.name, 32)
+                );
+            }
+        };
+        seg.truncate(TOOL_NAME_MAX - SKILL_TOOL_PREFIX.len());
+        used.insert(seg.clone());
+        out.push((format!("{SKILL_TOOL_PREFIX}{seg}"), s.name.clone()));
+    }
+    out
+}
+
+/// 由（可能被编码过的）工具名反解出技能名。
+/// 先按映射表精确匹配；再回退「原样名字」形式（兼容历史会话/手工调用）。
+fn resolve_skill_name(map: &[(String, String)], tool_name: &str) -> Option<String> {
+    if let Some((_, skill)) = map.iter().find(|(t, _)| t == tool_name) {
+        return Some(skill.clone());
+    }
+    tool_name
+        .strip_prefix(SKILL_TOOL_PREFIX)
+        .map(|raw| raw.to_string())
+}
 
 /// Skill 全文投递单次上限（超过截断并在结果尾部注明）。
 const SKILL_MAX_BYTES: usize = 32 * 1024;
@@ -142,14 +234,21 @@ async fn dynamic_skill_specs(ctx: &GatewayCtx) -> Vec<Value> {
             return Vec::new();
         }
     };
-    list.into_iter()
+    // 工具名一律走编码映射：合法原名保持原样（向后兼容），非法/重名则附名字摘要，
+    // 保证广告出去的工具名始终满足 MCP 名契约（bug 清单 15）。
+    let names = skill_tool_names(&list);
+    list.iter()
         .filter(|s| s.enabled)
-        .map(|s| {
-            json!({
-                "name": format!("skill__{}", s.name),
+        .filter_map(|s| {
+            let tool = names
+                .iter()
+                .find(|(_, skill)| skill == &s.name)
+                .map(|(t, _)| t.clone())?;
+            Some(json!({
+                "name": tool,
                 "description": format!("加载名为「{}」的技能全文并遵循（{}）", s.name, s.description),
                 "inputSchema": {"type": "object", "properties": {}}
-            })
+            }))
         })
         .collect()
 }
@@ -220,7 +319,7 @@ fn server_args(args_json: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn tool_list_mcp_servers(ctx: &GatewayCtx) -> Value {
+async fn tool_list_mcp_servers(ctx: &GatewayCtx) -> Result<Value, String> {
     let servers = tokio::task::spawn_blocking({
         let db = ctx.db.clone();
         move || db.with_any(|c| crate::store::mcp_list(c).map_err(|e| e.to_string()))
@@ -228,10 +327,7 @@ async fn tool_list_mcp_servers(ctx: &GatewayCtx) -> Value {
     .await
     .unwrap_or_else(|e| Err(format!("任务失败: {e}")));
 
-    let list = match servers {
-        Ok(list) => list,
-        Err(e) => return json!({"error": format!("读取 MCP Server 列表失败: {e}")}),
-    };
+    let list = servers.map_err(|e| format!("读取 MCP Server 列表失败: {e}"))?;
 
     let items: Vec<Value> = list
         .iter()
@@ -245,13 +341,13 @@ async fn tool_list_mcp_servers(ctx: &GatewayCtx) -> Value {
             })
         })
         .collect();
-    json!({
+    Ok(json!({
         "servers": items,
         "note": "以上为网关登记台账。要实际调用某个 Server 的工具，请在你的客户端配置中添加该 Server（用 get_mcp_server_detail 获取配置）。"
-    })
+    }))
 }
 
-async fn tool_server_detail(ctx: &GatewayCtx, name: &str) -> Value {
+async fn tool_server_detail(ctx: &GatewayCtx, name: &str) -> Result<Value, String> {
     let servers = tokio::task::spawn_blocking({
         let db = ctx.db.clone();
         move || db.with_any(|c| crate::store::mcp_list(c).map_err(|e| e.to_string()))
@@ -259,16 +355,12 @@ async fn tool_server_detail(ctx: &GatewayCtx, name: &str) -> Value {
     .await
     .unwrap_or_else(|e| Err(format!("任务失败: {e}")));
 
-    let list = match servers {
-        Ok(list) => list,
-        Err(e) => return json!({"error": format!("读取 MCP Server 列表失败: {e}")}),
-    };
+    let list = servers.map_err(|e| format!("读取 MCP Server 列表失败: {e}"))?;
 
     let Some(s) = list.iter().find(|s| s.name == name) else {
-        return json!({
-            "error": format!("未找到名为「{name}」的 MCP Server"),
-            "hint": "用 list_mcp_servers 查看现有登记"
-        });
+        return Err(format!(
+            "未找到名为「{name}」的 MCP Server；用 list_mcp_servers 查看现有登记"
+        ));
     };
 
     let connect = match s.kind.as_str() {
@@ -284,16 +376,16 @@ async fn tool_server_detail(ctx: &GatewayCtx, name: &str) -> Value {
             "envKeys": server_env_keys(s.env.as_deref()),
         }),
     };
-    json!({
+    Ok(json!({
         "name": s.name,
         "kind": s.kind,
         "enabled": s.enabled,
         "connect": connect,
         "note": "env 仅返回键名；实际值在客户端/供应商侧配置。"
-    })
+    }))
 }
 
-async fn tool_tool_schemas(ctx: &GatewayCtx, name: &str) -> Value {
+async fn tool_tool_schemas(ctx: &GatewayCtx, name: &str) -> Result<Value, String> {
     let servers = tokio::task::spawn_blocking({
         let db = ctx.db.clone();
         move || db.with_any(|c| crate::store::mcp_list(c).map_err(|e| e.to_string()))
@@ -301,19 +393,15 @@ async fn tool_tool_schemas(ctx: &GatewayCtx, name: &str) -> Value {
     .await
     .unwrap_or_else(|e| Err(format!("任务失败: {e}")));
 
-    let list = match servers {
-        Ok(list) => list,
-        Err(e) => return json!({"error": format!("读取 MCP Server 列表失败: {e}")}),
-    };
+    let list = servers.map_err(|e| format!("读取 MCP Server 列表失败: {e}"))?;
 
     let Some(s) = list.iter().find(|s| s.name == name) else {
-        return json!({
-            "error": format!("未找到名为「{name}」的 MCP Server"),
-            "hint": "用 list_mcp_servers 查看现有登记"
-        });
+        return Err(format!(
+            "未找到名为「{name}」的 MCP Server；用 list_mcp_servers 查看现有登记"
+        ));
     };
     if !s.enabled {
-        return json!({"error": format!("MCP Server「{name}」未启用"), "tools": []});
+        return Err(format!("MCP Server「{name}」未启用，暂不查询其工具"));
     }
 
     // 复用 mcp.rs 的工具发现（10s 超时），只读不执行
@@ -323,28 +411,20 @@ async fn tool_tool_schemas(ctx: &GatewayCtx, name: &str) -> Value {
     )
     .await
     {
-        Ok(Ok(tools)) => json!({
+        Ok(Ok(tools)) => Ok(json!({
             "server": s.name,
             "tools": tools,
             "note": "工具定义仅供参考；本接口不执行工具。"
-        }),
-        Ok(Err(e)) => json!({"error": format!("tools/list 失败: {e}")}),
-        Err(_) => json!({"error": "tools/list 超时(10s)"}),
+        })),
+        Ok(Err(e)) => Err(format!("tools/list 失败: {e}")),
+        Err(_) => Err("tools/list 超时(10s)".to_string()),
     }
 }
 
-async fn tool_list_skills(ctx: &GatewayCtx) -> Value {
-    let skills = tokio::task::spawn_blocking({
-        let db = ctx.db.clone();
-        move || db.with_any(|c| crate::store::skill_list(c).map_err(|e| e.to_string()))
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("任务失败: {e}")));
-
-    let list = match skills {
-        Ok(list) => list,
-        Err(e) => return json!({"error": format!("读取技能列表失败: {e}")}),
-    };
+async fn tool_list_skills(ctx: &GatewayCtx) -> Result<Value, String> {
+    let list = load_skills(ctx)
+        .await
+        .map_err(|e| format!("读取技能列表失败: {e}"))?;
     let items: Vec<Value> = list
         .iter()
         .map(|s| {
@@ -355,44 +435,37 @@ async fn tool_list_skills(ctx: &GatewayCtx) -> Value {
             })
         })
         .collect();
-    json!({"skills": items})
+    Ok(json!({"skills": items}))
 }
 
-async fn tool_skill_detail(ctx: &GatewayCtx, name: &str) -> Value {
-    let skills = tokio::task::spawn_blocking({
-        let db = ctx.db.clone();
-        move || db.with_any(|c| crate::store::skill_list(c).map_err(|e| e.to_string()))
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("任务失败: {e}")));
-
-    let list = match skills {
-        Ok(list) => list,
-        Err(e) => return json!({"error": format!("读取技能列表失败: {e}")}),
-    };
+/// 台账查询：返回技能全文。
+///
+/// bug 清单 16：**与投递口径一致**——未启用（enabled=0）的技能不再返回全文，
+/// 避免 `enabled` 这道闸门被旁路（投递拒绝、台账却照给，语义上是同一件事）。
+async fn tool_skill_detail(ctx: &GatewayCtx, name: &str) -> Result<Value, String> {
+    let list = load_skills(ctx).await?;
     let Some(s) = list.iter().find(|s| s.name == name) else {
-        return json!({
-            "error": format!("未找到名为「{name}」的技能"),
-            "hint": "用 list_skills 查看现有登记"
-        });
+        return Err(format!(
+            "未找到名为「{name}」的技能；用 list_skills 查看现有登记"
+        ));
     };
-    json!({
+    if !s.enabled {
+        return Err(format!(
+            "技能「{name}」未启用（enabled=0）；需要时先在 JAI「技能」页启用"
+        ));
+    }
+    Ok(json!({
         "name": s.name,
         "description": s.description,
         "enabled": s.enabled,
         "content": s.content,
-    })
+    }))
 }
 
 /// 投递 Skill 全文（`skill__<name>` 工具）。复用 `skill_list` 查找；
 /// 只投递给已启用（enabled=1）的技能，超长按 `SKILL_MAX_BYTES` 截断并注明。
 async fn deliver_skill(ctx: &GatewayCtx, name: &str) -> Result<Value, String> {
-    let skills = tokio::task::spawn_blocking({
-        let db = ctx.db.clone();
-        move || db.with_any(|c| crate::store::skill_list(c).map_err(|e| e.to_string()))
-    })
-    .await
-    .map_err(|e| format!("任务失败: {e}"))??;
+    let skills = load_skills(ctx).await?;
 
     let Some(s) = skills.iter().find(|s| s.name == name) else {
         return Err(format!(
@@ -559,10 +632,15 @@ fn proxy_result_payload(server: &str, upstream: Value) -> Value {
 }
 
 async fn dispatch_tool(ctx: &GatewayCtx, name: &str, args: &Value) -> Result<ToolOutcome, String> {
-    // Skill 投递优先：`skill__<name>` —— 必须先于 proxy 判断，
+    // Skill 投递优先：`skill__<...>` —— 必须先于 proxy 判断，
     // 否则 `skill__code-review` 会被 parse_proxy_name 拆成 server="skill"。
-    if let Some(skill_name) = name.strip_prefix("skill__") {
-        return deliver_skill(ctx, skill_name).await.map(ToolOutcome::Info);
+    if name.starts_with(SKILL_TOOL_PREFIX) {
+        let skills = load_skills(ctx).await?;
+        let map = skill_tool_names(&skills);
+        let Some(real) = resolve_skill_name(&map, name) else {
+            return Err(format!("未找到工具 {name}；用 list_skills 查看现有技能"));
+        };
+        return deliver_skill(ctx, &real).await.map(ToolOutcome::Info);
     }
     // 代理工具：命中 `server__tool` 且 server 可代理才转发
     if let Some((server, tool)) = parse_proxy_name(name) {
@@ -570,32 +648,44 @@ async fn dispatch_tool(ctx: &GatewayCtx, name: &str, args: &Value) -> Result<Too
         // 直接按代理语义处理；server 校验在 proxy_call_tool 内完成。
         return proxy_call_tool(ctx, server, tool, args).await;
     }
+    // 台账类工具：失败一律走 Err（→ isError=true），不再把错误塞进成功载荷
+    // （bug 清单 17：与 v0.2.0 bug 10 的「失败不得被拉平成成功」哲学统一）。
     match name {
-        "list_mcp_servers" => Ok(ToolOutcome::Info(tool_list_mcp_servers(ctx).await)),
+        "list_mcp_servers" => Ok(ToolOutcome::Info(tool_list_mcp_servers(ctx).await?)),
         "get_mcp_server_detail" => {
             let name = args
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or("缺少参数 name")?;
-            Ok(ToolOutcome::Info(tool_server_detail(ctx, name).await))
+            Ok(ToolOutcome::Info(tool_server_detail(ctx, name).await?))
         }
         "get_tool_schemas" => {
             let name = args
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or("缺少参数 name")?;
-            Ok(ToolOutcome::Info(tool_tool_schemas(ctx, name).await))
+            Ok(ToolOutcome::Info(tool_tool_schemas(ctx, name).await?))
         }
-        "list_skills" => Ok(ToolOutcome::Info(tool_list_skills(ctx).await)),
+        "list_skills" => Ok(ToolOutcome::Info(tool_list_skills(ctx).await?)),
         "get_skill_detail" => {
             let name = args
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or("缺少参数 name")?;
-            Ok(ToolOutcome::Info(tool_skill_detail(ctx, name).await))
+            Ok(ToolOutcome::Info(tool_skill_detail(ctx, name).await?))
         }
         other => Err(format!("未知工具: {other}")),
     }
+}
+
+/// 读技能列表（唯一入口：错误统一转 String）。
+async fn load_skills(ctx: &GatewayCtx) -> Result<Vec<SkillRow>, String> {
+    let db = ctx.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| crate::store::skill_list(c).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(|e| format!("任务失败: {e}"))?
 }
 
 // ---------------------------------------------------------------- JSON-RPC 端点

@@ -2593,6 +2593,21 @@ fn main() {
             let db_str = db_path.to_string_lossy().to_string();
 
             let db = Db::open(&db_str)?;
+            // 启动按需回收磁盘（bug 清单 14 的永久解法）：SQLite 删除大行后文件不会自动缩小，
+            // 历史事故实测出现过「895 MB 库里 894 MB 全是空洞」。必须在**日志连接建立之前**
+            // 执行（VACUUM 需要独占），失败仅告警、不阻塞启动。
+            {
+                let cfg = store::retention::ReclaimConfig::from_env();
+                match db.with(|c| store::retention::reclaim_if_bloated(c, cfg)) {
+                    Ok(Some((before, after))) => eprintln!(
+                        "[store] 启动回收磁盘：{} MB → {} MB（空闲页占比超过阈值）",
+                        before / 1048576,
+                        after / 1048576
+                    ),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[store] 启动回收跳过（不影响启动）: {e}"),
+                }
+            }
             // 存量钥匙串凭据一次性迁移入库（0006）；此后运行时零钥匙串访问。
             // 后台执行：授权弹框可能等待用户输入，绝不能阻塞启动路径；
             // 弹框期间迁移不持 DB 锁（见 vault::migrate_keyring_secrets 分段持锁设计）。
