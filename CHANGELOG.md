@@ -44,12 +44,21 @@ All notable changes to this project will be documented in this file.
   - 截断：MCP 注册路径/URL 与供应商 base URL 补 `title`（hover 可读全量），审计截断项 3 → 0。
   - 主操作可达：网关页新增吸顶操作条（`启动/停止` + `复制 MCP 配置`），移除会被折叠线切掉
     的浮动按钮；网关页折叠线下控件 1 → **0**。
+  - 模型表列降级：`<1024px` 隐藏「模态（入/出）」列（该信息降级为「模型名」列内的单字 badge，
+    完整集合放 `title`），并把三个行内输入窄窗收窄 → **最小窗口 900×600 下不再横向溢出**
+    （表宽 804 → 674，容器 724）；1180×800 下 7 列与编辑器完整保留。
+  - 顶部渐隐遮罩：内容滚过顶部时不再是硬边。踩坑两点（已写进代码注释）：
+    ① `sticky` 方案贴不到真正的裁切边（滚动容器 padding 也在可滚动区内，内容被裁切的是
+    `main` 边框盒顶边，sticky 恒定低 24px）→ 改「包裹 `main` + 绝对定位覆盖层」，偏移 0；
+    ② 必须显式 `pointer-events-none`，否则 24px 透明带吞掉顶部点击（同历史 P0-3 那类遮挡）。
+    包裹层不加 `z-index`，吸顶条（z-10）仍盖住遮罩（z-5）；`absolute` 不占布局高度。
 - 视觉回归探针加固（`tools/visual-regression/`）：
   - `audit.mjs` 主题改为**页面加载前**写入 `localStorage.theme`（原先加载后才加 `.dark` 类，
     next-themes 已初始化完毕，造成「应用暗色 + 组件库浅色」错配，使 toast 报出假结论）；
   - `audit.mjs` 的 `truncated` 检测**原为死代码**（只初始化、从不 push，字段恒空）→ 补上实现；
   - 新增 `probe-hits.mjs`（有效命中区）、`probe-toast2.mjs`（toast 主题与对比度）、
-    `probe-sticky.mjs`（吸顶条是否真的常驻）。
+    `probe-sticky.mjs`（吸顶条是否真的常驻）、`probe-fade.mjs`（顶部渐隐贴边/不吞点击）、
+    `probe-models-cols.mjs`（模型表列可见性与表宽）。
 
 ## [0.2.3] - 2026-09-17
 
