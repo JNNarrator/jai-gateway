@@ -544,8 +544,21 @@
     `render_stream_text_then_tool_keeps_ids`。已做**反证**：把旧行为加回去，前两条立刻变红。
   - 真机复验：以 zcode 原始请求体重放 + 构造纯工具/混排请求，逐流跑 id 一致性校验脚本全过；
     纯工具流里 `msg_*` 伪帧数为 0、参数增量 id 与登记 id 一致。
-  - 排查提示：**遇到「客户端失败、JAI 记 200」时，不要看 JAI 日志下结论**，要看客户端
+  - 排查提示：**遇到「客户端失败、JAI 记 200 时，不要看 JAI 日志下结论**，要看客户端
     的 cause 链（zcode：`~/.zcode/cli/log/zcode-*.jsonl` 的 `turn.failed` → `error.cause.cause`）。
+  - **同族第三处（同日续修）**：修完上面两处后 zcode 能拿到回复了，但工具调用报
+    `fault.runtime.toolLifecycleIncomplete`「Tool call ended without a terminal event.」
+    —— 因为 **openai 族上游没有「工具调用结束」事件**（`openai.rs`：`Ev::ToolCallEnd => None`），
+    而 `Finish` 分支只关 reasoning / 文本 item，**不关还开着的工具 item**，于是每条工具流都是
+    `output_item.added → …delta… → response.completed`，永远没有终结帧；严格客户端只认
+    `output_item.done` 来终结工具调用，缺了就把工具行标成"未终结"。
+    另：终结 item 早期还把 `name`/`arguments` 传成空串（客户端靠它构造 tool-call）。
+    修复：抽出 `close_tool_call()`，在 `ToolCallEnd`、**`Finish`**、以及新 item 开始前（文本/工具）
+    都补发 `function_call_arguments.done`（带完整 arguments）+ `output_item.done`（完整最终 item：
+    id/call_id/name/arguments），并推进 `output_index` 防撞号。
+    回归：`render_stream_finish_closes_open_tool_call`、
+    `render_stream_closes_every_open_tool_call`（连续两个工具调用、上游始终不给结束事件）；
+    真机逐流校验「每个 added 必有对应 done 且带 name/arguments」全过。
 
 ## 2. 优化清单
 

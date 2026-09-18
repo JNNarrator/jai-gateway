@@ -18,6 +18,14 @@ All notable changes to this project will be documented in this file.
   - 修复：状态拆为 `msg_started` + `active_tool_item_id`；文本增量按 `msg_started` 补发
     item/part 登记；工具增量/结束帧复用登记 id（`call_id` 从 id 反解）；纯工具调用不再发
     `msg_*` 收尾帧。回归 3 条单测（含反证：恢复旧行为即变红）+ 真机逐流 id 一致性校验。
+  - **同族第三处**：工具调用**永远没有终结帧**。openai 族上游不产生「工具调用结束」事件
+    （`openai.rs`：`Ev::ToolCallEnd => None`），而 `Finish` 只关 reasoning/文本 item，
+    于是每条工具流都是 `output_item.added → …delta… → response.completed`，严格客户端只认
+    `output_item.done` 终结工具调用 → 工具行永远关不掉，报
+    `fault.runtime.toolLifecycleIncomplete`「Tool call ended without a terminal event.」；
+    且终结 item 早期还传空 `name`/`arguments`。修复：`close_tool_call()` 在 `ToolCallEnd`、
+    **`Finish`**、以及新 item 开始前补发带完整参数的 `function_call_arguments.done` +
+    完整 `output_item.done`，并推进 `output_index` 防撞号。回归 2 条单测 + 真机逐流校验。
 
 
 ## [0.2.7] - 2026-09-18

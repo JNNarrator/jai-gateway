@@ -1586,6 +1586,14 @@ pub struct RenderState {
     /// 当前活跃 tool call 的 **item id**（`ToolCallStart` 登记的那个）。
     /// 参数增量/结束帧必须复用它；早期写死 `fc_{index}_pending`，与登记 id 不一致。
     pub active_tool_item_id: String,
+    /// 当前活跃 tool call 的 `call_id`、工具名与已累积参数。
+    /// 收尾的 `output_item.done` 是严格客户端**唯一的工具调用真相来源**：zcode（AI SDK）
+    /// 在该帧用 `item.call_id` 关工具行、用 `item.name` + `item.arguments` 构造 `tool-call`。
+    /// 早期这里传空串 → 工具行永远关不掉，报 `fault.runtime.toolLifecycleIncomplete`
+    /// 「Tool call ended without a terminal event.」
+    pub active_tool_call_id: String,
+    pub active_tool_name: String,
+    pub active_tool_args: String,
 }
 
 impl RenderState {
@@ -1649,12 +1657,59 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
         );
         st.output_index += 1;
     }
+    /// 关闭当前仍开着的工具 item：补 `function_call_arguments.done` + `output_item.done`。
+    ///
+    /// 为什么必须显式关：**openai 族上游没有「工具调用结束」事件**（`openai.rs` 里
+    /// `Ev::ToolCallEnd => None`），而 Responses 协议要求每个 item 都有终结帧，严格客户端
+    /// （zcode / AI SDK）只认 `output_item.done` 来终结工具调用 —— 缺失时报
+    /// `fault.runtime.toolLifecycleIncomplete`「Tool call ended without a terminal event.」。
+    fn close_tool_call(st: &mut RenderState, index_hint: usize, out: &mut Vec<String>) {
+        if st.active_tool_item_id.is_empty() {
+            return;
+        }
+        let item_id = std::mem::take(&mut st.active_tool_item_id);
+        let arguments = std::mem::take(&mut st.active_tool_args);
+        let call_id = if st.active_tool_call_id.is_empty() {
+            call_id_of(&item_id, index_hint)
+        } else {
+            std::mem::take(&mut st.active_tool_call_id)
+        };
+        let name = std::mem::take(&mut st.active_tool_name);
+        let mut item_type = std::mem::take(&mut st.active_tool_type);
+        if item_type.is_empty() {
+            item_type = "function_call".to_string();
+        }
+        out.push(
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": item_id,
+                "output_index": st.output_index,
+                "arguments": arguments,
+            })
+            .to_string(),
+        );
+        // 收尾 item 必须是完整最终形态（name + 完整 arguments），空串会让客户端工具行关不掉
+        let item = extended_tool_item(&item_id, &call_id, &name, &arguments, &item_type);
+        out.push(
+            json!({
+                "type": "response.output_item.done",
+                "output_index": st.output_index,
+                "item": item,
+            })
+            .to_string(),
+        );
+        st.output_index += 1;
+    }
+
     match e {
         Ev::Start { model: _ } => {
             st.started = true;
             st.output_index = 0;
             st.msg_started = false;
             st.active_tool_item_id.clear();
+            st.active_tool_call_id.clear();
+            st.active_tool_name.clear();
+            st.active_tool_args.clear();
             st.current_text.clear();
             st.reasoning_started = false;
             st.current_reasoning.clear();
@@ -1676,6 +1731,8 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                 return Vec::new();
             }
             let mut out = Vec::new();
+            let hint = st.output_index;
+            close_tool_call(st, hint, &mut out);
             close_reasoning(st, &mut out);
             if !st.msg_started {
                 st.msg_started = true;
@@ -1756,10 +1813,15 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
         }
         Ev::ToolCallStart { index, id, name } => {
             let mut out = Vec::new();
+            close_tool_call(st, *index, &mut out);
             close_reasoning(st, &mut out);
             let item_id = format!("fc_{index}_{id}");
-            // 登记 item id 供参数增量/结束帧复用；**不碰** msg_started（见字段注释）
+            // 登记 item id/call_id/名字/参数缓冲供增量与收尾帧复用；
+            // **不碰** msg_started（见字段注释）
             st.active_tool_item_id = item_id.clone();
+            st.active_tool_call_id = id.clone();
+            st.active_tool_name = name.clone();
+            st.active_tool_args.clear();
             // 扩展工具折叠还原（§10）：按上游 function 名还原 item 类型
             let item_type = restore_tool_type(name, &st.tool_identities);
             st.active_tool_type = item_type.to_string();
@@ -1775,7 +1837,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             out
         }
         Ev::ToolCallArgsDelta {
-            index,
+            index: _,
             args_fragment,
             ..
         } => {
@@ -1785,6 +1847,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             } else {
                 "response.function_call_arguments.delta"
             };
+            st.active_tool_args.push_str(args_fragment);
             vec![json!({
                 "type": event,
                 "item_id": tool_item_id(st),
@@ -1794,34 +1857,16 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             .to_string()]
         }
         Ev::ToolCallEnd { index } => {
-            let item_id = tool_item_id(st);
-            let mut out = vec![json!({
-                "type": "response.function_call_arguments.done",
-                "item_id": item_id,
-                "output_index": st.output_index,
-            })
-            .to_string()];
-            let mut item_type = std::mem::take(&mut st.active_tool_type);
-            if item_type.is_empty() {
-                item_type = "function_call".to_string();
-            }
-            let item =
-                extended_tool_item(&item_id, &call_id_of(&item_id, *index), "", "", &item_type);
-            out.push(
-                json!({
-                    "type": "response.output_item.done",
-                    "output_index": st.output_index,
-                    "item": item,
-                })
-                .to_string(),
-            );
-            st.output_index += 1;
-            st.active_tool_item_id.clear();
-            st.active_tool_type.clear();
+            let mut out = Vec::new();
+            close_tool_call(st, *index, &mut out);
             out
         }
         Ev::Finish { stop_reason, usage } => {
             let mut out = Vec::new();
+            // openai 族上游不产生 ToolCallEnd，收尾前必须补关仍开着的工具 item，
+            // 否则客户端拿不到终结事件（工具行永远关不掉）
+            let hint = st.output_index;
+            close_tool_call(st, hint, &mut out);
             // 纯 thinking 响应（无 text/tool）：先关闭 reasoning item 再收尾
             close_reasoning(st, &mut out);
             if st.msg_started {
@@ -2936,6 +2981,195 @@ mod tests {
             !joined.contains("_pending"),
             "不得再出现 _pending 占位 id：{joined}"
         );
+
+        // 收尾帧是严格客户端**唯一**的工具调用真相来源，必须带真名与完整参数
+        let done_item = frames
+            .iter()
+            .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+            .find(|v| {
+                v["type"] == "response.output_item.done"
+                    && v["item"]["type"] == "function_call"
+                    && v["item"]["id"] == "fc_0_call_a"
+            })
+            .expect("缺 function_call 的 output_item.done");
+        assert_eq!(
+            done_item["item"]["name"].as_str().unwrap(),
+            "Bash",
+            "收尾 item 必须带工具真名（空串会让客户端工具行关不掉）"
+        );
+        assert_eq!(
+            done_item["item"]["arguments"].as_str().unwrap(),
+            "{\"command\":\"pwd\"}",
+            "收尾 item 必须带累积的完整参数"
+        );
+        let args_done = frames
+            .iter()
+            .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+            .find(|v| v["type"] == "response.function_call_arguments.done")
+            .expect("缺 function_call_arguments.done");
+        assert_eq!(
+            args_done["arguments"].as_str().unwrap(),
+            "{\"command\":\"pwd\"}",
+            "function_call_arguments.done 应携带完整 arguments"
+        );
+    }
+
+    /// 回归（zcode「Tool call ended without a terminal event.」）：**上游不给 ToolCallEnd**
+    /// 时（openai 族上游没有显式结束事件，实测每个工具流都是 `added → completed`），
+    /// 收尾必须有终结帧，否则严格客户端的工具行永远处于未终结状态。
+    #[test]
+    fn render_stream_finish_closes_open_tool_call() {
+        let mut st = RenderState {
+            response_id: "resp_t".into(),
+            model: "deepseek-flash".into(),
+            ..Default::default()
+        };
+        let mut frames: Vec<String> = Vec::new();
+        let mut feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
+            frames.extend(render_stream_event(&ev, st));
+        };
+        feed(
+            &mut st,
+            StreamEvent::Start {
+                model: "deepseek-flash".into(),
+            },
+            &mut frames,
+        );
+        feed(
+            &mut st,
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "call_1".into(),
+                name: "Bash".into(),
+            },
+            &mut frames,
+        );
+        for frag in ["{\"command\":", "\"pwd\"}"] {
+            feed(
+                &mut st,
+                StreamEvent::ToolCallArgsDelta {
+                    index: 0,
+                    args_fragment: frag.into(),
+                },
+                &mut frames,
+            );
+        }
+        // 直接 Finish（模拟上游以 finish_reason=tool_calls 收尾，没有 ToolCallEnd）
+        feed(
+            &mut st,
+            StreamEvent::Finish {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            },
+            &mut frames,
+        );
+
+        let parsed: Vec<Value> = frames
+            .iter()
+            .filter_map(|f| serde_json::from_str(f).ok())
+            .collect();
+        let done = parsed
+            .iter()
+            .find(|v| v["type"] == "response.output_item.done")
+            .expect("上游不给 ToolCallEnd 时，Finish 必须补 output_item.done");
+        assert_eq!(done["item"]["type"], "function_call");
+        assert_eq!(done["item"]["id"], "fc_0_call_1");
+        assert_eq!(done["item"]["call_id"], "call_1");
+        assert_eq!(done["item"]["name"], "Bash", "收尾 item 必须有工具名");
+        assert_eq!(
+            done["item"]["arguments"], "{\"command\":\"pwd\"}",
+            "收尾 item 必须有累积参数"
+        );
+        assert!(
+            parsed
+                .iter()
+                .any(|v| v["type"] == "response.function_call_arguments.done"
+                    && v["arguments"] == "{\"command\":\"pwd\"}"),
+            "缺 function_call_arguments.done 或未带参数"
+        );
+        assert!(
+            st.active_tool_item_id.is_empty(),
+            "收尾后不得残留未关闭的工具 item"
+        );
+    }
+
+    /// 连续两次工具调用、上游始终不给结束事件：两个 item 都要被关掉，且 id 不串、不撞号。
+    #[test]
+    fn render_stream_closes_every_open_tool_call() {
+        let mut st = RenderState {
+            response_id: "resp_u".into(),
+            model: "deepseek-flash".into(),
+            ..Default::default()
+        };
+        let mut frames: Vec<String> = Vec::new();
+        let mut feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
+            frames.extend(render_stream_event(&ev, st));
+        };
+        feed(
+            &mut st,
+            StreamEvent::Start {
+                model: "deepseek-flash".into(),
+            },
+            &mut frames,
+        );
+        for (i, name) in [(0usize, "Bash"), (1usize, "Read")] {
+            let call = format!("call_{i}");
+            feed(
+                &mut st,
+                StreamEvent::ToolCallStart {
+                    index: i,
+                    id: call.clone(),
+                    name: name.into(),
+                },
+                &mut frames,
+            );
+            feed(
+                &mut st,
+                StreamEvent::ToolCallArgsDelta {
+                    index: i,
+                    args_fragment: format!("{{\"i\":{i}}}"),
+                },
+                &mut frames,
+            );
+        }
+        feed(
+            &mut st,
+            StreamEvent::Finish {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            },
+            &mut frames,
+        );
+
+        let parsed: Vec<Value> = frames
+            .iter()
+            .filter_map(|f| serde_json::from_str(f).ok())
+            .collect();
+        let done_items: Vec<&Value> = parsed
+            .iter()
+            .filter(|v| v["type"] == "response.output_item.done")
+            .collect();
+        assert_eq!(done_items.len(), 2, "两个工具 item 都要有关闭帧");
+        assert_eq!(done_items[0]["item"]["name"], "Bash");
+        assert_eq!(done_items[0]["item"]["arguments"], "{\"i\":0}");
+        assert_eq!(done_items[1]["item"]["name"], "Read");
+        assert_eq!(done_items[1]["item"]["arguments"], "{\"i\":1}");
+        // output_index 不得撞号
+        let idx: Vec<i64> = done_items
+            .iter()
+            .map(|v| v["output_index"].as_i64().unwrap())
+            .collect();
+        assert_ne!(idx[0], idx[1], "item 的 output_index 不能相同：{idx:?}");
     }
 
     /// 反向顺序（文本→工具）同样不许出现 id 漂移。
