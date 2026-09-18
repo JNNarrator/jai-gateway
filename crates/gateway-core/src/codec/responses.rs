@@ -2936,7 +2936,7 @@ mod tests {
             ..Default::default()
         };
         let mut frames: Vec<String> = Vec::new();
-        let mut feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
+        let feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
             frames.extend(render_stream_event(&ev, st));
         };
         feed(
@@ -3048,7 +3048,7 @@ mod tests {
             ..Default::default()
         };
         let mut frames: Vec<String> = Vec::new();
-        let mut feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
+        let feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
             frames.extend(render_stream_event(&ev, st));
         };
         feed(
@@ -3133,7 +3133,7 @@ mod tests {
             ..Default::default()
         };
         let mut frames: Vec<String> = Vec::new();
-        let mut feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
+        let feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
             frames.extend(render_stream_event(&ev, st));
         };
         feed(
@@ -3206,7 +3206,7 @@ mod tests {
             ..Default::default()
         };
         let mut frames: Vec<String> = Vec::new();
-        let mut feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
+        let feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
             frames.extend(render_stream_event(&ev, st));
         };
         feed(
