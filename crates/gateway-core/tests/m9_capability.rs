@@ -158,6 +158,16 @@ impl Fixture {
 }
 
 async fn fixture(mode: Mode) -> Fixture {
+    fixture_with_levels(mode, None, None).await
+}
+
+/// 夹具的档位声明版本（0011）：`provider_levels` / `model_levels` 为声明序逗号串
+/// （如 `"low,medium,high,xhigh,max"`），None = 未声明。
+async fn fixture_with_levels(
+    mode: Mode,
+    provider_levels: Option<&str>,
+    model_levels: Option<&str>,
+) -> Fixture {
     let captures = Arc::new(Mutex::new(Vec::<Value>::new()));
     let (up_port, up_path) = spawn_upstream(mode, captures.clone()).await;
 
@@ -205,11 +215,17 @@ async fn fixture(mode: Mode) -> Fixture {
                 last_ok_at: None,
                 last_err_at: None,
                 last_err_msg: None,
+                reasoning_effort_levels: provider_levels.and_then(gateway_core::effort::parse),
                 created_at: now,
                 updated_at: now,
             },
         )?;
         store::model_upsert(c, "p-up", model, Some(128000), 4096, None, None)?;
+        // 模型级档位声明（0011）：非空时覆盖供应商级
+        if let Some(ml) = model_levels.and_then(gateway_core::effort::parse) {
+            let row = store::model_get_by_provider_name(c, "p-up", model)?.expect("模型行应存在");
+            store::model_set_reasoning_levels(c, &row.id, Some(&ml))?;
+        }
         Ok::<_, store::StoreError>(())
     })
     .unwrap();
@@ -425,4 +441,127 @@ async fn extended_shell_tool_folds_and_restores() {
         .expect("应还原为 shell_call item");
     assert_eq!(shell["call_id"], "call_s1");
     assert_eq!(shell["action"]["command"], "ls -la");
+}
+
+// ------------------------------------------- M9-7..12 推理档位值域（0011）
+
+/// 上游声明的档位（基元律动对 DeepSeek 的实际值域，取自 2026-09-18 真机故障的
+/// 上游 400 原文：`DeepSeek reasoning_effort 只支持 low、medium、high、xhigh、max`）。
+const JIYUAN_LEVELS: &str = "low,medium,high,xhigh,max";
+
+/// M9-7（本次真机故障的回归）：zcode 发 `reasoning.effort=none`，上游只认
+/// low/medium/high/xhigh/max —— 旧行为原样透传 → 上游 400；修好后应**丢弃该参数**。
+#[tokio::test(flavor = "multi_thread")]
+async fn m9_7_effort_none_dropped_when_upstream_cannot_turn_reasoning_off() {
+    let fx = fixture_with_levels(Mode::OpenaiReasoning, Some(JIYUAN_LEVELS), None).await;
+    let (status, body) = fx
+        .post_responses(json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "reasoning": {"effort": "none"}
+        }))
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+
+    let upstream = fx.upstream_body().await;
+    assert!(
+        upstream.get("reasoning_effort").is_none(),
+        "上游不认 none → 该参数应被丢弃，而不是原样透传换 400：{upstream}"
+    );
+}
+
+/// M9-8：低于域下限的档位（minimal）→ 收敛到域内最低档（low）。
+#[tokio::test(flavor = "multi_thread")]
+async fn m9_8_effort_minimal_maps_to_declared_floor() {
+    let fx = fixture_with_levels(Mode::OpenaiReasoning, Some(JIYUAN_LEVELS), None).await;
+    let (status, _) = fx
+        .post_responses(json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "reasoning": {"effort": "minimal"}
+        }))
+        .await;
+    assert_eq!(status, 200);
+
+    let upstream = fx.upstream_body().await;
+    assert_eq!(upstream["reasoning_effort"], "low");
+}
+
+/// M9-9：域内值原样透传（不因声明值域而擅自改写客户端意图）。
+#[tokio::test(flavor = "multi_thread")]
+async fn m9_9_effort_in_domain_passes_through() {
+    let fx = fixture_with_levels(Mode::OpenaiReasoning, Some(JIYUAN_LEVELS), None).await;
+    let (status, _) = fx
+        .post_responses(json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "reasoning": {"effort": "xhigh"}
+        }))
+        .await;
+    assert_eq!(status, 200);
+
+    let upstream = fx.upstream_body().await;
+    assert_eq!(upstream["reasoning_effort"], "xhigh");
+}
+
+/// M9-10：模型级声明覆盖供应商级（同一供应商下不同模型档位不同）。
+#[tokio::test(flavor = "multi_thread")]
+async fn m9_10_model_level_overrides_provider_level() {
+    // 供应商声明宽松值域，模型行收紧到只有 high
+    let fx = fixture_with_levels(Mode::OpenaiReasoning, Some(JIYUAN_LEVELS), Some("high")).await;
+    let (status, _) = fx
+        .post_responses(json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "reasoning": {"effort": "none"}
+        }))
+        .await;
+    assert_eq!(status, 200);
+
+    let upstream = fx.upstream_body().await;
+    assert!(
+        upstream.get("reasoning_effort").is_none(),
+        "模型级值域（无 off/none）应使 none 被丢弃：{upstream}"
+    );
+}
+
+/// M9-11：**同族直通**路径同样归一 —— 客户端直发 openai_compat 入站时，
+/// `reasoning_effort` 也会被原样透传（同一 bug 的另一半入口）。
+#[tokio::test(flavor = "multi_thread")]
+async fn m9_11_passthrough_path_normalizes_effort() {
+    let fx = fixture_with_levels(Mode::OpenaiText, Some(JIYUAN_LEVELS), None).await;
+    let (status, _) = fx
+        .post_chat(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none"
+        }))
+        .await;
+    assert_eq!(status, 200);
+
+    let upstream = fx.upstream_body().await;
+    assert!(
+        upstream.get("reasoning_effort").is_none(),
+        "直通路径也应丢弃上游不认的 none：{upstream}"
+    );
+}
+
+/// M9-12：未声明值域的供应商行为**不变**（向后兼容守门）。
+#[tokio::test(flavor = "multi_thread")]
+async fn m9_12_undeclared_levels_keep_legacy_behavior() {
+    let fx = fixture(Mode::OpenaiReasoning).await;
+    let (status, _) = fx
+        .post_responses(json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "reasoning": {"effort": "none"}
+        }))
+        .await;
+    assert_eq!(status, 200);
+
+    let upstream = fx.upstream_body().await;
+    assert_eq!(
+        upstream["reasoning_effort"], "none",
+        "未声明值域 ⇒ 不干预（老供应商不受影响）"
+    );
 }

@@ -253,6 +253,7 @@ mod tests {
             weight,
             last_ok_at,
             last_err_at,
+            reasoning_effort_levels: None,
         }
     }
 

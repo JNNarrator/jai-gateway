@@ -62,6 +62,10 @@ pub fn build_export_json(c: &Connection) -> Result<String, StoreError> {
             if let Some(k) = p.api_key.as_deref().filter(|s| !s.is_empty()) {
                 v["api_key"] = Value::String(k.to_string());
             }
+            // 推理档位值域（0011）：空（未声明）不出键，保持导出物体积稳定
+            if let Some(levels) = p.reasoning_effort_levels.as_ref().filter(|l| !l.is_empty()) {
+                v["reasoning_effort_levels"] = json!(levels);
+            }
             v
         })
         .collect();

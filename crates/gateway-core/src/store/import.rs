@@ -104,7 +104,12 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if !matches!(family.as_str(), "openai_compat" | "anthropic" | "gemini") {
+        // 白名单与 providers.family 的 CHECK 约束同款拼写（0003 起 openai_responses 合法，
+        // 此前漏了它 —— 该族供应商无法随导出配置在机器间同步）
+        if !matches!(
+            family.as_str(),
+            "openai_compat" | "openai_responses" | "anthropic" | "gemini"
+        ) {
             report
                 .invalid_providers
                 .push(format!("{name}: 未知协议族 {family}"));
@@ -134,6 +139,10 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        // 推理档位值域（0011）：JSON 数组；缺省 None = 未声明（不覆盖本地已有声明）
+        let remote_effort_levels = p
+            .get("reasoning_effort_levels")
+            .and_then(crate::effort::from_json_array);
 
         // 本地按 (name, base_url) 去重；同一导出文件内重复只导入一次
         let dup_in_file = seen_local.iter().any(|(n, b)| n == name && b == base_url);
@@ -178,6 +187,10 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
             if let Some(w) = &website {
                 provider_set_website(c, &row.id, Some(w)).map_err(|e| e.to_string())?;
             }
+            if let Some(lv) = &remote_effort_levels {
+                super::provider_set_reasoning_levels(c, &row.id, Some(lv))
+                    .map_err(|e| e.to_string())?;
+            }
             report.providers_skipped_duplicate += 1;
             row.id
         } else {
@@ -195,6 +208,7 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
                 // 新建即带凭据：导入后立即可路由，消除「待录入密钥」状态
                 api_key: remote_api_key.clone(),
                 website: website.clone(),
+                reasoning_effort_levels: remote_effort_levels.clone(),
                 last_ok_at: None,
                 last_err_at: None,
                 last_err_msg: None,
@@ -263,6 +277,17 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
             output_modalities.as_deref(),
         )
         .map_err(|e| e.to_string())?;
+        // 推理档位值域（0011）：与模态同口径 —— 缺省不覆盖本地已有声明
+        if let Some(levels) = m
+            .get("reasoningEffortLevels")
+            .and_then(crate::effort::from_json_array)
+        {
+            if let Ok(Some(model_row)) = super::model_get_by_provider_name(c, local_id, model_name)
+            {
+                super::model_set_reasoning_levels(c, &model_row.id, Some(&levels))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         if !enabled {
             if let Ok(Some(model_row)) = super::model_get_by_provider_name(c, local_id, model_name)
             {
@@ -410,6 +435,75 @@ mod tests {
         // 白名单外 meta（端口/CORS）不导入
         assert_eq!(crate::store::meta_get(&c2, "gateway_port").unwrap(), None);
         assert_eq!(crate::store::meta_get(&c2, "cors_allow").unwrap(), None);
+    }
+
+    /// 0011 往返：供应商级 + 模型级「推理档位值域」随导出/导入落地，
+    /// 且 `openai_responses` 供应商不再被误判为「未知协议族」（本次顺带修的 bug）。
+    #[test]
+    fn roundtrip_carries_reasoning_effort_levels_and_responses_family() {
+        let c = open_and_migrate(":memory:").unwrap();
+        let now = crate::store::now_ms();
+        c.execute(
+            "INSERT INTO providers(id,name,base_url,family,enabled,priority,weight,reasoning_effort_levels,created_at,updated_at)
+             VALUES ('p1','基元律动','https://tokenrhythm.studio/v1','openai_compat',1,100,1,'low,medium,high,xhigh,max',?1,?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO providers(id,name,base_url,family,enabled,priority,weight,created_at,updated_at)
+             VALUES ('p2','Responses 上游','https://api.resp.test/v1','openai_responses',1,100,1,?1,?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        crate::store::model_upsert(&c, "p1", "deepseek-flash", Some(512_000), 8192, None, None)
+            .unwrap();
+        let m = crate::store::model_get_by_provider_name(&c, "p1", "deepseek-flash")
+            .unwrap()
+            .unwrap();
+        crate::store::model_set_reasoning_levels(&c, &m.id, Some(&["high".into()])).unwrap();
+
+        let exported = crate::store::export::build_export_json(&c).unwrap();
+        let c2 = open_and_migrate(":memory:").unwrap();
+        let report = apply_import(&c2, &exported, false).unwrap();
+        assert!(
+            report.invalid_providers.is_empty(),
+            "openai_responses 是合法族，不应进无效清单：{:?}",
+            report.invalid_providers
+        );
+        assert_eq!(report.providers_imported, 2);
+        assert_eq!(
+            report.models_imported, 1,
+            "两张供应商表都要落地，模型随 p1 导入"
+        );
+
+        let providers = crate::store::provider_list(&c2).unwrap();
+        let jy = providers.iter().find(|p| p.name == "基元律动").unwrap();
+        assert_eq!(
+            jy.reasoning_effort_levels.as_deref(),
+            Some(
+                &[
+                    "low".to_string(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into()
+                ][..]
+            )
+        );
+        let resp = providers
+            .iter()
+            .find(|p| p.name == "Responses 上游")
+            .unwrap();
+        assert_eq!(resp.reasoning_effort_levels, None);
+
+        let m2 = crate::store::model_get_by_provider_name(&c2, &jy.id, "deepseek-flash")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            m2.reasoning_effort_levels.as_deref(),
+            Some(&["high".to_string()][..]),
+            "模型级声明应随导出/导入携带"
+        );
     }
 
     /// 远端 api_key 非空才覆盖；空不清空本地。

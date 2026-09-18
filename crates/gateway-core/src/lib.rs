@@ -5,11 +5,13 @@
 //! - `router` : 多渠道路由与故障转移执行器（M2 起填充）
 //! - `store`  : SQLite 唯一事实源 + 迁移执行器 + 异步日志管道
 //! - `server` : Axum 网关 —— 绑定/端口顺延、安全中间件、直通代理、healthz
+//! - `effort` : 推理档位值域声明与归一（供应商/模型级「上游认哪些值」）
 //! - `vault`  : OS 密钥环封装（供应商凭据生命周期）
 //! - `discover`: 上游模型发现（三家协议适配）
 
 pub mod codec;
 pub mod discover;
+pub mod effort;
 pub mod mcp;
 pub mod modality;
 pub mod netcfg;

@@ -223,6 +223,41 @@ pub struct OutputContract {
     pub validate_output: bool,
 }
 
+/// 某条渠道声明的「推理档位值域」（0011，见 `crate::effort`）。
+///
+/// 族级能力表（[`Capabilities::reasoning`]）只回答「这一族支不支持原生 effort」；
+/// 值域回答「这家上游具体认哪些写法」——两者互补：前者管映射方式，后者管取值。
+#[derive(Debug, Clone)]
+pub struct EffortPolicy {
+    /// 声明序值域（首项 = 自定义档位的默认档）
+    pub levels: Vec<String>,
+    /// WARN 文案用的来源描述（如 `供应商「基元律动」`）
+    pub source: String,
+}
+
+impl EffortPolicy {
+    /// 值域为空视同未声明（返回 None），避免调用方各写一遍判空。
+    pub fn new(levels: Option<&Vec<String>>, source: impl Into<String>) -> Option<Self> {
+        let levels = levels.filter(|l| !l.is_empty())?.clone();
+        Some(EffortPolicy {
+            levels,
+            source: source.into(),
+        })
+    }
+}
+
+/// 规划对 `reasoning_effort` 的落地动作（resolve 阶段真正改写请求）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EffortRewrite {
+    /// 保持入站值（域内可接受，或该族本来就不用 effort）
+    #[default]
+    Keep,
+    /// 丢弃参数（上游无法表达该诉求，不传 = 上游默认）
+    Clear,
+    /// 改写为域内档位
+    Set(String),
+}
+
 /// 一次请求在目标族的规划结果。
 #[derive(Debug)]
 pub struct CompatibilityPlan<'a> {
@@ -235,6 +270,8 @@ pub struct CompatibilityPlan<'a> {
     pub output_contract: Option<OutputContract>,
     /// 扩展工具折叠的身份映射（resolve 时写入 extensions[TOOL_IDENTITIES_KEY]）
     pub tool_identities: Option<Vec<Value>>,
+    /// 推理档位改写动作（0011；`Keep` = 不动）
+    pub reasoning_rewrite: EffortRewrite,
 }
 
 /// 规划应用产物：拒绝错误 / WARN 汇总 / 请求改写已完成。
@@ -248,10 +285,22 @@ pub struct PlanOutcome {
 
 // ================================================================ 规划
 
-/// 面向目标协议族规划一次请求的兼容性。
+/// 面向目标协议族规划一次请求的兼容性（不声明推理档位值域，值原样透传）。
 pub fn plan_compatibility<'a>(
     req: &CanonicalRequest,
     caps: &'a Capabilities,
+) -> CompatibilityPlan<'a> {
+    plan_compatibility_with(req, caps, None)
+}
+
+/// 带渠道声明的推理档位值域（0011）的规划入口。
+///
+/// `effort_policy` 为 None 时与 [`plan_compatibility`] 完全等价（未声明的供应商
+/// 行为字节级不变）。
+pub fn plan_compatibility_with<'a>(
+    req: &CanonicalRequest,
+    caps: &'a Capabilities,
+    effort_policy: Option<&EffortPolicy>,
 ) -> CompatibilityPlan<'a> {
     let mut plan = CompatibilityPlan {
         capabilities: caps,
@@ -262,10 +311,11 @@ pub fn plan_compatibility<'a>(
         tools: None,
         output_contract: None,
         tool_identities: None,
+        reasoning_rewrite: EffortRewrite::Keep,
     };
 
     plan_response_format(req, caps, &mut plan);
-    plan_reasoning(req, caps, &mut plan);
+    plan_reasoning(req, caps, effort_policy, &mut plan);
     plan_tools(req, caps, &mut plan);
     plan_tool_choice(req, &mut plan);
     plan_extension_fields(req, caps, &mut plan);
@@ -360,10 +410,52 @@ fn plan_response_format(req: &CanonicalRequest, caps: &Capabilities, plan: &mut 
     }
 }
 
-fn plan_reasoning(req: &CanonicalRequest, caps: &Capabilities, plan: &mut CompatibilityPlan) {
+fn plan_reasoning(
+    req: &CanonicalRequest,
+    caps: &Capabilities,
+    effort_policy: Option<&EffortPolicy>,
+    plan: &mut CompatibilityPlan,
+) {
     let Some(effort) = &req.params.reasoning_effort else {
         return;
     };
+    // 原生 effort 族：先按渠道声明的值域归位（0011）。
+    // 未声明值域的渠道与旧行为完全一致（原样透传）。
+    if caps.reasoning == EffortMode::Native {
+        if let Some(policy) = effort_policy {
+            match crate::effort::place(effort, &policy.levels) {
+                crate::effort::Placement::Passthrough => {
+                    plan.reasoning = Some(Decision {
+                        action: DecisionAction::Supported,
+                        reason: format!("reasoning.effort({effort}) 原生透传"),
+                    });
+                }
+                crate::effort::Placement::Drop => {
+                    plan.reasoning_rewrite = EffortRewrite::Clear;
+                    plan.reasoning = Some(Decision {
+                        action: DecisionAction::Ignored,
+                        reason: format!(
+                            "reasoning.effort({effort})：{}声明档位为 {}，无法表达「关闭推理」→ 已丢弃该参数按上游默认处理",
+                            policy.source,
+                            policy.levels.join("/")
+                        ),
+                    });
+                }
+                crate::effort::Placement::Map(next) => {
+                    plan.reasoning_rewrite = EffortRewrite::Set(next.clone());
+                    plan.reasoning = Some(Decision {
+                        action: DecisionAction::Degraded,
+                        reason: format!(
+                            "reasoning.effort({effort})：{}声明档位为 {}，已改写为 {next}",
+                            policy.source,
+                            policy.levels.join("/")
+                        ),
+                    });
+                }
+            }
+            return;
+        }
+    }
     let decision = match caps.reasoning {
         EffortMode::Native => Decision {
             action: DecisionAction::Supported,
@@ -634,7 +726,15 @@ impl<'a> CompatibilityPlan<'a> {
             }
         }
 
-        // 2) 拒绝优先：tools 超限 > response_format > tool_choice（首个 Rejected 即终止）
+        // 2) 应用推理档位改写（0011）：必须在编码之前落地 —— 各 encoder 只读
+        //    `params.reasoning_effort`，改写在这里发生，encoder 侧零改动。
+        match std::mem::take(&mut self.reasoning_rewrite) {
+            EffortRewrite::Keep => {}
+            EffortRewrite::Clear => req.params.reasoning_effort = None,
+            EffortRewrite::Set(next) => req.params.reasoning_effort = Some(next),
+        }
+
+        // 3) 拒绝优先：tools 超限 > response_format > tool_choice（首个 Rejected 即终止）
         for (path, decision) in [
             ("tools", self.tools.take()),
             ("response_format", self.response_format.take()),

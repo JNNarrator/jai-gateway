@@ -28,6 +28,8 @@ export interface ProviderDto {
   weight: number;
   extraHeaders?: string | null;
   website?: string | null;
+  /** 供应商级「推理档位值域」声明（0011）：null/空 = 未声明 ⇒ 原样透传 */
+  reasoningEffortLevels?: string[] | null;
   lastOkAt?: number | null;
   lastErrAt?: number | null;
   lastErrMsg?: string | null;
@@ -51,6 +53,8 @@ export interface ModelRow {
   inputModalities: Modality[] | null;
   /** 输出模态集合：null=未知/未标注 */
   outputModalities: Modality[] | null;
+  /** 模型级「推理档位值域」声明（0011）：null = 继承供应商级 */
+  reasoningEffortLevels?: string[] | null;
 }
 
 export interface GatewayKeyInfo {

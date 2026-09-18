@@ -47,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "JIYUANLVDONG_API_KEY"
                     }),
                     website: None,
+                    reasoning_effort_levels: None,
                     last_ok_at: None,
                     last_err_at: None,
                     last_err_msg: None,
@@ -77,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "JIYUANLVDONG_API_KEY"
                     }),
                     website: None,
+                    reasoning_effort_levels: None,
                     last_ok_at: None,
                     last_err_at: None,
                     last_err_msg: None,

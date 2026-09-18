@@ -19,6 +19,7 @@ import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/common/PageHeader";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
+import { EffortLevelsEditor } from "@/components/common/EffortLevelsEditor";
 import { FormField } from "@/components/common/FormField";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Badge } from "@/components/ui/badge";
@@ -213,6 +214,10 @@ export function ProvidersPage() {
               })
             }
             onToggle={(v) => act(p.id, () => api.providerSetEnabled(p.id, v))}
+            onSetReasoningLevels={async (levels) => {
+              await api.providerSetReasoningLevels(p.id, levels);
+              setList(await api.providerList());
+            }}
             onDelete={() => setConfirmDelete(p)}
           />
         ))}
@@ -263,6 +268,7 @@ function ProviderCard(props: {
   onDiscover: () => void;
   onEdit: () => void;
   onToggle: (enabled: boolean) => void;
+  onSetReasoningLevels: (levels: string[] | null) => Promise<void>;
   onDelete: () => void;
 }) {
   const { p } = props;
@@ -319,6 +325,20 @@ function ProviderCard(props: {
                 官网
               </button>
             )}
+            {/* 推理档位值域（0011）：供应商级默认，模型行可覆盖。
+                未声明的渠道 JAI 原样透传 reasoning_effort，上游不认就 400。 */}
+            <div className="mt-1">
+              <EffortLevelsEditor
+                verbose
+                levels={p.reasoningEffortLevels ?? null}
+                scopeLabel={`供应商 ${p.name}`}
+                onChange={(levels) =>
+                  props
+                    .onSetReasoningLevels(levels)
+                    .catch((e) => toast(String(e), "err"))
+                }
+              />
+            </div>
             {(p.lastOkAt || p.lastErrAt) && (
               <div className="mt-1 text-xs">
                 {lastFailed ? (

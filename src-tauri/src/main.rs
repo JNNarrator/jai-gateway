@@ -152,6 +152,8 @@ pub struct ProviderDto {
     pub weight: i64,
     pub extra_headers: Option<String>,
     pub website: Option<String>,
+    /// 供应商级「推理档位值域」声明（0011）：None/空 = 未声明 ⇒ 原样透传
+    pub reasoning_effort_levels: Option<Vec<String>>,
     pub last_ok_at: Option<i64>,
     pub last_err_at: Option<i64>,
     pub last_err_msg: Option<String>,
@@ -169,6 +171,7 @@ fn to_dto(p: ProviderRow) -> ProviderDto {
         weight: p.weight,
         extra_headers: p.extra_headers,
         website: p.website,
+        reasoning_effort_levels: p.reasoning_effort_levels,
         last_ok_at: p.last_ok_at,
         last_err_at: p.last_err_at,
         last_err_msg: p.last_err_msg,
@@ -247,6 +250,7 @@ async fn provider_create(
         last_ok_at: None,
         last_err_at: None,
         last_err_msg: None,
+        reasoning_effort_levels: None,
         created_at: store::now_ms(),
         updated_at: store::now_ms(),
     };
@@ -610,6 +614,44 @@ async fn model_set_modalities(
             )
         })
         .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
+}
+
+/// 模型级「推理档位值域」声明（0011）。`None`/空数组 = 回到继承供应商级。
+#[tauri::command]
+async fn model_set_reasoning_levels(
+    core: State<'_, AppCore>,
+    model_id: String,
+    levels: Option<Vec<String>>,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::model_set_reasoning_levels(c, &model_id, levels.as_deref()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
+}
+
+/// 供应商级「推理档位值域」声明（0011）。`None`/空数组 = 未声明 ⇒ 原样透传。
+#[tauri::command]
+async fn provider_set_reasoning_levels(
+    core: State<'_, AppCore>,
+    id: String,
+    levels: Option<Vec<String>>,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::provider_set_reasoning_levels(c, &id, levels.as_deref()))
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(join_err)??;
@@ -2776,6 +2818,8 @@ fn main() {
             model_set_alias,
             model_toggle,
             model_set_modalities,
+            model_set_reasoning_levels,
+            provider_set_reasoning_levels,
             gateway_key_info,
             gateway_key_reveal,
             gateway_key_regenerate,

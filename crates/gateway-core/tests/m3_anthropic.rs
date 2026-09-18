@@ -122,6 +122,7 @@ async fn fixture(upstream_status: u16) -> Fixture {
                 last_ok_at: None,
                 last_err_at: None,
                 last_err_msg: None,
+                reasoning_effort_levels: None,
                 created_at: now,
                 updated_at: now,
             },

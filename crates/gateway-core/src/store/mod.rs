@@ -116,6 +116,10 @@ pub struct ProviderRow {
     pub api_key: Option<String>,
     /// 供应商官网（可空）
     pub website: Option<String>,
+    /// 供应商级「推理档位值域」声明（0011 起，见 `crate::effort`）：
+    /// None/空 = 未声明 ⇒ 原样透传；模型行非空时覆盖本级（route_candidates 用
+    /// COALESCE 解析）。
+    pub reasoning_effort_levels: Option<Vec<String>>,
     pub last_ok_at: Option<i64>,
     pub last_err_at: Option<i64>,
     pub last_err_msg: Option<String>,
@@ -140,11 +144,14 @@ pub struct ModelRow {
     pub input_modalities: Option<Vec<Modality>>,
     /// 输出模态集合：None = 未知/未标注。
     pub output_modalities: Option<Vec<Modality>>,
+    /// 模型级「推理档位值域」声明（0011 起，见 `crate::effort`）：
+    /// None = 继承供应商级（或两处都未声明 ⇒ 原样透传）。
+    pub reasoning_effort_levels: Option<Vec<String>>,
 }
 
 // ================================================================ providers
 
-const PROVIDER_COLS: &str = "id,name,base_url,family,enabled,priority,weight,extra_headers,api_key,website,last_ok_at,last_err_at,last_err_msg,created_at,updated_at";
+const PROVIDER_COLS: &str = "id,name,base_url,family,enabled,priority,weight,extra_headers,api_key,website,reasoning_effort_levels,last_ok_at,last_err_at,last_err_msg,created_at,updated_at";
 
 fn row_to_provider(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
     Ok(ProviderRow {
@@ -158,11 +165,14 @@ fn row_to_provider(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
         extra_headers: r.get(7)?,
         api_key: r.get(8)?,
         website: r.get(9)?,
-        last_ok_at: r.get(10)?,
-        last_err_at: r.get(11)?,
-        last_err_msg: r.get(12)?,
-        created_at: r.get(13)?,
-        updated_at: r.get(14)?,
+        reasoning_effort_levels: crate::effort::parse_opt(
+            r.get::<_, Option<String>>(10)?.as_deref(),
+        ),
+        last_ok_at: r.get(11)?,
+        last_err_at: r.get(12)?,
+        last_err_msg: r.get(13)?,
+        created_at: r.get(14)?,
+        updated_at: r.get(15)?,
     })
 }
 
@@ -170,6 +180,8 @@ fn row_to_model(r: &rusqlite::Row) -> rusqlite::Result<ModelRow> {
     let legacy = r.get::<_, Option<i64>>(7)?.map(|v| v != 0);
     let input_modalities = modality::parse_opt(r.get::<_, Option<String>>(8)?.as_deref());
     let output_modalities = modality::parse_opt(r.get::<_, Option<String>>(9)?.as_deref());
+    let reasoning_effort_levels =
+        crate::effort::parse_opt(r.get::<_, Option<String>>(10)?.as_deref());
     Ok(ModelRow {
         id: r.get(0)?,
         provider_id: r.get(1)?,
@@ -185,13 +197,14 @@ fn row_to_model(r: &rusqlite::Row) -> rusqlite::Result<ModelRow> {
         ),
         input_modalities,
         output_modalities,
+        reasoning_effort_levels,
     })
 }
 
 pub fn provider_insert(c: &Connection, p: &ProviderRow) -> Result<(), StoreError> {
     c.execute(
         &format!(
-            "INSERT INTO providers({PROVIDER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"
+            "INSERT INTO providers({PROVIDER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
         ),
         params![
             p.id,
@@ -204,6 +217,7 @@ pub fn provider_insert(c: &Connection, p: &ProviderRow) -> Result<(), StoreError
             p.extra_headers,
             p.api_key,
             p.website,
+            crate::effort::encode_opt(p.reasoning_effort_levels.as_deref()),
             p.last_ok_at,
             p.last_err_at,
             p.last_err_msg,
@@ -343,7 +357,7 @@ pub fn provider_delete(c: &Connection, id: &str) -> Result<usize, StoreError> {
 
 // ================================================================ models
 
-const MODEL_COLS: &str = "id,provider_id,model_name,upstream_model_id,context_window,max_output_tokens,enabled,supports_multimodal,input_modalities,output_modalities";
+const MODEL_COLS: &str = "id,provider_id,model_name,upstream_model_id,context_window,max_output_tokens,enabled,supports_multimodal,input_modalities,output_modalities,reasoning_effort_levels";
 
 /// Upsert 模型行（0010：入参为输入/输出模态集合，取代 0009 的 vision 布尔）。
 ///
@@ -363,7 +377,7 @@ pub fn model_upsert(
     let derived = modality::derive_supports_multimodal(input_modalities, None);
     c.execute(
         &format!(
-            "INSERT INTO models({MODEL_COLS}) VALUES (?1,?2,?3,NULL,?4,?5,1,?6,?7,?8)
+            "INSERT INTO models({MODEL_COLS}) VALUES (?1,?2,?3,NULL,?4,?5,1,?6,?7,?8,NULL)
              ON CONFLICT(provider_id, model_name) DO UPDATE SET
                context_window=excluded.context_window,
                max_output_tokens=excluded.max_output_tokens,
@@ -468,6 +482,34 @@ pub fn model_set_upstream(
     Ok(())
 }
 
+/// 模型级「推理档位值域」声明（0011）。`None`/空 = 回到「继承供应商级」。
+pub fn model_set_reasoning_levels(
+    c: &Connection,
+    model_id: &str,
+    levels: Option<&[String]>,
+) -> Result<(), StoreError> {
+    let encoded = crate::effort::encode_opt(levels);
+    c.execute(
+        "UPDATE models SET reasoning_effort_levels=?1 WHERE id=?2",
+        params![encoded, model_id],
+    )?;
+    Ok(())
+}
+
+/// 供应商级「推理档位值域」声明（0011）。`None`/空 = 回到「未声明 ⇒ 原样透传」。
+pub fn provider_set_reasoning_levels(
+    c: &Connection,
+    id: &str,
+    levels: Option<&[String]>,
+) -> Result<(), StoreError> {
+    let encoded = crate::effort::encode_opt(levels);
+    c.execute(
+        "UPDATE providers SET reasoning_effort_levels=?1, updated_at=?2 WHERE id=?3",
+        params![encoded, now_ms(), id],
+    )?;
+    Ok(())
+}
+
 /// 路由候选查询 —— storage §3 定案 SQL。按 (priority, rowid) 序逐渠道尝试。
 #[derive(Debug, Clone)]
 pub struct RouteCandidate {
@@ -488,6 +530,9 @@ pub struct RouteCandidate {
     /// 健康信息：用于健康感知排序（最近失败/最近成功）
     pub last_ok_at: Option<i64>,
     pub last_err_at: Option<i64>,
+    /// 该渠道出站时的「推理档位值域」（0011）：模型级优先、回落供应商级；
+    /// 两级皆未声明 → None（原样透传，见 `crate::effort`）。
+    pub reasoning_effort_levels: Option<Vec<String>>,
 }
 
 pub fn route_candidates(
@@ -496,7 +541,8 @@ pub fn route_candidates(
 ) -> Result<Vec<RouteCandidate>, StoreError> {
     let sql = "SELECT p.id, p.name, p.priority, p.base_url, p.family, p.extra_headers,
                 p.api_key, p.website, m.upstream_model_id, m.max_output_tokens, p.weight,
-                p.last_ok_at, p.last_err_at
+                p.last_ok_at, p.last_err_at,
+                COALESCE(m.reasoning_effort_levels, p.reasoning_effort_levels) AS effort_levels
          FROM models m JOIN providers p ON p.id = m.provider_id
          WHERE m.model_name = ?1 AND m.enabled = 1 AND p.enabled = 1
          ORDER BY p.priority ASC, m.rowid ASC";
@@ -517,6 +563,9 @@ pub fn route_candidates(
                 weight: r.get(10)?,
                 last_ok_at: r.get(11)?,
                 last_err_at: r.get(12)?,
+                reasoning_effort_levels: crate::effort::parse_opt(
+                    r.get::<_, Option<String>>(13)?.as_deref(),
+                ),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

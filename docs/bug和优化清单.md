@@ -432,6 +432,38 @@
     避免把 360 分钟的推送也压成 30 分钟。需要一个可控时钟的测试。
   - 影响面：仅调度节奏，不影响数据正确性（`should_pull` 的 last-write-wins 仍会拦住重复导入）。
 
+- [x] 21. **zcode 经 JAI 测试连接恒失败：「Provider rejected the model request.」**
+  - 现象：zcode 自定义 Provider（`openai-responses` → `http://127.0.0.1:1314/v1`，模型
+    `基元律动/deepseek-flash`）连接测试与真实会话全失败；报错文案由 zcode 生成
+    （`zcode.cjs` 把上游 400/422 统一包装成这句），**看起来像模型名不对，实际无关**。
+  - 定位过程（从日志而非猜测入手）：`request_logs` 里同文案 400 累计 53 次，`error_summary`
+    是上游原文 —— `{"code":"UNSUPPORTED_FIELD","message":"DeepSeek reasoning_effort 只支持
+    low、medium、high、xhigh、max","data":{"field":"reasoning_effort"}}`；zcode 的
+    `rollout/model-io-*.jsonl` 显示失败请求全部带 `reasoning.effort=none`，而**直连**基元律动
+    （不经 JAI）的会话带 `effort=max` 全部 200 —— 值域就是分水岭。
+  - 根因：族级能力表把 `openai_compat` 的 reasoning 定为 `EffortMode::Native` ⇒ 客户端值
+    **原样透传**；而「这家上游认哪些写法」无人负责。zcode 的 provider 没有 reasoning 元数据时
+    按「无推理」发 `none`，恰好撞上只认 low..max 的上游。
+  - 修复（2026-09-18，迁移 0011 + `crate::effort`）：供应商级/模型级「推理档位值域」声明
+    （模型级覆盖供应商级，`NULL` = 未声明 ⇒ 原样透传，老供应商零影响）；
+    `plan_reasoning` 归位（域内透传 / `none` 无档位则丢弃 / 其余收敛到最近档）；
+    `CompatibilityPlan::resolve` 首次真正改写 `params.reasoning_effort`；
+    直通路径 body 同步归一（顶层与嵌套两种形态）。
+  - 回归：`tests/m9_capability.rs` 新增 6 条（`m9_7` 复刻本故障、`m9_11` 直通路径、`m9_12`
+    未声明不干预），`effort.rs` 13 条单测，`import.rs` 1 条 0011 往返；真机复验上游
+    不带 `reasoning_effort` → 200、带 `"low"` → 200。
+  - **注意（用户须知）**：需重新构建并重启 JAI 才生效（重启自动迁移到 0011）；到「供应商」页把
+    基元律动的档位填成 `low,medium,high,xhigh,max` 即可，zcode 侧不用改任何配置。
+  - 附带澄清（曾被误判为根因）：`供应商/模型` 限定名是**支持**的（`split_once('/')`），
+    但必须正斜杠 —— 反斜杠会当字面量 → 404（同日 08:54 的两次 404 即此）。
+
+- [x] 22. 导入配置时 `openai_responses` 供应商被判「未知协议族」（顺手修）
+  - 位置：`store/import.rs` 的 family 白名单 `matches!(family, "openai_compat" | "anthropic" | "gemini")`。
+  - 后果：该族供应商无法随 WebDAV / 导出配置同步到另一台机器（0003 起它是合法族，
+    `providers.family` 的 CHECK 也允许它）。
+  - 修复：白名单补齐 `openai_responses`；回归并入
+    `store::import::tests::roundtrip_carries_reasoning_effort_levels_and_responses_family`。
+
 
 ## 2. 优化清单
 

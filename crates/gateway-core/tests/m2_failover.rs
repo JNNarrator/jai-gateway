@@ -107,6 +107,7 @@ async fn fixture(priority_a: i64, priority_b: i64, status_a: u16, status_b: u16)
         last_ok_at: None,
         last_err_at: None,
         last_err_msg: None,
+        reasoning_effort_levels: None,
         created_at: now,
         updated_at: now,
     };

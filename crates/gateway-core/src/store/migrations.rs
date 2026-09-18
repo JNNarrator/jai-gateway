@@ -40,6 +40,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0010_model_modalities",
         include_str!("migrations/0010_model_modalities.sql"),
     ),
+    (
+        "0011_reasoning_effort_levels",
+        include_str!("migrations/0011_reasoning_effort_levels.sql"),
+    ),
 ];
 
 #[cfg(test)]

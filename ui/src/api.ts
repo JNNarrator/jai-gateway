@@ -68,6 +68,9 @@ export const api = {
     ),
   providerDiscoverModels: (id: string) =>
     invoke<[number, number]>("provider_discover_models", { id }),
+  /** 供应商级推理档位值域（0011）：null/空 = 未声明 ⇒ 原样透传 */
+  providerSetReasoningLevels: (id: string, levels: string[] | null) =>
+    invoke<void>("provider_set_reasoning_levels", { id, levels }),
   openWebsite: (url: string) => openUrl(url),
 
   // 模型
@@ -90,6 +93,10 @@ export const api = {
     outputModalities: Modality[] | null,
   ) =>
     invoke<void>("model_set_modalities", { modelId, inputModalities, outputModalities }),
+  /** 推理档位值域（0011）：数组 = 声明序值域；null/空 = 未声明（模型级 → 继承供应商级）
+   *  未声明的渠道 JAI 原样透传 reasoning_effort，上游不认就会 400。 */
+  modelSetReasoningLevels: (modelId: string, levels: string[] | null) =>
+    invoke<void>("model_set_reasoning_levels", { modelId, levels }),
 
   // 网关密钥
   gatewayKeyInfo: () => invoke<GatewayKeyInfo | null>("gateway_key_info"),

@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **zcode 经 JAI 测试连接恒失败：「Provider rejected the model request.」**（真机 2026-09-18）：
+  - 现象：zcode 自定义 Provider（`openai-responses` → `http://127.0.0.1:1314/v1`）选
+    `基元律动/deepseek-flash`，测试连接与真实会话全部失败；报错文案是 zcode 把上游
+    400/422 统一包装后的产物，看起来像「模型名不对」，**实际与模型名无关**。
+  - 根因：zcode 发 `reasoning:{"effort":"none"}`（其 provider 未声明推理能力时按「无推理」发 none），
+    而 JAI 的族级能力表把 `openai_compat` 的 reasoning 定为 `EffortMode::Native` ⇒
+    **客户端值原样透传**；上游基元律动只认 `low/medium/high/xhigh/max` →
+    400 `UNSUPPORTED_FIELD`（`request_logs` 里同一文案累计 53 次）。「客户端参数值 ∈ 上游值域」
+    这一步此前无人负责：族级能力只回答「这一族支不支持原生 effort」，管不了「这家上游认哪些写法」。
+  - 修复（迁移 0011 + `effort.rs`）：新增**供应商级/模型级「推理档位值域」声明**
+    （`providers/models.reasoning_effort_levels`，模型级覆盖供应商级，`NULL`/空 = 未声明）。
+    规划层 `plan_reasoning` 按值域归位：域内值原样透传；关闭语义（`none`/`off`/`disabled`）
+    在域内无对应档位时**丢弃该参数**（不传 = 上游默认，而不是硬塞一个注定 400 的值）；
+    其余未命中档位**收敛到域内最近档**（低于下限取最低、高于上限取最高）。
+    `CompatibilityPlan::resolve` 首次真正改写 `params.reasoning_effort`（此前只收 WARN 不改写），
+    各 encoder 零改动。**同族直通路径**同步归一（顶层 `reasoning_effort` 与嵌套 `reasoning.effort`
+    两种形态），未声明值域的渠道整段短路、请求体逐字节不变。
+  - 向后兼容：未声明值域的供应商行为不变（`m9_12` 断言 `none` 仍原样透传）。
+  - 回归：`tests/m9_capability.rs` 新增 6 条（`m9_7` 复刻本次故障：`none` 应被丢弃且不回 400、
+    `m9_8` minimal→low、`m9_9` 域内透传、`m9_10` 模型级覆盖供应商级、`m9_11` 直通路径归一、
+    `m9_12` 未声明不干预）；`effort.rs` 13 条单测覆盖值域解析/归一/空壳 `reasoning` 摘除。
+  - 真机复验：上游直连不带 `reasoning_effort` → 200、带 `"low"` → 200（即修复后 JAI 的两种出站形态）。
+  - UI：供应商卡片「档位 …」+ 模型表「档位?」芯片（就地编辑、预设值域、清除即未声明，不新增表格列
+    以免窄窗横向溢出回归）；每次丢弃/改写留一条 `CapabilityWarn` 结构化日志。
+  - 文档：`docs/zcode接入.md` 补「模型名怎么填（必须正斜杠）」与「推理档位声明」两节，
+    并把排查入口改为先看 JAI 日志页的 `error_summary`（不再从模型名上找原因）。
+
+### Fixed（顺手修）
+- **导入配置时 `openai_responses` 供应商被判为「未知协议族」**：`store/import.rs` 的 family
+  白名单漏了 `openai_responses`（0003 起已是合法族，`providers.family` 的 CHECK 也允许它），
+  导致该族供应商无法随 WebDAV / 导出配置同步到另一台机器。已补齐白名单。
+
 ## [0.2.5] - 2026-09-17
 
 ### Fixed

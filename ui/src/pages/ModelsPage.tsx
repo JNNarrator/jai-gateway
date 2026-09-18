@@ -6,6 +6,7 @@ import { toast } from "../lib/toast";
 import { copyText } from "../lib/clipboard";
 import { PageHeader } from "@/components/common/PageHeader";
 import { EmptyState } from "@/components/common/EmptyState";
+import { EffortLevelsEditor } from "@/components/common/EffortLevelsEditor";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -190,6 +191,10 @@ export function ModelsPage() {
                     await api.modelSetModalities(m.id, input, output);
                     setModels(await api.modelList(selId));
                   }}
+                  onSetReasoningLevels={async (levels) => {
+                    await api.modelSetReasoningLevels(m.id, levels);
+                    setModels(await api.modelList(selId));
+                  }}
                 />
               ))}
             </TableBody>
@@ -216,11 +221,13 @@ function ModelRowEditor({
   onSave,
   onToggle,
   onSetModalities,
+  onSetReasoningLevels,
 }: {
   m: ModelRow;
   onSave: (ctx: number | null, out: number, alias: string | null) => Promise<void>;
   onToggle: (enabled: boolean) => Promise<void>;
   onSetModalities: (input: Modality[] | null, output: Modality[] | null) => Promise<void>;
+  onSetReasoningLevels: (levels: string[] | null) => Promise<void>;
 }) {
   const [ctx, setCtx] = useState(m.contextWindow ?? 128000);
   const [out, setOut] = useState(m.maxOutputTokens);
@@ -255,6 +262,15 @@ function ModelRowEditor({
           {/* <lg 时「模态（入/出）」列被隐藏（列降级，见 §3 第 5 条），
               模态信息降级为一行紧凑 badge，避免信息凭空消失。 */}
           <ModalityCompact m={m} />
+          {/* 推理档位值域（0011）：同理不新增列（7 列已吃掉全部宽度），
+              以紧凑芯片就地编辑，避免窄窗横向溢出回归。 */}
+          <EffortLevelsEditor
+            levels={m.reasoningEffortLevels ?? null}
+            scopeLabel={`模型 ${m.modelName}`}
+            onChange={(levels) =>
+              onSetReasoningLevels(levels).catch((e) => toast(String(e), "err"))
+            }
+          />
         </span>
       </TableCell>
       <TableCell>
