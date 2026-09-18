@@ -1568,8 +1568,11 @@ pub struct RenderState {
     pub started: bool,
     /// 当前 item 在 output[] 中的序号
     pub output_index: usize,
-    /// 当前文本 item 是否已开
-    pub item_started: bool,
+    /// 当前文本 item（`msg_*`）是否已开。
+    /// **必须只由文本路径读写**：早期工具调用复用了这个标志，导致「先工具调用、后文本」
+    /// 的流里文本增量不再补发 `output_item.added` / `content_part.added`，
+    /// 严格客户端（zcode / AI SDK）就会报 `text part msg_* not found` 并整轮失败。
+    pub msg_started: bool,
     /// 当前文本 item 已累积的文本（用于 output_text.done / content_part.done）
     pub current_text: String,
     /// 当前 reasoning item 是否已开（thinking 增量流）
@@ -1580,6 +1583,9 @@ pub struct RenderState {
     pub tool_identities: Vec<ToolIdentity>,
     /// 当前活跃 tool call 的还原类型（function_call / shell_call / …）
     pub active_tool_type: String,
+    /// 当前活跃 tool call 的 **item id**（`ToolCallStart` 登记的那个）。
+    /// 参数增量/结束帧必须复用它；早期写死 `fc_{index}_pending`，与登记 id 不一致。
+    pub active_tool_item_id: String,
 }
 
 impl RenderState {
@@ -1593,6 +1599,25 @@ impl RenderState {
             "output": [],
         })
     }
+}
+
+/// 当前活跃 tool call 的 item id；未登记时退回占位 id，避免 panic。
+fn tool_item_id(st: &RenderState) -> String {
+    if st.active_tool_item_id.is_empty() {
+        format!("fc_{}_pending", st.output_index)
+    } else {
+        st.active_tool_item_id.clone()
+    }
+}
+
+/// 从 `fc_{index}_{call_id}` 里取回 call_id；取不到则退回 `call_{index}`。
+fn call_id_of(item_id: &str, index: usize) -> String {
+    item_id
+        .splitn(3, '_')
+        .nth(2)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call_{index}"))
 }
 
 /// 渲染单个 IR 流事件为 Responses SSE 的 `data: {...}` 帧。
@@ -1628,7 +1653,8 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
         Ev::Start { model: _ } => {
             st.started = true;
             st.output_index = 0;
-            st.item_started = false;
+            st.msg_started = false;
+            st.active_tool_item_id.clear();
             st.current_text.clear();
             st.reasoning_started = false;
             st.current_reasoning.clear();
@@ -1651,8 +1677,8 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             }
             let mut out = Vec::new();
             close_reasoning(st, &mut out);
-            if !st.item_started {
-                st.item_started = true;
+            if !st.msg_started {
+                st.msg_started = true;
                 st.current_text.clear();
                 out.push(
                     json!({
@@ -1732,7 +1758,8 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             let mut out = Vec::new();
             close_reasoning(st, &mut out);
             let item_id = format!("fc_{index}_{id}");
-            st.item_started = true;
+            // 登记 item id 供参数增量/结束帧复用；**不碰** msg_started（见字段注释）
+            st.active_tool_item_id = item_id.clone();
             // 扩展工具折叠还原（§10）：按上游 function 名还原 item 类型
             let item_type = restore_tool_type(name, &st.tool_identities);
             st.active_tool_type = item_type.to_string();
@@ -1760,16 +1787,17 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             };
             vec![json!({
                 "type": event,
-                "item_id": format!("fc_{index}_{}", "pending"),
+                "item_id": tool_item_id(st),
                 "output_index": st.output_index,
                 "delta": args_fragment,
             })
             .to_string()]
         }
         Ev::ToolCallEnd { index } => {
+            let item_id = tool_item_id(st);
             let mut out = vec![json!({
                 "type": "response.function_call_arguments.done",
-                "item_id": format!("fc_{index}_{}", "pending"),
+                "item_id": item_id,
                 "output_index": st.output_index,
             })
             .to_string()];
@@ -1777,13 +1805,8 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             if item_type.is_empty() {
                 item_type = "function_call".to_string();
             }
-            let item = extended_tool_item(
-                &format!("fc_{index}_{}", "pending"),
-                &format!("call_{index}"),
-                "",
-                "",
-                &item_type,
-            );
+            let item =
+                extended_tool_item(&item_id, &call_id_of(&item_id, *index), "", "", &item_type);
             out.push(
                 json!({
                     "type": "response.output_item.done",
@@ -1793,14 +1816,15 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                 .to_string(),
             );
             st.output_index += 1;
-            st.item_started = false;
+            st.active_tool_item_id.clear();
+            st.active_tool_type.clear();
             out
         }
         Ev::Finish { stop_reason, usage } => {
             let mut out = Vec::new();
             // 纯 thinking 响应（无 text/tool）：先关闭 reasoning item 再收尾
             close_reasoning(st, &mut out);
-            if st.item_started {
+            if st.msg_started {
                 let item_id = format!("msg_{}", st.response_id);
                 let text = std::mem::take(&mut st.current_text);
                 out.push(
@@ -1838,7 +1862,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                     })
                     .to_string(),
                 );
-                st.item_started = false;
+                st.msg_started = false;
             }
             let status = match stop_reason {
                 StopReason::MaxTokens | StopReason::SafetyBlock => "incomplete",
@@ -2211,6 +2235,7 @@ mod tests {
                 provider_name: "search".into(),
             }],
             active_tool_type: "custom_tool_call".into(),
+            active_tool_item_id: String::new(),
             ..Default::default()
         };
         let delta = render_stream_event(
@@ -2746,6 +2771,123 @@ mod tests {
         )));
         assert!(frames.iter().any(|f| f.contains("get_weather")));
         assert!(frames.last().unwrap().contains("[DONE]"));
+    }
+
+    /// 回归（zcode「Model request failed.」）：**先工具调用、后文本**的混排流里，
+    /// 文本增量必须自带 `msg_*` 的 output_item.added + content_part.added，
+    /// 且工具参数增量/结束帧必须复用 ToolCallStart 登记的那个 item id。
+    ///
+    /// 早期实现用同一个 `item_started` 标志表示「文本 item 已开」，ToolCallStart 会把它
+    /// 置 true，于是随后的文本增量不再补发 item/part 登记 → 严格客户端（zcode 内的
+    /// AI SDK）抛 `text part msg_* not found` → 整轮 turn 失败（无 HTTP 状态、reason=unknown）。
+    #[test]
+    fn render_stream_tool_then_text_keeps_item_ids_consistent() {
+        let mut st = RenderState {
+            response_id: "resp_x".into(),
+            model: "deepseek-flash".into(),
+            ..Default::default()
+        };
+        render_stream_event(
+            &StreamEvent::Start {
+                model: "deepseek-flash".into(),
+            },
+            &mut st,
+        );
+
+        // 工具调用先到
+        let tool_start = render_stream_event(
+            &StreamEvent::ToolCallStart {
+                index: 0,
+                id: "call_abc".into(),
+                name: "Bash".into(),
+            },
+            &mut st,
+        );
+        let added: Value = serde_json::from_str(&tool_start[0]).unwrap();
+        let tool_item_id = added["item"]["id"].as_str().unwrap().to_string();
+        assert_eq!(tool_item_id, "fc_0_call_abc");
+
+        let args = render_stream_event(
+            &StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                args_fragment: "{\"cmd\":\"ls\"}".into(),
+            },
+            &mut st,
+        );
+        let delta: Value = serde_json::from_str(&args[0]).unwrap();
+        assert_eq!(
+            delta["item_id"].as_str().unwrap(),
+            tool_item_id,
+            "参数增量必须复用登记 id（早期写死 fc_0_pending）"
+        );
+
+        let end = render_stream_event(&StreamEvent::ToolCallEnd { index: 0 }, &mut st);
+        let done: Value = serde_json::from_str(&end[0]).unwrap();
+        assert_eq!(done["item_id"].as_str().unwrap(), tool_item_id);
+        assert_eq!(end[1..].len(), 1);
+        let done_item: Value = serde_json::from_str(&end[1]).unwrap();
+        assert_eq!(done_item["item"]["id"].as_str().unwrap(), tool_item_id);
+        assert_eq!(
+            done_item["item"]["call_id"].as_str().unwrap(),
+            "call_abc",
+            "call_id 不能丢成 call_0"
+        );
+
+        // 随后才出现文本：必须补发 msg_* 的 item/part 登记
+        let txt = render_stream_event(
+            &StreamEvent::TextDelta {
+                text: "好了".into(),
+            },
+            &mut st,
+        );
+        let joined = txt.join("\n");
+        assert!(
+            joined.contains("response.output_item.added") && joined.contains("msg_resp_x"),
+            "文本增量前必须补发 output_item.added(msg_resp_x)：{joined}"
+        );
+        assert!(
+            joined.contains("response.content_part.added"),
+            "文本增量前必须补发 content_part.added：{joined}"
+        );
+        let delta_frame: Value = serde_json::from_str(txt.last().unwrap()).unwrap();
+        assert_eq!(delta_frame["type"], "response.output_text.delta");
+        assert_eq!(delta_frame["item_id"].as_str().unwrap(), "msg_resp_x");
+    }
+
+    /// 反向顺序（文本→工具）同样不许出现 id 漂移。
+    #[test]
+    fn render_stream_text_then_tool_keeps_ids() {
+        let mut st = RenderState {
+            response_id: "resp_y".into(),
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        render_stream_event(
+            &StreamEvent::Start {
+                model: "gpt-4o".into(),
+            },
+            &mut st,
+        );
+        let txt = render_stream_event(&StreamEvent::TextDelta { text: "hi".into() }, &mut st);
+        assert!(txt.iter().any(|f| f.contains("response.output_item.added")));
+
+        render_stream_event(
+            &StreamEvent::ToolCallStart {
+                index: 1,
+                id: "call_9".into(),
+                name: "Bash".into(),
+            },
+            &mut st,
+        );
+        let args = render_stream_event(
+            &StreamEvent::ToolCallArgsDelta {
+                index: 1,
+                args_fragment: "{}".into(),
+            },
+            &mut st,
+        );
+        let delta: Value = serde_json::from_str(&args[0]).unwrap();
+        assert_eq!(delta["item_id"].as_str().unwrap(), "fc_1_call_9");
     }
 
     #[test]
