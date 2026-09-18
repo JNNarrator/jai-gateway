@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-09-18
+
 ### Fixed
 - **zcode 经 JAI 测试连接恒失败：「Provider rejected the model request.」**（真机 2026-09-18）：
   - 现象：zcode 自定义 Provider（`openai-responses` → `http://127.0.0.1:1314/v1`）选
@@ -32,9 +34,8 @@ All notable changes to this project will be documented in this file.
   - 文档：`docs/zcode接入.md` 补「模型名怎么填（必须正斜杠）」与「推理档位声明」两节，
     并把排查入口改为先看 JAI 日志页的 `error_summary`（不再从模型名上找原因）。
 
-### Fixed（顺手修）
-- **导入配置时 `openai_responses` 供应商被判为「未知协议族」**：`store/import.rs` 的 family
-  白名单漏了 `openai_responses`（0003 起已是合法族，`providers.family` 的 CHECK 也允许它），
+- **导入配置时 `openai_responses` 供应商被判为「未知协议族」**（顺手修）：`store/import.rs` 的
+  family 白名单漏了 `openai_responses`（0003 起已是合法族，`providers.family` 的 CHECK 也允许它），
   导致该族供应商无法随 WebDAV / 导出配置同步到另一台机器。已补齐白名单。
 
 ## [0.2.5] - 2026-09-17
