@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Responses 流式渲染 item id/状态错乱：zcode 每轮都报「Model request failed.」**（bug 25）：
+  zcode 每次请求都已收到 `200 + text/event-stream`，却在流里拿到 error chunk，报
+  `reason=unknown`（无 HTTP 状态），而 JAI 侧 `request_logs` 记的是 `200 + tool_calls=N`
+  —— 看起来像上游抖动，实为自己渲染的流违反协议契约。客户端 cause 链给出铁证：
+  `UnknownError: text part msg_resp_jai_942 not found`（errorPhase=stream）。
+  - 「文本 item 已开」的标志被 `ToolCallStart` 复用 → **只调用工具、没有文本**的回复
+    收尾时，`Finish` 会为一个从未登记的 `msg_*` 发 `output_text.done`/`content_part.done`
+    → 客户端查不到该 text part → 整轮 turn 失败（错误恰好发生在流尾，与线上时间戳一致）；
+  - `ToolCallArgsDelta`/`ToolCallEnd` 写死 `fc_{index}_pending`，与 `ToolCallStart`
+    登记的 `fc_{index}_{call_id}` 不一致 → 参数增量引用不存在的 item；
+  - 修复：状态拆为 `msg_started` + `active_tool_item_id`；文本增量按 `msg_started` 补发
+    item/part 登记；工具增量/结束帧复用登记 id（`call_id` 从 id 反解）；纯工具调用不再发
+    `msg_*` 收尾帧。回归 3 条单测（含反证：恢复旧行为即变红）+ 真机逐流 id 一致性校验。
+
+
 ## [0.2.7] - 2026-09-18
 
 ### Fixed

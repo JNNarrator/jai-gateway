@@ -2854,6 +2854,90 @@ mod tests {
         assert_eq!(delta_frame["item_id"].as_str().unwrap(), "msg_resp_x");
     }
 
+    /// 回归（zcode 真机故障的最精确形态）：**只有工具调用、没有文本**的回复。
+    ///
+    /// 早期 `ToolCallStart` 把「文本 item 已开」的标志置 true，于是收尾时 `Finish` 分支会
+    /// 为一个**从未登记过**的 `msg_*` 发出 `output_text.done` / `content_part.done` /
+    /// `output_item.done` —— 严格客户端（zcode 内 AI SDK）查不到该 text part，抛
+    /// `text part msg_* not found`，整轮 turn 失败（错误恰好发生在流尾，与线上时间戳一致）。
+    #[test]
+    fn render_stream_tool_only_emits_no_bogus_message_frames() {
+        let mut st = RenderState {
+            response_id: "resp_z".into(),
+            model: "deepseek-flash".into(),
+            ..Default::default()
+        };
+        let mut frames: Vec<String> = Vec::new();
+        let mut feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
+            frames.extend(render_stream_event(&ev, st));
+        };
+        feed(
+            &mut st,
+            StreamEvent::Start {
+                model: "deepseek-flash".into(),
+            },
+            &mut frames,
+        );
+        for (i, call) in [(0usize, "call_a"), (1usize, "call_b")] {
+            feed(
+                &mut st,
+                StreamEvent::ToolCallStart {
+                    index: i,
+                    id: call.into(),
+                    name: "Bash".into(),
+                },
+                &mut frames,
+            );
+            feed(
+                &mut st,
+                StreamEvent::ToolCallArgsDelta {
+                    index: i,
+                    args_fragment: "{\"command\":\"pwd\"}".into(),
+                },
+                &mut frames,
+            );
+            feed(&mut st, StreamEvent::ToolCallEnd { index: i }, &mut frames);
+        }
+        feed(
+            &mut st,
+            StreamEvent::Finish {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            },
+            &mut frames,
+        );
+
+        let joined = frames.join("\n");
+        assert!(
+            !joined.contains("msg_resp_z"),
+            "纯工具调用回复不得出现 msg_* 伪帧（旧实现会发 output_text.done/content_part.done）:\n{joined}"
+        );
+        assert!(
+            !joined.contains("output_text.done") && !joined.contains("content_part.done"),
+            "纯工具调用回复不应有文本收尾帧:\n{joined}"
+        );
+        // 两个工具 item 的登记 id 与增量/结束帧必须一致
+        for call in ["fc_0_call_a", "fc_1_call_b"] {
+            assert!(
+                joined.contains(&format!("\"id\":\"{call}\"")),
+                "缺 {call} 的 output_item.added：{joined}"
+            );
+            assert!(
+                joined.contains(&format!("\"item_id\":\"{call}\"")),
+                "参数帧未复用登记 id {call}：{joined}"
+            );
+        }
+        assert!(
+            !joined.contains("_pending"),
+            "不得再出现 _pending 占位 id：{joined}"
+        );
+    }
+
     /// 反向顺序（文本→工具）同样不许出现 id 漂移。
     #[test]
     fn render_stream_text_then_tool_keeps_ids() {

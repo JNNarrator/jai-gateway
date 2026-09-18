@@ -509,6 +509,44 @@
   - UI：供应商卡片「工具上限 …」+ 模型表「≤N / 上限?」芯片（留空 = 不拦）。
 
 
+- [x] 25. **Responses 流式渲染的 item id / 状态错乱：zcode 每轮都「Model request failed.」**
+  - 现象：zcode 经 JAI（`openai-responses` 入站）**每次**请求都失败，客户端已收到
+    `200 + text/event-stream`（`x-jai-mode: converted`），随后在流里拿到 error chunk，
+    报 `reason=unknown retryable=false`（**无 HTTP 状态**）。而 JAI 的 `request_logs`
+    记的是 `200 + tool_calls=N`（看起来成功）→ 极易误判成「上游抖动」。
+  - 真因（从客户端 cause 链坐实，而非猜测）：
+    ```
+    cause: UnknownError: text part msg_resp_jai_942 not found
+    context: errorPhase=stream source=provider transport=sse
+    ```
+    即 AI SDK 收到引用某 item 的帧，但该 item 从未登记（无 `output_item.added` /
+    `content_part.added`）。`codec/responses.rs` 流式渲染状态机有两处错：
+    1. 「文本 item 已开」的标志（`item_started`）被 `ToolCallStart` 复用置 true。于是
+       **只调用工具、没有文本**的回复（agent 主 turn 的常态，实测 out_tok=178/tc=2）
+       在收尾时，`Finish` 分支会为一个从未登记的 `msg_*` 发出 `output_text.done` /
+       `content_part.done` / `output_item.done` → 客户端查不到该 text part → 整轮失败。
+       错误发生在**流尾**，与线上时间戳完全吻合。
+    2. `ToolCallStart` 登记的 item id 是 `fc_{index}_{call_id}`，但
+       `ToolCallArgsDelta` / `ToolCallEnd` 写死 `fc_{index}_pending` ⇒ 参数增量引用
+       不存在的 item（同一 bug 的另一半，严格客户端同样会炸）。
+  - 教训：**SSE 是协议，不是「看起来像就行」**。凡是「按 id 索引的增量流」，登记帧
+    与增量帧的 id、顺序都是硬契约；用单标志表示多种 item 的状态，早晚会串。
+    「只调用工具、没有文本」是最常见形态，不该靠客户端宽容才不失败。
+  - 修复：
+    1. 状态拆开：`msg_started`（**只由文本路径读写**）+ `active_tool_item_id`（登记工具
+       item id），`Start` 一并重置；`ToolCallEnd` 清空；
+    2. 文本增量只据 `msg_started` 决定是否补发 `output_item.added` + `content_part.added`；
+    3. 参数增量/结束帧复用登记的 id，`item.call_id` 从 id 反解（不再退化成 `call_{index}`）；
+    4. 纯工具调用回复不再发 `msg_*` 收尾帧。
+  - 回归：`codec::responses` 新增 3 条单测——
+    `render_stream_tool_only_emits_no_bogus_message_frames`（**最精确复刻**：纯工具调用不得
+    出现 `msg_*` 伪帧、不得有 `_pending`）、`render_stream_tool_then_text_keeps_item_ids_consistent`、
+    `render_stream_text_then_tool_keeps_ids`。已做**反证**：把旧行为加回去，前两条立刻变红。
+  - 真机复验：以 zcode 原始请求体重放 + 构造纯工具/混排请求，逐流跑 id 一致性校验脚本全过；
+    纯工具流里 `msg_*` 伪帧数为 0、参数增量 id 与登记 id 一致。
+  - 排查提示：**遇到「客户端失败、JAI 记 200」时，不要看 JAI 日志下结论**，要看客户端
+    的 cause 链（zcode：`~/.zcode/cli/log/zcode-*.jsonl` 的 `turn.failed` → `error.cause.cause`）。
+
 ## 2. 优化清单
 
 - [x] 1. 创建供应商弹框应该有按钮可以测试能不能获取到模型。
