@@ -198,6 +198,7 @@ async fn fixture(mode: &'static str) -> Fixture {
                 last_ok_at: None,
                 last_err_at: None,
                 last_err_msg: None,
+                max_tools: None,
                 reasoning_effort_levels: None,
                 created_at: now,
                 updated_at: now,

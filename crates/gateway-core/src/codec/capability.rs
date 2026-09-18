@@ -47,7 +47,12 @@ pub struct Capabilities {
     pub tools: HashSet<&'static str>,
     /// 无法原生表达的工具类型 → 降级为 function（键=请求类型，值=降级目标类型）
     pub tools_degraded: &'static [(&'static str, &'static str)],
-    /// 上游工具声明上限（超限 Rejected → `tools_limit_exceeded`）
+    /// 该协议族的工具声明上限（超限 Rejected → `tools_limit_exceeded`）。
+    ///
+    /// **四族一律 `None`**：协议本身没有这条限制，网关曾按 128 硬拦（bug 24）——
+    /// 2026-09-18 实测上游接受 140 / 300 个工具均 200，而 zcode 的 140 个工具被
+    /// JAI 自己 400 掉，误杀了上游完全能跑的配置。上限只来自**渠道声明**
+    /// （[`ChannelPolicy::max_tools`]，供应商/模型级可配），未声明即放行由上游裁决。
     pub max_tools: Option<usize>,
     /// 支持的 tool_choice 模式名（auto / none / required / specific）
     pub tool_choice: HashSet<&'static str>,
@@ -70,9 +75,6 @@ pub struct Capabilities {
 fn set(ss: &[&'static str]) -> HashSet<&'static str> {
     ss.iter().copied().collect()
 }
-
-/// 默认工具声明上限（GodeX 参考 DeepSeek maxTools=128）。
-pub const DEFAULT_MAX_TOOLS: usize = 128;
 
 /// Codex 扩展工具类型 → function 降级（所有出站族统一；详见 §10 降级矩阵）。
 /// 折叠名：shell / apply_patch / local_shell 用固定名，custom 用原名（重名加后缀）。
@@ -98,7 +100,7 @@ static OPENAI_COMPAT_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilitie
     ]),
     tools: set(&["function"]),
     tools_degraded: EXTENDED_TOOLS_DEGRADED,
-    max_tools: Some(DEFAULT_MAX_TOOLS),
+    max_tools: None,
     tool_choice: set(&["auto", "none", "required", "specific"]),
     response_formats: set(&["text", "json_object", "json_schema"]),
     degraded_formats: &[],
@@ -120,7 +122,7 @@ static OPENAI_RESPONSES_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabili
     ]),
     tools: set(&["function"]),
     tools_degraded: EXTENDED_TOOLS_DEGRADED,
-    max_tools: Some(DEFAULT_MAX_TOOLS),
+    max_tools: None,
     tool_choice: set(&["auto", "none", "required", "specific"]),
     response_formats: set(&["text", "json_object", "json_schema"]),
     degraded_formats: &[],
@@ -134,7 +136,7 @@ static ANTHROPIC_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
     parameters: set(&["max_output_tokens", "temperature", "top_p", "top_k", "stop"]),
     tools: set(&["function"]),
     tools_degraded: EXTENDED_TOOLS_DEGRADED,
-    max_tools: Some(DEFAULT_MAX_TOOLS),
+    max_tools: None,
     tool_choice: set(&["auto", "none", "required", "specific"]),
     response_formats: set(&["text"]),
     degraded_formats: &[
@@ -158,7 +160,7 @@ static GEMINI_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
     ]),
     tools: set(&["function"]),
     tools_degraded: EXTENDED_TOOLS_DEGRADED,
-    max_tools: Some(DEFAULT_MAX_TOOLS),
+    max_tools: None,
     tool_choice: set(&["auto", "none", "required", "specific"]),
     response_formats: set(&["text"]),
     degraded_formats: &[
@@ -246,6 +248,26 @@ impl EffortPolicy {
     }
 }
 
+/// 单条渠道（供应商/模型）的**声明式覆盖**集合。
+///
+/// 两个成员遵循同一哲学：**没声明就不干预**（网关不发明限制），**声明了就严格执行**。
+/// 之所以需要这层：族级能力表描述「协议本身能不能」，而「这家上游实际认什么」
+/// 只有渠道自己知道（上游网关各自的校验规则不同）。
+#[derive(Debug, Clone, Default)]
+pub struct ChannelPolicy {
+    /// 推理档位值域（0011，见 `crate::effort`）
+    pub effort: Option<EffortPolicy>,
+    /// 工具声明数上限（0012）：None = 未声明 ⇒ 不拦，由上游裁决
+    pub max_tools: Option<usize>,
+}
+
+impl ChannelPolicy {
+    /// 两项都没声明 → None（调用方可借此整段短路，保持零干预快路径）。
+    pub fn is_empty(&self) -> bool {
+        self.effort.is_none() && self.max_tools.is_none()
+    }
+}
+
 /// 规划对 `reasoning_effort` 的落地动作（resolve 阶段真正改写请求）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EffortRewrite {
@@ -293,14 +315,14 @@ pub fn plan_compatibility<'a>(
     plan_compatibility_with(req, caps, None)
 }
 
-/// 带渠道声明的推理档位值域（0011）的规划入口。
+/// 带渠道声明（[`ChannelPolicy`]：推理档位值域 0011 + 工具数上限 0012）的规划入口。
 ///
-/// `effort_policy` 为 None 时与 [`plan_compatibility`] 完全等价（未声明的供应商
+/// `policy` 为 None 时与 [`plan_compatibility`] 完全等价（未声明的供应商
 /// 行为字节级不变）。
 pub fn plan_compatibility_with<'a>(
     req: &CanonicalRequest,
     caps: &'a Capabilities,
-    effort_policy: Option<&EffortPolicy>,
+    policy: Option<&ChannelPolicy>,
 ) -> CompatibilityPlan<'a> {
     let mut plan = CompatibilityPlan {
         capabilities: caps,
@@ -315,8 +337,8 @@ pub fn plan_compatibility_with<'a>(
     };
 
     plan_response_format(req, caps, &mut plan);
-    plan_reasoning(req, caps, effort_policy, &mut plan);
-    plan_tools(req, caps, &mut plan);
+    plan_reasoning(req, caps, policy, &mut plan);
+    plan_tools(req, caps, policy, &mut plan);
     plan_tool_choice(req, &mut plan);
     plan_extension_fields(req, caps, &mut plan);
     plan_tool_result_images(req, caps, &mut plan);
@@ -413,7 +435,7 @@ fn plan_response_format(req: &CanonicalRequest, caps: &Capabilities, plan: &mut 
 fn plan_reasoning(
     req: &CanonicalRequest,
     caps: &Capabilities,
-    effort_policy: Option<&EffortPolicy>,
+    policy: Option<&ChannelPolicy>,
     plan: &mut CompatibilityPlan,
 ) {
     let Some(effort) = &req.params.reasoning_effort else {
@@ -422,7 +444,7 @@ fn plan_reasoning(
     // 原生 effort 族：先按渠道声明的值域归位（0011）。
     // 未声明值域的渠道与旧行为完全一致（原样透传）。
     if caps.reasoning == EffortMode::Native {
-        if let Some(policy) = effort_policy {
+        if let Some(policy) = policy.and_then(|p| p.effort.as_ref()) {
             match crate::effort::place(effort, &policy.levels) {
                 crate::effort::Placement::Passthrough => {
                     plan.reasoning = Some(Decision {
@@ -521,12 +543,31 @@ pub fn restore_tool_type(provider_name: &str, identities: &[ToolIdentity]) -> &'
     }
 }
 
-fn plan_tools(req: &CanonicalRequest, caps: &Capabilities, plan: &mut CompatibilityPlan) {
-    if let Some(max) = caps.max_tools {
+/// 直通路径用：数出请求体里声明的工具个数（`tools` 数组长度）。
+///
+/// `openai_compat` 与 `openai_responses` 的键同名（都是顶层 `tools`）；
+/// 无该键 / 非 JSON → `None`（无从判定，不拦）。
+pub fn body_tool_count(body: &[u8]) -> Option<usize> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    v.get("tools")?.as_array().map(|a| a.len())
+}
+
+fn plan_tools(
+    req: &CanonicalRequest,
+    caps: &Capabilities,
+    policy: Option<&ChannelPolicy>,
+    plan: &mut CompatibilityPlan,
+) {
+    // 生效上限：渠道声明优先，其次族级（四族目前均为 None ⇒ 不拦，由上游裁决）。
+    let max = policy.and_then(|p| p.max_tools).or(caps.max_tools);
+    if let Some(max) = max {
         if req.tools.len() > max {
             plan.tools = Some(Decision {
                 action: DecisionAction::Rejected,
-                reason: format!("工具声明数 {} 超过上游上限 {max}", req.tools.len()),
+                reason: format!(
+                    "工具声明数 {} 超过该渠道声明上限 {max}（可在供应商/模型设置里调整该上限）",
+                    req.tools.len()
+                ),
             });
             return;
         }
@@ -899,7 +940,8 @@ mod tests {
             Family::Anthropic,
             Family::Gemini,
         ] {
-            assert_eq!(caps_of(f).max_tools, Some(DEFAULT_MAX_TOOLS));
+            // 工具数上限不再有族级硬默认（bug 24）：只有渠道声明才拦
+            assert_eq!(caps_of(f).max_tools, None);
         }
     }
 
@@ -1063,22 +1105,54 @@ mod tests {
         );
     }
 
+    /// bug 24 回归：工具数上限只来自**渠道声明**。
+    /// - 未声明（族级现在一律 None）：**不拦** —— 140 个工具曾被网关自己的 128 硬默认
+    ///   400 掉，而上游实测 140/300 都 200，等于误杀；
+    /// - 渠道声明了：超限依旧 400（`tools_limit_exceeded`），错误码与旧行为一致。
     #[test]
-    fn max_tools_rejected() {
+    fn max_tools_only_enforced_when_channel_declares_it() {
         let mut req: CanonicalRequest = Default::default();
-        for i in 0..DEFAULT_MAX_TOOLS + 1 {
+        for i in 0..140 {
             req.tools.push(crate::codec::ir::ToolSpec {
                 name: format!("t{i}"),
                 description: None,
                 input_schema: json!({"type": "object"}),
             });
         }
-        let mut req = req.clone();
-        let plan = plan_compatibility(&req, caps_of(Family::OpenAiCompat));
-        let outcome = plan.resolve(&mut req);
-        let (msg, code) = outcome.rejection.unwrap();
+
+        // 1) 未声明 → 放行（上游裁决）
+        let mut passthrough_req = req.clone();
+        let plan = plan_compatibility(&passthrough_req, caps_of(Family::OpenAiCompat));
+        assert!(plan.resolve(&mut passthrough_req).rejection.is_none());
+
+        // 2) 声明 128 → 拦
+        let policy = ChannelPolicy {
+            effort: None,
+            max_tools: Some(128),
+        };
+        let mut rejected_req = req.clone();
+        let plan =
+            plan_compatibility_with(&rejected_req, caps_of(Family::OpenAiCompat), Some(&policy));
+        let (msg, code) = plan.resolve(&mut rejected_req).rejection.unwrap();
         assert_eq!(code, Some("tools_limit_exceeded"));
-        assert!(msg.contains("128"));
+        assert!(msg.contains("140"), "文案应含实际个数：{msg}");
+        assert!(msg.contains("128"), "文案应含声明上限：{msg}");
+
+        // 3) 声明 300 → 140 个放行
+        let wide = ChannelPolicy {
+            effort: None,
+            max_tools: Some(300),
+        };
+        let mut ok_req = req.clone();
+        let plan = plan_compatibility_with(&ok_req, caps_of(Family::OpenAiCompat), Some(&wide));
+        assert!(plan.resolve(&mut ok_req).rejection.is_none());
+    }
+
+    #[test]
+    fn body_tool_count_reads_tools_array() {
+        assert_eq!(body_tool_count(br#"{"tools":[{"a":1},{"b":2}]}"#), Some(2));
+        assert_eq!(body_tool_count(br#"{"model":"x"}"#), None);
+        assert_eq!(body_tool_count(b"not-json"), None);
     }
 
     #[test]

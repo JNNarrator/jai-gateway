@@ -274,12 +274,19 @@ enum RouteDecision {
 | 面 | 内容 | openai_compat / openai_responses | anthropic | gemini |
 | --- | --- | --- | --- | --- |
 | `parameters` | 支持的请求参数名（文档性声明） | stream/temperature/top_p/max_output_tokens/stop/penalties/seed/reasoning_effort/response_format | max/temperature/top_p/top_k/stop | max/temperature/top_p/top_k/stop/seed |
-| `tools` / `max_tools` | 工具声明类型 + 上限 | function / 128 | function / 128 | function / 128 |
+| `tools` / `max_tools` | 工具声明类型 + 上限 | function / —（不拦） | function / —（不拦） | function / —（不拦） |
 | `tool_choice` | auto/none/required/specific | ✓ 全 | ✓ 全 | ✓ 全 |
 | `response_formats` | 原生响应格式 | text/json_object/json_schema | text | text |
 | `degraded_formats` | 无法原生表达 → 降级方式 | — | json_object/json_schema → 指令注入 | 同左 |
 | `reasoning` | effort 能力档位 | Native | Boolean | None |
 | `streaming_usage` | 流式 usage | true | true | false |
+
+> **`max_tools` 不再有族级默认**（bug 24，2026-09-18）：协议本身没有这条限制，早期的 128
+> 是经验值；实测上游接受 140 / 300 个工具（均 200），而 zcode 的 140 个工具被网关自己
+> 400 掉 —— 即**误杀上游完全能跑的配置**。现在上限只来自**渠道声明**
+> （`providers/models.max_tools`，模型级覆盖供应商级；`NULL`/0 = 未声明 ⇒ 不拦，由上游
+> 裁决），声明了就严格执行（400 `tools_limit_exceeded`）。跨族转换与同族直通两条路径
+> 语义一致。详见 `codec::capability::ChannelPolicy`。
 
 ### 扩展工具降级矩阵（v2.1 新增）
 

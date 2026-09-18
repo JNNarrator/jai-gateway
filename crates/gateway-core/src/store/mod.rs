@@ -120,6 +120,9 @@ pub struct ProviderRow {
     /// None/空 = 未声明 ⇒ 原样透传；模型行非空时覆盖本级（route_candidates 用
     /// COALESCE 解析）。
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// 供应商级「工具声明数上限」声明（0012）：None/0 = 未声明 ⇒ 不拦（由上游裁决）；
+    /// 模型行非空（>0）时覆盖本级。见 `codec::capability::ChannelPolicy`。
+    pub max_tools: Option<i64>,
     pub last_ok_at: Option<i64>,
     pub last_err_at: Option<i64>,
     pub last_err_msg: Option<String>,
@@ -147,11 +150,19 @@ pub struct ModelRow {
     /// 模型级「推理档位值域」声明（0011 起，见 `crate::effort`）：
     /// None = 继承供应商级（或两处都未声明 ⇒ 原样透传）。
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// 模型级「工具声明数上限」声明（0012）：None = 继承供应商级。
+    pub max_tools: Option<i64>,
 }
 
 // ================================================================ providers
 
-const PROVIDER_COLS: &str = "id,name,base_url,family,enabled,priority,weight,extra_headers,api_key,website,reasoning_effort_levels,last_ok_at,last_err_at,last_err_msg,created_at,updated_at";
+const PROVIDER_COLS: &str = "id,name,base_url,family,enabled,priority,weight,extra_headers,api_key,website,reasoning_effort_levels,max_tools,last_ok_at,last_err_at,last_err_msg,created_at,updated_at";
+
+/// 工具数上限归一（0012）：`0`/负数一律视同未声明（NULL）——「不限制」只有一种写法，
+/// 避免「0 = 不限 / 0 = 全禁」这类歧义。
+fn normalize_max_tools(v: Option<i64>) -> Option<i64> {
+    v.filter(|n| *n > 0)
+}
 
 fn row_to_provider(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
     Ok(ProviderRow {
@@ -168,11 +179,12 @@ fn row_to_provider(r: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
         reasoning_effort_levels: crate::effort::parse_opt(
             r.get::<_, Option<String>>(10)?.as_deref(),
         ),
-        last_ok_at: r.get(11)?,
-        last_err_at: r.get(12)?,
-        last_err_msg: r.get(13)?,
-        created_at: r.get(14)?,
-        updated_at: r.get(15)?,
+        max_tools: normalize_max_tools(r.get::<_, Option<i64>>(11)?),
+        last_ok_at: r.get(12)?,
+        last_err_at: r.get(13)?,
+        last_err_msg: r.get(14)?,
+        created_at: r.get(15)?,
+        updated_at: r.get(16)?,
     })
 }
 
@@ -182,6 +194,7 @@ fn row_to_model(r: &rusqlite::Row) -> rusqlite::Result<ModelRow> {
     let output_modalities = modality::parse_opt(r.get::<_, Option<String>>(9)?.as_deref());
     let reasoning_effort_levels =
         crate::effort::parse_opt(r.get::<_, Option<String>>(10)?.as_deref());
+    let max_tools = normalize_max_tools(r.get::<_, Option<i64>>(11)?);
     Ok(ModelRow {
         id: r.get(0)?,
         provider_id: r.get(1)?,
@@ -198,13 +211,14 @@ fn row_to_model(r: &rusqlite::Row) -> rusqlite::Result<ModelRow> {
         input_modalities,
         output_modalities,
         reasoning_effort_levels,
+        max_tools,
     })
 }
 
 pub fn provider_insert(c: &Connection, p: &ProviderRow) -> Result<(), StoreError> {
     c.execute(
         &format!(
-            "INSERT INTO providers({PROVIDER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
+            "INSERT INTO providers({PROVIDER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)"
         ),
         params![
             p.id,
@@ -218,6 +232,7 @@ pub fn provider_insert(c: &Connection, p: &ProviderRow) -> Result<(), StoreError
             p.api_key,
             p.website,
             crate::effort::encode_opt(p.reasoning_effort_levels.as_deref()),
+            normalize_max_tools(p.max_tools),
             p.last_ok_at,
             p.last_err_at,
             p.last_err_msg,
@@ -357,7 +372,7 @@ pub fn provider_delete(c: &Connection, id: &str) -> Result<usize, StoreError> {
 
 // ================================================================ models
 
-const MODEL_COLS: &str = "id,provider_id,model_name,upstream_model_id,context_window,max_output_tokens,enabled,supports_multimodal,input_modalities,output_modalities,reasoning_effort_levels";
+const MODEL_COLS: &str = "id,provider_id,model_name,upstream_model_id,context_window,max_output_tokens,enabled,supports_multimodal,input_modalities,output_modalities,reasoning_effort_levels,max_tools";
 
 /// Upsert 模型行（0010：入参为输入/输出模态集合，取代 0009 的 vision 布尔）。
 ///
@@ -377,7 +392,7 @@ pub fn model_upsert(
     let derived = modality::derive_supports_multimodal(input_modalities, None);
     c.execute(
         &format!(
-            "INSERT INTO models({MODEL_COLS}) VALUES (?1,?2,?3,NULL,?4,?5,1,?6,?7,?8,NULL)
+            "INSERT INTO models({MODEL_COLS}) VALUES (?1,?2,?3,NULL,?4,?5,1,?6,?7,?8,NULL,NULL)
              ON CONFLICT(provider_id, model_name) DO UPDATE SET
                context_window=excluded.context_window,
                max_output_tokens=excluded.max_output_tokens,
@@ -510,6 +525,32 @@ pub fn provider_set_reasoning_levels(
     Ok(())
 }
 
+/// 模型级「工具声明数上限」声明（0012）。`None`/0 = 回到「继承供应商级（或不拦）」。
+pub fn model_set_max_tools(
+    c: &Connection,
+    model_id: &str,
+    max_tools: Option<i64>,
+) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE models SET max_tools=?1 WHERE id=?2",
+        params![normalize_max_tools(max_tools), model_id],
+    )?;
+    Ok(())
+}
+
+/// 供应商级「工具声明数上限」声明（0012）。`None`/0 = 未声明 ⇒ 不拦（由上游裁决）。
+pub fn provider_set_max_tools(
+    c: &Connection,
+    id: &str,
+    max_tools: Option<i64>,
+) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE providers SET max_tools=?1, updated_at=?2 WHERE id=?3",
+        params![normalize_max_tools(max_tools), now_ms(), id],
+    )?;
+    Ok(())
+}
+
 /// 路由候选查询 —— storage §3 定案 SQL。按 (priority, rowid) 序逐渠道尝试。
 #[derive(Debug, Clone)]
 pub struct RouteCandidate {
@@ -533,6 +574,9 @@ pub struct RouteCandidate {
     /// 该渠道出站时的「推理档位值域」（0011）：模型级优先、回落供应商级；
     /// 两级皆未声明 → None（原样透传，见 `crate::effort`）。
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// 该渠道声明的「工具声明数上限」（0012）：模型级优先、回落供应商级；
+    /// 两级皆未声明（或 0）→ None（不拦，由上游裁决）。
+    pub max_tools: Option<i64>,
 }
 
 pub fn route_candidates(
@@ -542,7 +586,8 @@ pub fn route_candidates(
     let sql = "SELECT p.id, p.name, p.priority, p.base_url, p.family, p.extra_headers,
                 p.api_key, p.website, m.upstream_model_id, m.max_output_tokens, p.weight,
                 p.last_ok_at, p.last_err_at,
-                COALESCE(m.reasoning_effort_levels, p.reasoning_effort_levels) AS effort_levels
+                COALESCE(m.reasoning_effort_levels, p.reasoning_effort_levels) AS effort_levels,
+                COALESCE(m.max_tools, p.max_tools) AS max_tools
          FROM models m JOIN providers p ON p.id = m.provider_id
          WHERE m.model_name = ?1 AND m.enabled = 1 AND p.enabled = 1
          ORDER BY p.priority ASC, m.rowid ASC";
@@ -566,6 +611,7 @@ pub fn route_candidates(
                 reasoning_effort_levels: crate::effort::parse_opt(
                     r.get::<_, Option<String>>(13)?.as_deref(),
                 ),
+                max_tools: normalize_max_tools(r.get::<_, Option<i64>>(14)?),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

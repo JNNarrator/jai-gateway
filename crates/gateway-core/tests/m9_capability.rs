@@ -7,7 +7,7 @@
 //! 2. 同一路径上游输出非法 JSON → 502 structured_output_validation_failed
 //! 3. OpenAI 入站 json_schema → openai_compat 上游：response_format 原样外传
 //! 4. Responses 入站 reasoning.effort → openai_compat 上游：reasoning_effort 注入
-//! 5. 工具声明超 max_tools（129）→ 400 tools_limit_exceeded
+//! 5. 渠道声明的工具上限：超限 400 tools_limit_exceeded；未声明不拦（bug 24）
 
 use axum::body::Body;
 use axum::response::Response;
@@ -158,7 +158,7 @@ impl Fixture {
 }
 
 async fn fixture(mode: Mode) -> Fixture {
-    fixture_with_levels(mode, None, None).await
+    fixture_with_policy(mode, None, None, None).await
 }
 
 /// 夹具的档位声明版本（0011）：`provider_levels` / `model_levels` 为声明序逗号串
@@ -167,6 +167,16 @@ async fn fixture_with_levels(
     mode: Mode,
     provider_levels: Option<&str>,
     model_levels: Option<&str>,
+) -> Fixture {
+    fixture_with_policy(mode, provider_levels, model_levels, None).await
+}
+
+/// 夹具全参数版：额外带「工具声明数上限」（0012）供应商级声明，None = 未声明（不拦）。
+async fn fixture_with_policy(
+    mode: Mode,
+    provider_levels: Option<&str>,
+    model_levels: Option<&str>,
+    provider_max_tools: Option<i64>,
 ) -> Fixture {
     let captures = Arc::new(Mutex::new(Vec::<Value>::new()));
     let (up_port, up_path) = spawn_upstream(mode, captures.clone()).await;
@@ -216,6 +226,7 @@ async fn fixture_with_levels(
                 last_err_at: None,
                 last_err_msg: None,
                 reasoning_effort_levels: provider_levels.and_then(gateway_core::effort::parse),
+                max_tools: provider_max_tools,
                 created_at: now,
                 updated_at: now,
             },
@@ -359,10 +370,12 @@ async fn responses_reasoning_effort_to_openai_compat() {
     assert_eq!(upstream["reasoning_effort"], "high");
 }
 
-/// M9-5：工具声明超 max_tools → 400 tools_limit_exceeded（跨族转换路径）
+/// M9-5：**渠道声明**了工具上限 → 超限 400 tools_limit_exceeded（跨族转换路径）。
+/// 注意语义变化（bug 24）：族级不再有 128 硬默认，只有供应商/模型声明才拦。
 #[tokio::test(flavor = "multi_thread")]
-async fn too_many_tools_rejected() {
-    let fx = fixture(Mode::AnthropicValidJson).await;
+async fn declared_tool_cap_rejects_overflow() {
+    // 供应商声明 128 上限，客户端发 129 个
+    let fx = fixture_with_policy(Mode::AnthropicValidJson, None, None, Some(128)).await;
     let tools: Vec<Value> = (0..129u32)
         .map(|i| {
             json!({
@@ -378,6 +391,72 @@ async fn too_many_tools_rejected() {
     let (status, body) = fx
         .post_chat(json!({
             "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools
+        }))
+        .await;
+    assert_eq!(status, 400, "body: {body}");
+    assert_eq!(body["error"]["code"], "tools_limit_exceeded");
+    let msg = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("129") && msg.contains("128"),
+        "文案应给出数字：{msg}"
+    );
+}
+
+/// M9-13（bug 24 回归）：未声明上限时**不拦** —— zcode 的 140 个工具曾被网关自己的
+/// 128 硬默认 400 掉，而上游实测 140/300 都 200。
+#[tokio::test(flavor = "multi_thread")]
+async fn undeclared_tool_cap_lets_140_tools_through() {
+    let fx = fixture(Mode::OpenaiText).await;
+    // Responses API 的工具声明是**扁平**结构（chat completions 才是嵌套 function 对象）
+    let tools: Vec<Value> = (0..140u32)
+        .map(|i| {
+            json!({
+                "type": "function",
+                "name": format!("tool_{i}"),
+                "description": "t",
+                "parameters": {"type": "object"}
+            })
+        })
+        .collect();
+    let (status, body) = fx
+        .post_responses(json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": tools
+        }))
+        .await;
+    assert_eq!(status, 200, "未声明上限不应拦（旧行为 400）：{body}");
+
+    // 工具原样到达上游（一个一个不少）
+    let upstream = fx.upstream_body().await;
+    assert_eq!(
+        upstream["tools"].as_array().map(|a| a.len()),
+        Some(140),
+        "140 个工具应完整透传"
+    );
+}
+
+/// M9-14：工具上限在**同族直通**路径同样生效（声明了就拦，两条路径语义一致）。
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_tool_cap_applies_on_passthrough_path_too() {
+    let fx = fixture_with_policy(Mode::OpenaiText, None, None, Some(128)).await;
+    let tools: Vec<Value> = (0..140u32)
+        .map(|i| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": format!("tool_{i}"),
+                    "description": "t",
+                    "parameters": {"type": "object"}
+                }
+            })
+        })
+        .collect();
+    let (status, body) = fx
+        .post_chat(json!({
+            "model": "gpt-4o",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": tools
         }))

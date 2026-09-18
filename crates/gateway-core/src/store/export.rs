@@ -66,6 +66,10 @@ pub fn build_export_json(c: &Connection) -> Result<String, StoreError> {
             if let Some(levels) = p.reasoning_effort_levels.as_ref().filter(|l| !l.is_empty()) {
                 v["reasoning_effort_levels"] = json!(levels);
             }
+            // 工具声明数上限（0012）：未声明（NULL）不出键，同上
+            if let Some(n) = p.max_tools.filter(|n| *n > 0) {
+                v["max_tools"] = json!(n);
+            }
             v
         })
         .collect();

@@ -1001,16 +1001,23 @@ fn rewrite_body_model(body: &Bytes, new_model: &str) -> Bytes {
     }
 }
 
-/// 渠道声明的推理档位值域 → 规划用策略（0011，见 `crate::effort`）。
+/// 渠道声明的覆盖项 → 规划用 [`ChannelPolicy`]（0011 推理档位值域 + 0012 工具数上限）。
 /// 模型级优先、回落供应商级（在 `store::route_candidates` 的 COALESCE 里解析）；
-/// 两级皆未声明 → `None`，调用方短路，行为与旧版一致。
-fn effort_policy_of(
+/// 两级都没声明 → `None`，调用方短路，行为与旧版一致（网关不发明限制）。
+fn channel_policy_of(
     cand: &store::RouteCandidate,
-) -> Option<crate::codec::capability::EffortPolicy> {
-    crate::codec::capability::EffortPolicy::new(
-        cand.reasoning_effort_levels.as_ref(),
-        format!("供应商「{}」", cand.provider_name),
-    )
+) -> Option<crate::codec::capability::ChannelPolicy> {
+    let policy = crate::codec::capability::ChannelPolicy {
+        effort: crate::codec::capability::EffortPolicy::new(
+            cand.reasoning_effort_levels.as_ref(),
+            format!("供应商「{}」", cand.provider_name),
+        ),
+        max_tools: cand
+            .max_tools
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0),
+    };
+    (!policy.is_empty()).then_some(policy)
 }
 
 /// 尝试单渠道（同族直通）。失败已按 router 分类，只返回「可转移」失败。
@@ -1057,41 +1064,80 @@ async fn try_candidate(
         None => body.clone(),
     };
 
-    // 推理档位值域归一（0011）：**同族直通也要过一遍** —— 客户端发的值这家上游未必认。
-    // 真机故障即此：`reasoning_effort:"none"` 被原样透传给只认 low/medium/high/xhigh/max
-    // 的上游 → 400 UNSUPPORTED_FIELD。未声明值域的渠道整段短路（保持原始字节）。
+    // 渠道声明归一（0011 推理档位值域 + 0012 工具数上限）：**同族直通也要过一遍** ——
+    // 客户端发的东西这家上游未必认，而族级能力表管不到「这家上游具体怎么校验」。
+    // 真机故障即此两例：`reasoning_effort:"none"` 被原样透传给只认 low..max 的上游
+    // → 400 UNSUPPORTED_FIELD；140 个工具被网关自己的 128 硬默认拦掉 → 400
+    // tools_limit_exceeded（上游实际接受）。未声明的渠道整段短路（保持原始字节）。
     let body = match (
         crate::codec::Family::from_db_str(&cand.family),
-        effort_policy_of(cand),
+        channel_policy_of(cand),
     ) {
         (Some(family), Some(policy)) => {
-            if let Some(cur) = crate::effort::body_effort(&body, family) {
-                if !matches!(
-                    crate::effort::place(&cur, &policy.levels),
-                    crate::effort::Placement::Passthrough
-                ) {
-                    emit_log(
-                        &ctx.logs,
-                        wire.log_family(),
-                        Some(peeked),
-                        Some(&cand.provider_id),
-                        cand.upstream_model_id.clone(),
-                        200,
-                        ms_since(started),
-                        peeked.stream,
-                        None,
-                        0,
-                        Some("CapabilityWarn".into()),
-                        Some(format!(
-                            "reasoning.effort({cur})：{}声明档位为 {} → 已按该值域归一",
-                            policy.source,
-                            policy.levels.join("/")
-                        )),
-                    );
+            // 工具数上限：声明了就拦（与跨族路径同一语义、同一错误码）
+            if let Some(max) = policy.max_tools {
+                if let Some(n) = crate::codec::capability::body_tool_count(&body) {
+                    if n > max {
+                        let msg = format!(
+                            "工具声明数 {n} 超过该渠道声明上限 {max}（可在供应商/模型设置里调整该上限）"
+                        );
+                        emit_log(
+                            &ctx.logs,
+                            wire.log_family(),
+                            Some(peeked),
+                            Some(&cand.provider_id),
+                            cand.upstream_model_id.clone(),
+                            400,
+                            ms_since(started),
+                            peeked.stream,
+                            None,
+                            0,
+                            Some("InvalidRequest".into()),
+                            Some(msg.clone()),
+                        );
+                        return Attempt::Delivered(wire.error_response(
+                            StatusCode::BAD_REQUEST,
+                            &msg,
+                            "invalid_request_error",
+                            Some("tools_limit_exceeded"),
+                        ));
+                    }
                 }
             }
-            match crate::effort::normalize_body(&body, family, &policy.levels) {
-                Some(next) => Bytes::from(next),
+            if let Some(effort) = policy.effort.as_ref() {
+                if let Some(cur) = crate::effort::body_effort(&body, family) {
+                    if !matches!(
+                        crate::effort::place(&cur, &effort.levels),
+                        crate::effort::Placement::Passthrough
+                    ) {
+                        emit_log(
+                            &ctx.logs,
+                            wire.log_family(),
+                            Some(peeked),
+                            Some(&cand.provider_id),
+                            cand.upstream_model_id.clone(),
+                            200,
+                            ms_since(started),
+                            peeked.stream,
+                            None,
+                            0,
+                            Some("CapabilityWarn".into()),
+                            Some(format!(
+                                "reasoning.effort({cur})：{}声明档位为 {} → 已按该值域归一",
+                                effort.source,
+                                effort.levels.join("/")
+                            )),
+                        );
+                    }
+                }
+            }
+            match policy.effort.as_ref() {
+                Some(effort) => {
+                    match crate::effort::normalize_body(&body, family, &effort.levels) {
+                        Some(next) => Bytes::from(next),
+                        None => body,
+                    }
+                }
                 None => body,
             }
         }
@@ -1365,11 +1411,11 @@ async fn try_converted_candidate(
     // 取代原 response_format 硬编码 400 与 extension_warn_note 汇总，拒绝语义与错误码保持
     if let Some(family) = crate::codec::Family::from_db_str(&cand.family) {
         // 渠道声明的推理档位值域（0011）：未声明时 policy 为 None，行为与旧版一致
-        let effort_policy = effort_policy_of(cand);
+        let policy = channel_policy_of(cand);
         let plan = crate::codec::capability::plan_compatibility_with(
             &req,
             crate::codec::capability::caps_of(family),
-            effort_policy.as_ref(),
+            policy.as_ref(),
         );
         let outcome = plan.resolve(&mut req);
         if let Some((msg, code)) = outcome.rejection {
@@ -2871,6 +2917,7 @@ mod tests {
                     last_ok_at: None,
                     last_err_at: None,
                     last_err_msg: None,
+                    max_tools: None,
                     reasoning_effort_levels: None,
                     created_at: now,
                     updated_at: now,
@@ -2932,6 +2979,7 @@ mod tests {
                     last_ok_at: None,
                     last_err_at: None,
                     last_err_msg: None,
+                    max_tools: None,
                     reasoning_effort_levels: None,
                     created_at: now,
                     updated_at: now,
@@ -3031,6 +3079,7 @@ mod tests {
                     last_ok_at: None,
                     last_err_at: None,
                     last_err_msg: None,
+                    max_tools: None,
                     reasoning_effort_levels: None,
                     created_at: now,
                     updated_at: now,

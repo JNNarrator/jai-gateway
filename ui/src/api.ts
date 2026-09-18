@@ -71,6 +71,9 @@ export const api = {
   /** 供应商级推理档位值域（0011）：null/空 = 未声明 ⇒ 原样透传 */
   providerSetReasoningLevels: (id: string, levels: string[] | null) =>
     invoke<void>("provider_set_reasoning_levels", { id, levels }),
+  /** 供应商级工具声明数上限（0012）：null = 未声明 ⇒ 不拦 */
+  providerSetMaxTools: (id: string, maxTools: number | null) =>
+    invoke<void>("provider_set_max_tools", { id, maxTools }),
   openWebsite: (url: string) => openUrl(url),
 
   // 模型
@@ -97,6 +100,10 @@ export const api = {
    *  未声明的渠道 JAI 原样透传 reasoning_effort，上游不认就会 400。 */
   modelSetReasoningLevels: (modelId: string, levels: string[] | null) =>
     invoke<void>("model_set_reasoning_levels", { modelId, levels }),
+  /** 工具声明数上限（0012）：数字 = 该渠道上限；null = 未声明 ⇒ 不拦（由上游裁决）。
+   *  未声明的渠道不再有 128 硬默认——JAI 不发明限制（bug 24）。 */
+  modelSetMaxTools: (modelId: string, maxTools: number | null) =>
+    invoke<void>("model_set_max_tools", { modelId, maxTools }),
 
   // 网关密钥
   gatewayKeyInfo: () => invoke<GatewayKeyInfo | null>("gateway_key_info"),

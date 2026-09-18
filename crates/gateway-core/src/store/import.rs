@@ -143,6 +143,11 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
         let remote_effort_levels = p
             .get("reasoning_effort_levels")
             .and_then(crate::effort::from_json_array);
+        // 工具声明数上限（0012）：缺省 None = 未声明（不覆盖本地已有声明）
+        let remote_max_tools = p
+            .get("max_tools")
+            .and_then(Value::as_i64)
+            .filter(|n| *n > 0);
 
         // 本地按 (name, base_url) 去重；同一导出文件内重复只导入一次
         let dup_in_file = seen_local.iter().any(|(n, b)| n == name && b == base_url);
@@ -191,6 +196,9 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
                 super::provider_set_reasoning_levels(c, &row.id, Some(lv))
                     .map_err(|e| e.to_string())?;
             }
+            if let Some(n) = remote_max_tools {
+                super::provider_set_max_tools(c, &row.id, Some(n)).map_err(|e| e.to_string())?;
+            }
             report.providers_skipped_duplicate += 1;
             row.id
         } else {
@@ -209,6 +217,7 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
                 api_key: remote_api_key.clone(),
                 website: website.clone(),
                 reasoning_effort_levels: remote_effort_levels.clone(),
+                max_tools: remote_max_tools,
                 last_ok_at: None,
                 last_err_at: None,
                 last_err_msg: None,
@@ -286,6 +295,13 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
             {
                 super::model_set_reasoning_levels(c, &model_row.id, Some(&levels))
                     .map_err(|e| e.to_string())?;
+            }
+        }
+        // 工具声明数上限（0012，模型级）：同口径 —— 缺省不覆盖本地
+        if let Some(n) = m.get("maxTools").and_then(Value::as_i64).filter(|n| *n > 0) {
+            if let Ok(Some(model_row)) = super::model_get_by_provider_name(c, local_id, model_name)
+            {
+                super::model_set_max_tools(c, &model_row.id, Some(n)).map_err(|e| e.to_string())?;
             }
         }
         if !enabled {
@@ -437,8 +453,8 @@ mod tests {
         assert_eq!(crate::store::meta_get(&c2, "cors_allow").unwrap(), None);
     }
 
-    /// 0011 往返：供应商级 + 模型级「推理档位值域」随导出/导入落地，
-    /// 且 `openai_responses` 供应商不再被误判为「未知协议族」（本次顺带修的 bug）。
+    /// 0011/0012 往返：供应商级 + 模型级「推理档位值域」与「工具数上限」随导出/导入落地，
+    /// 且 `openai_responses` 供应商不再被误判为「未知协议族」。
     #[test]
     fn roundtrip_carries_reasoning_effort_levels_and_responses_family() {
         let c = open_and_migrate(":memory:").unwrap();
@@ -461,6 +477,8 @@ mod tests {
             .unwrap()
             .unwrap();
         crate::store::model_set_reasoning_levels(&c, &m.id, Some(&["high".into()])).unwrap();
+        crate::store::model_set_max_tools(&c, &m.id, Some(256)).unwrap();
+        crate::store::provider_set_max_tools(&c, "p2", Some(512)).unwrap();
 
         let exported = crate::store::export::build_export_json(&c).unwrap();
         let c2 = open_and_migrate(":memory:").unwrap();
@@ -496,6 +514,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.reasoning_effort_levels, None);
 
+        // 0012 工具数上限：供应商级 + 模型级都要随导出/导入携带
+        assert_eq!(jy.max_tools, None, "基元律动未声明上限");
+        assert_eq!(resp.max_tools, Some(512), "供应商级上限应携带");
+
         let m2 = crate::store::model_get_by_provider_name(&c2, &jy.id, "deepseek-flash")
             .unwrap()
             .unwrap();
@@ -504,6 +526,7 @@ mod tests {
             Some(&["high".to_string()][..]),
             "模型级声明应随导出/导入携带"
         );
+        assert_eq!(m2.max_tools, Some(256), "模型级上限应携带");
     }
 
     /// 远端 api_key 非空才覆盖；空不清空本地。

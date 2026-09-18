@@ -154,6 +154,8 @@ pub struct ProviderDto {
     pub website: Option<String>,
     /// 供应商级「推理档位值域」声明（0011）：None/空 = 未声明 ⇒ 原样透传
     pub reasoning_effort_levels: Option<Vec<String>>,
+    /// 供应商级「工具声明数上限」声明（0012）：None = 未声明 ⇒ 不拦（由上游裁决）
+    pub max_tools: Option<i64>,
     pub last_ok_at: Option<i64>,
     pub last_err_at: Option<i64>,
     pub last_err_msg: Option<String>,
@@ -172,6 +174,7 @@ fn to_dto(p: ProviderRow) -> ProviderDto {
         extra_headers: p.extra_headers,
         website: p.website,
         reasoning_effort_levels: p.reasoning_effort_levels,
+        max_tools: p.max_tools,
         last_ok_at: p.last_ok_at,
         last_err_at: p.last_err_at,
         last_err_msg: p.last_err_msg,
@@ -250,6 +253,7 @@ async fn provider_create(
         last_ok_at: None,
         last_err_at: None,
         last_err_msg: None,
+        max_tools: None,
         reasoning_effort_levels: None,
         created_at: store::now_ms(),
         updated_at: store::now_ms(),
@@ -651,6 +655,44 @@ async fn provider_set_reasoning_levels(
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
         db.with(|c| store::provider_set_reasoning_levels(c, &id, levels.as_deref()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
+}
+
+/// 模型级「工具声明数上限」声明（0012）。`None`/0 = 回到继承供应商级（或不拦）。
+#[tauri::command]
+async fn model_set_max_tools(
+    core: State<'_, AppCore>,
+    model_id: String,
+    max_tools: Option<i64>,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::model_set_max_tools(c, &model_id, max_tools))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+
+    core.autopush.notify_change();
+    Ok(())
+}
+
+/// 供应商级「工具声明数上限」声明（0012）。`None`/0 = 未声明 ⇒ 不拦（由上游裁决）。
+#[tauri::command]
+async fn provider_set_max_tools(
+    core: State<'_, AppCore>,
+    id: String,
+    max_tools: Option<i64>,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::provider_set_max_tools(c, &id, max_tools))
             .map_err(|e| e.to_string())
     })
     .await
@@ -2820,6 +2862,8 @@ fn main() {
             model_set_modalities,
             model_set_reasoning_levels,
             provider_set_reasoning_levels,
+            model_set_max_tools,
+            provider_set_max_tools,
             gateway_key_info,
             gateway_key_reveal,
             gateway_key_regenerate,

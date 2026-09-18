@@ -254,6 +254,7 @@ mod tests {
             last_ok_at,
             last_err_at,
             reasoning_effort_levels: None,
+            max_tools: None,
         }
     }
 

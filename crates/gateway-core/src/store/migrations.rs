@@ -44,6 +44,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0011_reasoning_effort_levels",
         include_str!("migrations/0011_reasoning_effort_levels.sql"),
     ),
+    (
+        "0012_max_tools_per_channel",
+        include_str!("migrations/0012_max_tools_per_channel.sql"),
+    ),
 ];
 
 #[cfg(test)]

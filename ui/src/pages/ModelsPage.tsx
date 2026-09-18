@@ -7,6 +7,7 @@ import { copyText } from "../lib/clipboard";
 import { PageHeader } from "@/components/common/PageHeader";
 import { EmptyState } from "@/components/common/EmptyState";
 import { EffortLevelsEditor } from "@/components/common/EffortLevelsEditor";
+import { MaxToolsEditor } from "@/components/common/MaxToolsEditor";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -195,6 +196,10 @@ export function ModelsPage() {
                     await api.modelSetReasoningLevels(m.id, levels);
                     setModels(await api.modelList(selId));
                   }}
+                  onSetMaxTools={async (maxTools) => {
+                    await api.modelSetMaxTools(m.id, maxTools);
+                    setModels(await api.modelList(selId));
+                  }}
                 />
               ))}
             </TableBody>
@@ -222,12 +227,14 @@ function ModelRowEditor({
   onToggle,
   onSetModalities,
   onSetReasoningLevels,
+  onSetMaxTools,
 }: {
   m: ModelRow;
   onSave: (ctx: number | null, out: number, alias: string | null) => Promise<void>;
   onToggle: (enabled: boolean) => Promise<void>;
   onSetModalities: (input: Modality[] | null, output: Modality[] | null) => Promise<void>;
   onSetReasoningLevels: (levels: string[] | null) => Promise<void>;
+  onSetMaxTools: (maxTools: number | null) => Promise<void>;
 }) {
   const [ctx, setCtx] = useState(m.contextWindow ?? 128000);
   const [out, setOut] = useState(m.maxOutputTokens);
@@ -270,6 +277,12 @@ function ModelRowEditor({
             onChange={(levels) =>
               onSetReasoningLevels(levels).catch((e) => toast(String(e), "err"))
             }
+          />
+          {/* 工具声明数上限（0012）：同上，就地编辑不新增列 */}
+          <MaxToolsEditor
+            maxTools={m.maxTools ?? null}
+            scopeLabel={`模型 ${m.modelName}`}
+            onChange={(n) => onSetMaxTools(n).catch((e) => toast(String(e), "err"))}
           />
         </span>
       </TableCell>

@@ -30,6 +30,8 @@ export interface ProviderDto {
   website?: string | null;
   /** 供应商级「推理档位值域」声明（0011）：null/空 = 未声明 ⇒ 原样透传 */
   reasoningEffortLevels?: string[] | null;
+  /** 供应商级「工具声明数上限」声明（0012）：null = 未声明 ⇒ 不拦（由上游裁决） */
+  maxTools?: number | null;
   lastOkAt?: number | null;
   lastErrAt?: number | null;
   lastErrMsg?: string | null;
@@ -55,6 +57,8 @@ export interface ModelRow {
   outputModalities: Modality[] | null;
   /** 模型级「推理档位值域」声明（0011）：null = 继承供应商级 */
   reasoningEffortLevels?: string[] | null;
+  /** 模型级「工具声明数上限」声明（0012）：null = 继承供应商级 */
+  maxTools?: number | null;
 }
 
 export interface GatewayKeyInfo {

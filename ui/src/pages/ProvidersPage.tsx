@@ -20,6 +20,7 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { EffortLevelsEditor } from "@/components/common/EffortLevelsEditor";
+import { MaxToolsEditor } from "@/components/common/MaxToolsEditor";
 import { FormField } from "@/components/common/FormField";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Badge } from "@/components/ui/badge";
@@ -218,6 +219,10 @@ export function ProvidersPage() {
               await api.providerSetReasoningLevels(p.id, levels);
               setList(await api.providerList());
             }}
+            onSetMaxTools={async (maxTools) => {
+              await api.providerSetMaxTools(p.id, maxTools);
+              setList(await api.providerList());
+            }}
             onDelete={() => setConfirmDelete(p)}
           />
         ))}
@@ -269,6 +274,7 @@ function ProviderCard(props: {
   onEdit: () => void;
   onToggle: (enabled: boolean) => void;
   onSetReasoningLevels: (levels: string[] | null) => Promise<void>;
+  onSetMaxTools: (maxTools: number | null) => Promise<void>;
   onDelete: () => void;
 }) {
   const { p } = props;
@@ -327,7 +333,7 @@ function ProviderCard(props: {
             )}
             {/* 推理档位值域（0011）：供应商级默认，模型行可覆盖。
                 未声明的渠道 JAI 原样透传 reasoning_effort，上游不认就 400。 */}
-            <div className="mt-1">
+            <div className="mt-1 flex flex-wrap items-center gap-3">
               <EffortLevelsEditor
                 verbose
                 levels={p.reasoningEffortLevels ?? null}
@@ -336,6 +342,14 @@ function ProviderCard(props: {
                   props
                     .onSetReasoningLevels(levels)
                     .catch((e) => toast(String(e), "err"))
+                }
+              />
+              <MaxToolsEditor
+                verbose
+                maxTools={p.maxTools ?? null}
+                scopeLabel={`供应商 ${p.name}`}
+                onChange={(n) =>
+                  props.onSetMaxTools(n).catch((e) => toast(String(e), "err"))
                 }
               />
             </div>

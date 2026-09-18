@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **网关自己发明的工具数上限（128）把上游能跑的请求拦成 400**（bug 24）：zcode 经 JAI 声明
+  140 个工具 → `400 tools_limit_exceeded 工具声明数 140 超过上游上限 128`，整个 turn 失败；
+  而**上游实测 140 / 300 个工具都返回 200** —— 128 是跨族能力对齐表里的经验值，并非任何上游的
+  真实约束，等于误杀。与 bug 21 同源：网关不该**发明**上游限制，只能**执行上游声明的**限制。
+  - 四族 `max_tools` 一律 `None`（删除 `DEFAULT_MAX_TOOLS`）⇒ 未声明即**不拦**，放行由上游裁决
+    （上游真报错时其错误原文照常回给客户端）；
+  - 新增 `providers/models.max_tools` **渠道声明**（迁移 0012，模型级覆盖供应商级；`NULL`/0 = 未声明），
+    声明了超限仍 400，文案含实际个数与上限并提示可调整；
+  - 规划层新增 `ChannelPolicy`（0011 effort + 0012 max_tools 统一为「渠道覆盖」），
+    `plan_compatibility_with(req, caps, Option<&ChannelPolicy>)`；
+  - **同族直通路径同样生效**（`capability::body_tool_count`），避免「声明了上限却被直通绕过」。
+  - 回归：`max_tools_only_enforced_when_channel_declares_it`、`body_tool_count_reads_tools_array`；
+    m9 新增 `undeclared_tool_cap_lets_140_tools_through`（bug 复刻：140 个完整透传）、
+    `declared_tool_cap_applies_on_passthrough_path_too`，原 `too_many_tools_rejected` 改为
+    `declared_tool_cap_rejects_overflow`（声明才拦）。
+  - UI：供应商卡片「工具上限 …」+ 模型表「≤N / 上限?」芯片（留空 = 不拦）。
+
+### Fixed
 - **发布后 updater 通道仍推上一版**（v0.2.6 发布时实测）：`release.yml` 建草稿时硬编码
   `-F prerelease=true`，而 updater 端点取 `/releases/latest/download/latest.json`，
   **GitHub 的 latest 不含 prerelease** → 草稿转正式后 feed 仍返回上一版（实测返回 0.2.5），

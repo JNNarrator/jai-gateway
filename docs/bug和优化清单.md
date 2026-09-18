@@ -481,6 +481,33 @@
   - 教训：`scripts/release_check.sh` 覆盖不到这一环（它只看仓库内状态），
     「发布是否真的可达」只能在发布后从**公网端点**验。
 
+- [x] 24. **网关自己发明的工具数上限（128）把上游能跑的请求拦成 400**
+  - 现象：zcode 经 JAI 发 140 个工具声明 →
+    `400 provider_code=tools_limit_exceeded 工具声明数 140 超过上游上限 128`，
+    整个 turn 失败（`reason=invalid_request`）。
+  - 根因：`codec/capability.rs` 的族级能力表把 `max_tools` 定死 128
+    （`DEFAULT_MAX_TOOLS`，四族同值，出自 protocol-ir 能力对齐表的经验值），
+    `plan_tools` 超限直接 `Rejected`。**实测上游基元律动接受 140 与 300 个工具均 200**
+    —— 这条限制是**网关自己的臆测**，误杀了上游完全能跑的配置。
+  - 教训（与 bug 21 同源）：网关不该**发明**上游限制，只能**执行上游声明的**限制。
+    族级能力表只该回答「协议本身支不支持」，不是「这家上游具体怎么校验」。
+  - 修复（2026-09-18，迁移 0012）：
+    1. 四族 `max_tools` 一律 `None`（删掉 `DEFAULT_MAX_TOOLS`）⇒ **未声明即不拦**，
+       放行由上游裁决（上游真报错时其错误原文照常回给客户端，链路不再被网关截断）；
+    2. 新增 `providers/models.max_tools` 渠道声明（模型级覆盖供应商级，`NULL`/0 = 未声明）；
+       声明了超限仍 400，文案含实际个数与上限并提示可调整；
+    3. 规划层新增 `ChannelPolicy`（0011 的 effort + 0012 的 max_tools 统一为「渠道覆盖」），
+       `plan_compatibility_with(req, caps, Option<&ChannelPolicy>)`；
+    4. **同族直通路径同样生效**（`capability::body_tool_count` 数 `tools` 数组），
+       避免「声明了上限却被直通路径绕过」。
+  - 回归：`capability.rs` 单测 `max_tools_only_enforced_when_channel_declares_it`
+    （未声明放行 / 声明 128 拦 / 声明 300 放行）、`body_tool_count_reads_tools_array`；
+    `m9_capability.rs` 改 `too_many_tools_rejected` → `declared_tool_cap_rejects_overflow`，
+    新增 `undeclared_tool_cap_lets_140_tools_through`（bug 复刻：140 个应完整透传）、
+    `declared_tool_cap_applies_on_passthrough_path_too`。
+  - 真机复验：上游直连 140 / 300 个工具均 200；修复后经 JAI 的 140 工具请求 200 且上游实收 140 个。
+  - UI：供应商卡片「工具上限 …」+ 模型表「≤N / 上限?」芯片（留空 = 不拦）。
+
 
 ## 2. 优化清单
 
