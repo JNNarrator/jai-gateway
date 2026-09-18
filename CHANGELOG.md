@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-09-18
+
 ### Fixed
 - **网关自己发明的工具数上限（128）把上游能跑的请求拦成 400**（bug 24）：zcode 经 JAI 声明
   140 个工具 → `400 tools_limit_exceeded 工具声明数 140 超过上游上限 128`，整个 turn 失败；
@@ -22,7 +24,6 @@ All notable changes to this project will be documented in this file.
     `declared_tool_cap_rejects_overflow`（声明才拦）。
   - UI：供应商卡片「工具上限 …」+ 模型表「≤N / 上限?」芯片（留空 = 不拦）。
 
-### Fixed
 - **发布后 updater 通道仍推上一版**（v0.2.6 发布时实测）：`release.yml` 建草稿时硬编码
   `-F prerelease=true`，而 updater 端点取 `/releases/latest/download/latest.json`，
   **GitHub 的 latest 不含 prerelease** → 草稿转正式后 feed 仍返回上一版（实测返回 0.2.5），
