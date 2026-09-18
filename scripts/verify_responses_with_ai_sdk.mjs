@@ -57,19 +57,30 @@ const result = streamText({
 const counts = {};
 const toolCalls = [];
 const errors = [];
+let reasoningText = '';
 for await (const part of result.fullStream) {
   counts[part.type] = (counts[part.type] || 0) + 1;
   if (part.type === 'tool-call') {
     toolCalls.push({ id: part.toolCallId, name: part.toolName, input: part.input });
   }
+  if (part.type === 'reasoning-delta') reasoningText += part.text ?? part.delta ?? '';
   if (part.type === 'error') errors.push(String(part.error?.message ?? part.error));
 }
 
 console.log('文件:', file);
 console.log('chunkCounts:', JSON.stringify(counts));
 console.log('toolCalls:', JSON.stringify(toolCalls));
+console.log('推理文本长度:', reasoningText.length, '| 开头:', JSON.stringify(reasoningText.slice(0, 60)));
+
+let failed = false;
 if (errors.length) {
   console.log('errors:', errors);
-  process.exit(1);
+  failed = true;
 }
+// 有推理内容时，客户端必须真的拿到文本（否则下轮回传缺 reasoning_content → 上游 400）
+if (sse.includes('reasoning_summary_text.delta') && reasoningText.length === 0) {
+  console.log('✗ 流里有推理但客户端没拿到文本（事件名/形状不被 SDK 识别）');
+  failed = true;
+}
+if (failed) process.exit(1);
 console.log('OK：严格客户端（AI SDK）解析通过');

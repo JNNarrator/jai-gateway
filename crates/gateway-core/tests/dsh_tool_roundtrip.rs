@@ -197,6 +197,48 @@ async fn dsh_second_round_embedded_function_call() {
     assert_tool_pairing(msgs);
 }
 
+/// 回归（zcode「The `reasoning_content` in the thinking mode must be passed back to the API.」）：
+/// 严格客户端（zcode 内 AI SDK）回传历史时，推理内容是以
+/// `{"type":"reasoning","id":..,"summary":[{"type":"summary_text","text":..}]}` 的形状放的
+/// （见 `@ai-sdk/openai` 的 responses 输入转换），工具调用则是独立的 `function_call` item。
+/// 网关必须把二者**合并进同一条 assistant 消息**：`reasoning_content` + `tool_calls`，
+/// 否则 thinking 模式的上游会 400。
+#[tokio::test]
+async fn reasoning_summary_item_becomes_reasoning_content_on_assistant_message() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let fx = fixture(captured.clone()).await;
+    let body = json!({
+        "model":"dsh-model",
+        "input":[
+            {"role":"user","content":[{"type":"input_text","text":"列出目录"}]},
+            {"type":"reasoning","id":"rs_1",
+             "summary":[{"type":"summary_text","text":"先看当前目录，再决定下一步。"}]},
+            {"type":"function_call","id":"fc_1","call_id":"call_00_z1","name":"bash",
+             "arguments":"{\"command\":\"pwd\"}","status":"completed"},
+            {"type":"function_call_output","call_id":"call_00_z1","output":"/tmp\n"},
+            {"role":"user","content":[{"type":"input_text","text":"继续"}]}
+        ]
+    });
+    let (status, resp) = fx.post_responses_raw(body).await;
+    assert_eq!(status, 200, "网关应转换成功: {resp}");
+
+    let guard = captured.lock().unwrap();
+    let up = guard.last().expect("mock 应收到请求");
+    let msgs = up["messages"].as_array().unwrap();
+    let asst = msgs
+        .iter()
+        .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+        .expect("上游应收到带 tool_calls 的 assistant 消息");
+    assert_eq!(
+        asst["reasoning_content"].as_str().unwrap_or_default(),
+        "先看当前目录，再决定下一步。",
+        "thinking 模式要求 reasoning_content 与 tool_calls 同条消息回传：{}",
+        serde_json::to_string(asst).unwrap()
+    );
+    assert_eq!(asst["tool_calls"][0]["function"]["name"], "bash");
+    assert_tool_pairing(msgs);
+}
+
 #[tokio::test]
 async fn dsh_second_round_multi_tool_calls() {
     let captured = Arc::new(Mutex::new(Vec::new()));

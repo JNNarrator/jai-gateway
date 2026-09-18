@@ -879,7 +879,8 @@ pub fn render_response(r: &CanonicalResponse) -> Value {
                     "type": "reasoning",
                     "id": format!("rs_{}", r.id),
                     "role": "assistant",
-                    "summary": [],
+                    // 非流式路径：严格客户端从 summary[].text 取推理文本（与其流式路径一致）
+                    "summary": [{"type": "summary_text", "text": text}],
                     "content": [{"type": "reasoning_text", "text": text, "annotations": []}],
                 }));
             }
@@ -1656,16 +1657,29 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
         }
         st.reasoning_started = false;
         let text = std::mem::take(&mut st.current_reasoning);
+        let item_id = format!("rs_{}", st.response_id);
+        out.push(
+            json!({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": item_id,
+                "output_index": st.output_index,
+                "summary_index": 0,
+            })
+            .to_string(),
+        );
         let part = json!({"type": "reasoning_text", "text": text, "annotations": []});
+        // `summary` 是严格客户端回传历史时读取的位置（AI SDK 会把 reasoning item 的
+        // summary[].text 变成下一次请求里的 reasoning item）；`content` 保留给既有客户端。
+        let summary = json!([{"type": "summary_text", "text": text}]);
         out.push(
             json!({
                 "type": "response.output_item.done",
                 "output_index": st.output_index,
                 "item": {
                     "type": "reasoning",
-                    "id": format!("rs_{}", st.response_id),
+                    "id": item_id,
                     "role": "assistant",
-                    "summary": [],
+                    "summary": summary,
                     "content": [part],
                 },
             })
@@ -1802,6 +1816,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             if text.is_empty() {
                 return Vec::new();
             }
+            let item_id = format!("rs_{}", st.response_id);
             let mut out = Vec::new();
             if !st.reasoning_started {
                 st.reasoning_started = true;
@@ -1812,7 +1827,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                         "output_index": st.output_index,
                         "item": {
                             "type": "reasoning",
-                            "id": format!("rs_{}", st.response_id),
+                            "id": item_id,
                             "role": "assistant",
                             "summary": [],
                             "content": [],
@@ -1820,14 +1835,27 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                     })
                     .to_string(),
                 );
+                out.push(
+                    json!({
+                        "type": "response.reasoning_summary_part.added",
+                        "item_id": item_id,
+                        "output_index": st.output_index,
+                        "summary_index": 0,
+                    })
+                    .to_string(),
+                );
             }
             st.current_reasoning.push_str(text);
+            // 必须用 `reasoning_summary_text.delta`：`response.reasoning_text.delta` **不在**
+            // 严格客户端的 modeled chunk 列表里（zcode 内 AI SDK 直接丢弃）→ 客户端拿不到推理
+            // 文本 → 下轮回传时缺 reasoning_content → 上游报
+            // 「The `reasoning_content` in the thinking mode must be passed back to the API.」
             out.push(
                 json!({
-                    "type": "response.reasoning_text.delta",
-                    "item_id": format!("rs_{}", st.response_id),
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": item_id,
                     "output_index": st.output_index,
-                    "content_index": 0,
+                    "summary_index": 0,
                     "delta": text,
                 })
                 .to_string(),
@@ -2487,8 +2515,11 @@ mod tests {
 
     #[test]
     fn render_stream_thinking_events() {
-        // 流式出站：ThinkingDelta → reasoning item 的 added + reasoning_text.delta
-        // 事件；后续 text 到来前先 output_item.done 关闭 reasoning item。
+        // 流式出站：ThinkingDelta → reasoning item 的 added + summary_part.added +
+        // reasoning_summary_text.delta（**必须用 modeled 事件**：`reasoning_text.delta`
+        // 不在严格客户端的 modeled chunk 列表里，会被直接丢弃 → 客户端拿不到推理文本 →
+        // 下轮回传缺 reasoning_content → 上游 400）；
+        // 后续 text 到来前先 summary_part.done + output_item.done 关闭 reasoning item。
         use crate::codec::ir::StreamEvent as Ev;
         let mut st = RenderState {
             response_id: "resp_t".into(),
@@ -2512,8 +2543,19 @@ mod tests {
         assert!(first[0].contains("response.output_item.added"));
         assert!(first[0].contains("\"type\":\"reasoning\""));
         assert!(first[0].contains("rs_resp_t"));
-        assert!(first[1].contains("response.reasoning_text.delta"));
-        assert!(first[1].contains("think step one"));
+        assert!(
+            first[1].contains("response.reasoning_summary_part.added"),
+            "首帧需登记 reasoning summary part：{:?}",
+            first[1]
+        );
+        assert!(first[2].contains("response.reasoning_summary_text.delta"));
+        assert!(first[2].contains("think step one"));
+        assert!(
+            !first
+                .iter()
+                .any(|f| f.contains("response.reasoning_text.delta")),
+            "不得再发未被 modeled 的 reasoning_text.delta（会被客户端丢弃）"
+        );
 
         let second = render_stream_event(
             &Ev::ThinkingDelta {
@@ -2521,14 +2563,19 @@ mod tests {
             },
             &mut st,
         );
-        assert!(second[0].contains("response.reasoning_text.delta"));
+        assert!(second[0].contains("response.reasoning_summary_text.delta"));
         assert!(second[0].contains("step two"));
 
-        // text 到来：先关 reasoning（done 含累计全文），再开文本 item
+        // text 到来：先关 reasoning（part.done + item.done 含累计全文与 summary），再开文本 item
         let txt = render_stream_event(&Ev::TextDelta { text: "hi".into() }, &mut st);
-        assert!(txt[0].contains("response.output_item.done"));
-        assert!(txt[0].contains("think step one step two"));
-        assert!(txt[0].contains("\"type\":\"reasoning\""));
+        assert!(txt[0].contains("response.reasoning_summary_part.done"));
+        assert!(txt[1].contains("response.output_item.done"));
+        assert!(txt[1].contains("think step one step two"));
+        assert!(txt[1].contains("\"type\":\"reasoning\""));
+        assert!(
+            txt[1].contains("summary_text"),
+            "item.done 需带 summary（严格客户端回传历史时读它）"
+        );
         assert!(txt.iter().any(|s| s.contains("response.output_text.delta")));
         // reasoning item 已关闭：output_index 前进到 1（text item 用）
         assert_eq!(st.output_index, 1);
@@ -2559,8 +2606,9 @@ mod tests {
             },
             &mut st2,
         );
-        assert!(fin[0].contains("response.output_item.done"));
-        assert!(fin[0].contains("only think"));
+        assert!(fin[0].contains("response.reasoning_summary_part.done"));
+        assert!(fin[1].contains("response.output_item.done"));
+        assert!(fin[1].contains("only think"));
         assert!(fin.iter().any(|s| s.contains("response.completed")));
     }
 

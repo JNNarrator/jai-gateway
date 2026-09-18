@@ -7,6 +7,22 @@ All notable changes to this project will be documented in this file.
 ## [0.2.8] - 2026-09-18
 
 ### Fixed
+- **推理内容用「非 modeled 事件」下发，客户端拿不到 → 下轮上游 400
+  `The reasoning_content in the thinking mode must be passed back to the API.`**（bug 26）：
+  zcode 报 `Provider rejected the model request.`（JAI 只是把上游 tokenrhythm 的 400 原文透传）。
+  - 根因：JAI 用 `response.reasoning_text.delta` 下发思考内容，而该事件**不在**严格客户端的
+    modeled chunk 列表里（`@ai-sdk/openai` 只认 `response.reasoning_summary_part.added/done`
+    与 `response.reasoning_summary_text.delta`）→ 推理文本被客户端**静默丢弃** → 客户端回传历史
+    时无法带上 reasoning → thinking 模式的上游（deepseek/LiteLLM）拒绝。
+  - 修复：改用 modeled 的 `reasoning_summary_part.added` + `reasoning_summary_text.delta`
+    （收尾补 `reasoning_summary_part.done`），并让 reasoning item 的 `summary` 带上文本
+    （流式 `output_item.done` 与非流式 body 都改；`content` 保留兼容既有客户端）。
+  - 验证：用真实 `ai`+`@ai-sdk/openai` 回放真实流 → `reasoning-delta: 243`、推理文本 1011 字符
+    被客户端捕获（修前为 0）；新增链路测试
+    `reasoning_summary_item_becomes_reasoning_content_on_assistant_message` 断言
+    客户端回传的 reasoning item 会被合并成上游 assistant 消息的 `reasoning_content` + `tool_calls`。
+  - 附注：把用户失败的请求体原样重放两次都 200 → 该 400 属上游**非确定性**（部分后端实例强制校验），
+    因此「客户端能拿到并回传 reasoning」是唯一可靠解法。
 - **Responses 流式渲染 item id/状态错乱：zcode 每轮都报「Model request failed.」**（bug 25）：
   zcode 每次请求都已收到 `200 + text/event-stream`，却在流里拿到 error chunk，报
   `reason=unknown`（无 HTTP 状态），而 JAI 侧 `request_logs` 记的是 `200 + tool_calls=N`
@@ -36,6 +52,29 @@ All notable changes to this project will be documented in this file.
     转字符串、`apply_patch_call.operation` 保留对象、`shell_call` 带 `status`。
     新增 `scripts/verify_responses_with_ai_sdk.mjs`（用真实 `ai`+`@ai-sdk/openai` 回放 JAI 的流），
     修复后实测 `tool-call: 2`、name/input 正确、无 TypeValidationError。
+
+- **`m4_conversion` 的 flood 护栏回归随机失败，会打红 CI**（bug 25 修复过程暴露）：
+  `cargo test --workspace` 偶发 `conversion_disconnects_on_newline_flood_upstream`
+  失败（实测 8 轮 4 红），但单跑该文件恒绿——典型的负载敏感 flake。
+  - **现象会误导方向**：断言期望「已断开」护栏文案，实际拿到的是
+    `stream aborted by upstream: ...` —— 看起来像上游流中断或护栏失效。
+  - **根因（分诊取证，非推测）**：mock handler **不消费请求体** → hyper 在
+    `poll_drain_or_close_read` 走 `_ => self.close_read()`（`hyper-1.11.0/src/proto/h1/conn.rs:849`）
+    → 服务端 close 时接收缓冲区仍有客户端发来的未读字节 → 内核发 **RST 而非 FIN**
+    → **客户端接收缓冲区里已到达但应用尚未读走的数据被一并丢弃**。
+  - **证据链**（三步排除法，每步都是实测）：
+    1. mock 侧显式打点确认 1056774 字节**全部写完**（排除「上游没发完」）；
+    2. 网关侧读到的 `buf_len` 每次都不同（实测 685204 / 751158 / 908054 / 924126 / 997438），
+       而 `content_length` 声明值一直是正确的 1056774 —— 排除「网关护栏逻辑错」，
+       实为乱序/部分丢失；错误链给出
+       `error decoding response body <- ... unexpected EOF during chunk size line`；
+    3. **单变量验证**：只让 handler 消费请求体（`_req_body: axum::body::Bytes`）
+       → 连跑 6 轮全绿（修前 8 轮 4 红）。
+  - 负载相关性也由此解释：机器越忙 → 客户端读得越慢 → 接收缓冲区积压越多 → 被 RST 丢得越多。
+  - **生产代码零改动**：真实上游会读请求体，这是**测试夹具缺陷**。两个 mock 都补
+    `_req_body`，根因写进 `m4_conversion.rs` 注释防复发。
+  - 另修 `clippy -D warnings` 门禁失败：bug 25 的 4 个回归测试里 `feed` 闭包无需
+    `mut` 绑定（`unused_mut`）——该批改动当初未过 clippy 就提交了，发布门禁首次运行即暴露。
 
 
 ## [0.2.7] - 2026-09-18

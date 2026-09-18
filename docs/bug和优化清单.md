@@ -581,6 +581,25 @@
     真机：用 `scripts/verify_responses_with_ai_sdk.mjs` 消费修复后的真实流 →
     `tool-input-end: 2`、`tool-call: 2`、name/input 正确、无 TypeValidationError。
 
+- [x] 26. **推理内容下发用了「非 modeled 事件」，客户端拿不到 → 上游要求回传 reasoning_content 时 400**
+  - 现象：zcode 报 `Provider rejected the model request.`，JAI 侧只是透传上游 400
+    （`{"code":"LITELLM_ERROR","message":"The `reasoning_content` in the thinking mode must be
+    passed back to the API."}`）。
+  - 根因：JAI 用 `response.reasoning_text.delta` 下发思考内容，而严格客户端
+    （zcode 内 AI SDK）的 modeled chunk 列表里**没有**这个事件（只有
+    `response.reasoning_summary_part.added/done` 与 `response.reasoning_summary_text.delta`）
+    → 推理文本被**静默丢弃** → 客户端回传历史时不可能带上 reasoning → thinking 模式上游拒绝。
+    与 bug 25 同源：**事件名/形状必须落在客户端的 modeled 集合内**，否则等于没发。
+  - 修复：改用 modeled 事件（`reasoning_summary_part.added` → 每个 delta
+    `reasoning_summary_text.delta` → 收尾 `reasoning_summary_part.done`），reasoning item 的
+    `summary` 带上文本（流式 `output_item.done` + 非流式 body；`content` 保留兼容既有客户端）。
+  - 验证：真实 SDK 回放 → 客户端捕获推理文本（修前 0 字符，修后 1011 字符）；
+    链路测试断言回传的 reasoning item 变成上游 assistant 消息的 `reasoning_content`+`tool_calls`。
+  - 附注：用户失败请求体原样重放两次都 200 → 上游**非确定性**（部分后端强制校验），
+    故"客户端能拿到并回传"是唯一可靠解法。
+  - 待办（未做）：`discover.rs`「发现模型」的 `/v1/models` 调用仍是单次发送，上游抖动即失败
+    （用户同日遇到 `请求失败: error sending request for url (https://tokenrhythm.studio/v1/models)`）；
+    计划加传输层重试（只重试发不出去的错误，不重试 HTTP 错误码）。
 ## 2. 优化清单
 
 - [x] 1. 创建供应商弹框应该有按钮可以测试能不能获取到模型。
