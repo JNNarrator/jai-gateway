@@ -52,6 +52,17 @@
 4. 触发 `.github/workflows/release.yml`
 5. 人工验收 CI 产物（macOS + Windows，签名 + updater 元数据）
 6. 在 GitHub Releases 将草稿转正式发布并指向 updater feed
+7. **发布后必须校验 updater 通道**（v0.2.6 踩过：草稿转正式后 feed 仍返回上一版）
+
+   ```bash
+   curl -sL https://github.com/<owner>/<repo>/releases/latest/download/latest.json | jq .version
+   # 必须等于刚发布的版本号；否则：
+   gh release edit vX.Y.Z --prerelease=false --latest
+   ```
+
+   原因：updater 端点走 `/releases/latest/…`，而 **GitHub 的 latest 不含 prerelease**。
+   `release.yml` 早期把草稿建成 `prerelease=true`（v0.2.6 已改为 `false`），
+   若沿用到旧工作流，发布后更新通道会一直停在上一版且**没有任何报错**。
 
 ## 6. 本地打 macOS 包（验证用，非发布产物）
 

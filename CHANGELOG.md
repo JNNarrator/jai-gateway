@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **发布后 updater 通道仍推上一版**（v0.2.6 发布时实测）：`release.yml` 建草稿时硬编码
+  `-F prerelease=true`，而 updater 端点取 `/releases/latest/download/latest.json`，
+  **GitHub 的 latest 不含 prerelease** → 草稿转正式后 feed 仍返回上一版（实测返回 0.2.5），
+  全程无报错，表现为「新版本发了但没人收到更新」。已改为 `-F prerelease=false`
+  （草稿态本已由 `draft=true` 表达），并在 `docs/design/release.md` §5 新增发布后校验步骤
+  （含 `gh release edit vX.Y.Z --prerelease=false --latest` 兜底）。见 bug 23。
+
 ## [0.2.6] - 2026-09-18
 
 ### Fixed

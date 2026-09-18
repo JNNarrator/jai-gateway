@@ -464,6 +464,23 @@
   - 修复：白名单补齐 `openai_responses`；回归并入
     `store::import::tests::roundtrip_carries_reasoning_effort_levels_and_responses_family`。
 
+- [x] 23. **发布后 updater 通道仍推上一版**（v0.2.6 发布时实测踩到）
+  - 现象：v0.2.6 的 Release 已由草稿转正式，但应用轮询的
+    `releases/latest/download/latest.json` 仍返回 **0.2.5** —— **全程无任何报错**，
+    表现为「新版本发了但没人收到更新」。
+  - 根因（两层）：
+    1. `release.yml` 建草稿时硬编码 `-F prerelease=true`，而 GitHub 的 `/releases/latest`
+       **不含 prerelease** → feed 指针停在上一版；草稿态本已由 `draft=true` 表达，
+       该标志纯属冗余且有害；
+    2. 仅翻 `prerelease=false` 后 `latest` 指针仍可能停在上一版（实测需 `--latest` 显式置位）。
+  - 修复（2026-09-18）：`release.yml` 改为 `-F prerelease=false`；`docs/design/release.md` §5 新增
+    第 7 步「发布后必须校验 updater 通道」（给出 curl 校验与 `--prerelease=false --latest` 兜底命令）。
+  - 本次事故的现场处置：对 v0.2.6 执行 `gh release edit v0.2.6 --prerelease=false --latest`，
+    复验 feed 返回 **0.2.6**、5 个平台条目签名齐全（darwin-aarch64/app、windows-x86_64{,-msi,-nsis}），
+    且 macOS 更新包 `JAI_aarch64.app.tar.gz` 可 200 下载。
+  - 教训：`scripts/release_check.sh` 覆盖不到这一环（它只看仓库内状态），
+    「发布是否真的可达」只能在发布后从**公网端点**验。
+
 
 ## 2. 优化清单
 

@@ -28,12 +28,17 @@ jobs:
           # 复用上次运行遗留的同 tag draft（重跑场景）；
           # 否则走 API 直接创建 —— 响应即含 release id。v0.1.2 曾用
           # gh release create + 列表回查取 id，回查撞上 API 最终一致性窗口导致 8s 失败
+          #
+          # prerelease 必须为 false（v0.2.6 踩过）：草稿态已由 draft=true 表达，
+          # 而 updater 端点取的是 `/releases/latest/…`，**GitHub 的 latest 不含
+          # prerelease** —— 置 true 会让「发布草稿」后更新通道仍指向上一版
+          # （实测 v0.2.6 发布后 feed 仍返回 0.2.5），需人工翻转才生效。
           RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases" \
             --jq '.[] | select(.draft and .tag_name == "${{ github.ref_name }}") | .id' | head -1)
           if [ -z "$RELEASE_ID" ]; then
             RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases" \
               -f tag_name="${{ github.ref_name }}" \
-              -F draft=true -F prerelease=true \
+              -F draft=true -F prerelease=false \
               -f name="JAI ${{ github.ref_name }}" \
               -f body="见 CHANGELOG.md" --jq '.id')
           fi
