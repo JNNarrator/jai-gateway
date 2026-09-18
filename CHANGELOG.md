@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-09-18
+
 ### Fixed
 - **Responses 流式渲染 item id/状态错乱：zcode 每轮都报「Model request failed.」**（bug 25）：
   zcode 每次请求都已收到 `200 + text/event-stream`，却在流里拿到 error chunk，报
