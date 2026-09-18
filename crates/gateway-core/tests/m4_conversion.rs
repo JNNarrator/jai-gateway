@@ -20,10 +20,12 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------- mock 上游
 
 /// Anthropic mock：按模式返回固定响应。
+///
+/// `_req_body` 必须显式消费请求体（见 [`spawn_gemini_mock`] 的 RST 说明）。
 async fn spawn_anthropic_mock(mode: &'static str) -> u16 {
     let app = Router::new().route(
         "/v1/messages",
-        post(move || async move {
+        post(move |_req_body: axum::body::Bytes| async move {
             let payload = match mode {
                 "text" => json!({
                     "id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4",
@@ -66,6 +68,19 @@ async fn spawn_anthropic_mock(mode: &'static str) -> u16 {
 }
 
 /// Gemini mock：支持非流式文本/工具，流式走 SSE。
+///
+/// `_req_body: axum::body::Bytes` 是**必需的**，不是装饰：handler 若不消费请求体，
+/// hyper 会在响应写完前 `close_read()`（`hyper::proto::h1::conn::poll_drain_or_close_read`
+/// 的 `_ => self.close_read()` 分支）→ 服务端 close 时接收缓冲区仍有客户端发来的未读
+/// 字节 → 内核发 **RST 而非 FIN** → **客户端接收缓冲区里已到达但尚未被应用读走的数据
+/// 被一并丢弃**。
+///
+/// 这在 flood 回归（上游单帧 ~1MiB 大响应）上表现为随机 flake：网关侧报
+/// `error decoding response body <- ... unexpected EOF during chunk size line`，
+/// 拿到的错误帧是「stream aborted by upstream」而非护栏文案；截断点每次都不同
+/// （实测 685204 / 751158 / 908054 / 924126 / 997438 字节）、负载越高越容易触发
+/// （客户端读得慢 → 缓冲区积压多 → 被丢得更多），而 mock 侧却显示「已发送完毕」。
+/// 定位代价见 CHANGELOG 0.2.8 的记录。
 async fn spawn_gemini_mock(mode: &'static str) -> u16 {
     #[derive(Clone)]
     struct GemSt {
@@ -75,7 +90,9 @@ async fn spawn_gemini_mock(mode: &'static str) -> u16 {
         .route(
             "/v1beta/models/gemini-2.0-flash:generateContent",
             post(
-                |State(st): State<GemSt>, query: axum::extract::Query<Value>| async move {
+                |State(st): State<GemSt>,
+                 query: axum::extract::Query<Value>,
+                 _req_body: axum::body::Bytes| async move {
                     let is_sse = query.get("alt").and_then(Value::as_str) == Some("sse");
                     // 行缓冲护栏回归：flood（无换行大块刷流）/ trickle（慢速无终止标记流）
                     if is_sse && matches!(st.mode, "flood" | "trickle") {
@@ -438,8 +455,8 @@ async fn conversion_disconnects_on_newline_flood_upstream() {
     assert_eq!(status, 200);
     assert!(
         text.contains("已断开"),
-        "应收到缓冲护栏错误帧（单行超限或行超时），实际开头: {}",
-        text.chars().take(200).collect::<String>()
+        "应收到缓冲护栏错误帧（单行超限或行超时），实际: {}",
+        text.chars().take(600).collect::<String>()
     );
 }
 
