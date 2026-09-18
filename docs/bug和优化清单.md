@@ -559,6 +559,27 @@
     回归：`render_stream_finish_closes_open_tool_call`、
     `render_stream_closes_every_open_tool_call`（连续两个工具调用、上游始终不给结束事件）；
     真机逐流校验「每个 added 必有对应 done 且带 name/arguments」全过。
+  - **同族第四处（真正的拦路虎，同日定位）**：补上终结帧后 zcode 仍报同一句话，于是搭了
+    **本地 SDK 测试台**（用真实 `ai` + `@ai-sdk/openai` 回放 JAI 实际发出的 SSE，
+    见 `scripts/verify_responses_with_ai_sdk.mjs`），一次就拿到铁证：
+    ```
+    _TypeValidationError: Type validation failed:
+      {"item":{...,"id":"fc_0_call_00_…","name":"Bash","type":"function_call"},"type":"response.output_item.done"}
+    —— invalid_union ...（所有变体都不匹配）
+    ```
+    读 SDK 的 zod schema 后确认：**`response.output_item.done` 里 function_call 变体的
+    `status` 是必填**（`z.enum(["in_progress","completed","incomplete"])`，无 `.nullish()`），
+    而 JAI 从没发过 `status` → 该帧整体校验失败被**静默丢弃** → SDK 永不产生
+    `tool-input-end`/`tool-call`（日志里 `chunkCounts` 只有 `tool-input-start`/`tool-input-delta`）
+    → 工具行永远关不掉。同期还对齐了其它 item 形状：`custom_tool_call.input` 必须是**字符串**
+    （JAI 原来发对象）、`shell_call`/`apply_patch_call` 的 `status` 同样必填、
+    `apply_patch_call.operation` 必须是对象（原来发字符串）。
+  - 教训：**"看起来像"不等于"协议合规"**。客户端用 zod 逐事件校验时，缺一个必填字段就是整帧丢弃，
+    而且**丢弃是静默的**（客户端不报错、JAI 记 200）——只有拿真实客户端/SDK 回放才能发现。
+    这类"形状契约"必须用真实 SDK 验证，不能只靠自家单测断言"我发了什么"。
+  - 回归：`render_stream_tool_items_carry_status`（added=in_progress / done=completed）；
+    真机：用 `scripts/verify_responses_with_ai_sdk.mjs` 消费修复后的真实流 →
+    `tool-input-end: 2`、`tool-call: 2`、name/input 正确、无 TypeValidationError。
 
 ## 2. 优化清单
 

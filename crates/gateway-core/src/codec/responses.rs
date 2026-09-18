@@ -105,14 +105,20 @@ fn extended_tool_item(
     name: &str,
     arguments: &str,
     item_type: &str,
+    status: &str,
 ) -> Value {
     let parsed: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+    // `status` 不是可选项：严格 Responses 客户端（zcode 内 AI SDK）的 zod schema 在
+    // `response.output_item.done` 的 function_call / shell_call / apply_patch_call 变体里
+    // 把 `status` 定为**必填**，缺失会让该帧整体校验失败并被丢弃 →
+    // 工具调用永远拿不到 `tool-input-end`/`tool-call`（表现为「工具行未终结」）。
     match item_type {
         "shell_call" | "local_shell_call" => json!({
             "type": item_type,
             "id": id,
             "call_id": call_id,
             "name": name,
+            "status": status,
             "action": parsed,
         }),
         "apply_patch_call" => json!({
@@ -120,20 +126,29 @@ fn extended_tool_item(
             "id": id,
             "call_id": call_id,
             "name": name,
-            "operation": parsed.get("operation").and_then(Value::as_str).unwrap_or_default(),
+            "status": status,
+            "operation": parsed.get("operation").cloned().unwrap_or(Value::Null),
         }),
         "custom_tool_call" => json!({
             "type": item_type,
             "id": id,
             "call_id": call_id,
             "name": name,
-            "input": parsed.get("input").cloned().unwrap_or(Value::Null),
+            "status": status,
+            // 客户端 schema 要求 `input` 是**字符串**（自由文本）；JAI 折叠后拿到的是
+            // `{"type":..,"value":..}` 对象，这里统一转成 JSON 文本
+            "input": match parsed.get("input") {
+                Some(Value::String(t)) => t.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
         }),
         _ => json!({
             "type": "function_call",
             "id": id,
             "call_id": call_id,
             "name": name,
+            "status": status,
             "arguments": arguments,
         }),
     }
@@ -875,6 +890,7 @@ pub fn render_response(r: &CanonicalResponse) -> Value {
                     name,
                     &serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
                     "function_call",
+                    "completed",
                 ));
             }
             _ => {}
@@ -919,7 +935,7 @@ pub fn restore_extended_items(mut value: Value, identities: &[ToolIdentity]) -> 
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            *item = extended_tool_item(id, call_id, name, arguments, item_type);
+            *item = extended_tool_item(id, call_id, name, arguments, item_type, "completed");
         }
     }
     value
@@ -1689,7 +1705,14 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             .to_string(),
         );
         // 收尾 item 必须是完整最终形态（name + 完整 arguments），空串会让客户端工具行关不掉
-        let item = extended_tool_item(&item_id, &call_id, &name, &arguments, &item_type);
+        let item = extended_tool_item(
+            &item_id,
+            &call_id,
+            &name,
+            &arguments,
+            &item_type,
+            "completed",
+        );
         out.push(
             json!({
                 "type": "response.output_item.done",
@@ -1825,7 +1848,7 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             // 扩展工具折叠还原（§10）：按上游 function 名还原 item 类型
             let item_type = restore_tool_type(name, &st.tool_identities);
             st.active_tool_type = item_type.to_string();
-            let item = extended_tool_item(&item_id, id, name, "", item_type);
+            let item = extended_tool_item(&item_id, id, name, "", item_type, "in_progress");
             out.push(
                 json!({
                     "type": "response.output_item.added",
@@ -3095,6 +3118,82 @@ mod tests {
         assert!(
             st.active_tool_item_id.is_empty(),
             "收尾后不得残留未关闭的工具 item"
+        );
+    }
+
+    /// 回归（zcode 真机故障）：Responses item 的 `status` 是**严格客户端的必填字段**。
+    /// zcode 内 AI SDK 的 zod schema 里，`response.output_item.done` 的 function_call 变体
+    /// 要求 `status: enum(in_progress|completed|incomplete)`；缺失 → 该帧校验失败被丢弃 →
+    /// 工具调用永远拿不到 `tool-input-end`/`tool-call`（表现为「工具行未终结」）。
+    #[test]
+    fn render_stream_tool_items_carry_status() {
+        let mut st = RenderState {
+            response_id: "resp_s".into(),
+            model: "deepseek-flash".into(),
+            ..Default::default()
+        };
+        let mut frames: Vec<String> = Vec::new();
+        let mut feed = |st: &mut RenderState, ev: StreamEvent, frames: &mut Vec<String>| {
+            frames.extend(render_stream_event(&ev, st));
+        };
+        feed(
+            &mut st,
+            StreamEvent::Start {
+                model: "deepseek-flash".into(),
+            },
+            &mut frames,
+        );
+        feed(
+            &mut st,
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: "call_s".into(),
+                name: "Bash".into(),
+            },
+            &mut frames,
+        );
+        feed(
+            &mut st,
+            StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                args_fragment: "{}".into(),
+            },
+            &mut frames,
+        );
+        feed(
+            &mut st,
+            StreamEvent::Finish {
+                stop_reason: StopReason::ToolUse,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            },
+            &mut frames,
+        );
+
+        let parsed: Vec<Value> = frames
+            .iter()
+            .filter_map(|f| serde_json::from_str(f).ok())
+            .collect();
+        let added = parsed
+            .iter()
+            .find(|v| {
+                v["type"] == "response.output_item.added" && v["item"]["type"] == "function_call"
+            })
+            .expect("缺 function_call 的 output_item.added");
+        assert_eq!(added["item"]["status"], "in_progress");
+        let done = parsed
+            .iter()
+            .find(|v| {
+                v["type"] == "response.output_item.done" && v["item"]["type"] == "function_call"
+            })
+            .expect("缺 function_call 的 output_item.done");
+        assert_eq!(
+            done["item"]["status"], "completed",
+            "done 的 function_call item 必须带 status（严格客户端 schema 必填）"
         );
     }
 

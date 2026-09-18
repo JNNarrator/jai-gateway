@@ -26,6 +26,14 @@ All notable changes to this project will be documented in this file.
     且终结 item 早期还传空 `name`/`arguments`。修复：`close_tool_call()` 在 `ToolCallEnd`、
     **`Finish`**、以及新 item 开始前补发带完整参数的 `function_call_arguments.done` +
     完整 `output_item.done`，并推进 `output_index` 防撞号。回归 2 条单测 + 真机逐流校验。
+  - **第四处（真凶）**：`response.output_item.done` 的 `status` 是**严格客户端必填字段**
+    （AI SDK zod schema：`z.enum(["in_progress","completed","incomplete"])`，无 `.nullish()`），
+    而 JAI 从不发 `status` → 整帧校验失败被**静默丢弃** → SDK 永不产生 `tool-input-end`/`tool-call`
+    （`chunkCounts` 只有 start/delta），工具行永远关不掉。已补 `status`
+    （added=`in_progress`、done=`completed`），并对齐其它 item 形状：`custom_tool_call.input`
+    转字符串、`apply_patch_call.operation` 保留对象、`shell_call` 带 `status`。
+    新增 `scripts/verify_responses_with_ai_sdk.mjs`（用真实 `ai`+`@ai-sdk/openai` 回放 JAI 的流），
+    修复后实测 `tool-call: 2`、name/input 正确、无 TypeValidationError。
 
 
 ## [0.2.7] - 2026-09-18
