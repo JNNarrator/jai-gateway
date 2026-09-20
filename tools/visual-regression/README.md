@@ -27,7 +27,14 @@ node tools/visual-regression/audit-summarize.mjs .vr/audit-dark-1180x800.json
 # MCP 页两个开关的说明性回归（标签/解释条/hover 详情/点文字能切换/无溢出）
 node tools/visual-regression/mcp-switches.mjs --size=1180x800
 node tools/visual-regression/mcp-switches.mjs --size=900x600
+
+# 网关页接入地址的说明性回归（Base URL 复制仍在 / 完整地址 5 条 / 复制内容逐条相符 / 无溢出）
+node tools/visual-regression/gateway-endpoints.mjs --size=1180x800
+node tools/visual-regression/gateway-endpoints.mjs --size=900x600
 ```
+
+`gateway-endpoints.mjs` 需要剪贴板读写授权（脚本内 `ctx.grantPermissions(["clipboard-read","clipboard-write"])`）——
+不授权时 `navigator.clipboard.readText()` 抛 `NotAllowedError`，会把「复制成功但读不到」误判成功能失败。
 
 `probe-colors3.mjs` 用于复核某个按钮的真实对比度（`DARK=1` 强制暗色主题）。本目录新增的两个探针
 （本地 `.vr/` 里同名副本，供 `TMPDIR` 口径运行）：

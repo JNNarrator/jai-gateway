@@ -664,6 +664,35 @@
     教训：断言里凡是「先筛选再取最值」，都必须显式断言**筛选结果非空**，否则「找不到元素」既可能假通过
     （`undefined && …` 恰好被写成宽松条件）又可能报出无法定位的失败，两种都在浪费排查时间。
 
+- [x] 7. 网关页缺「完整请求地址」：用户复制 Base URL 填进要求精确地址的客户端会 404（Reasonix 实测踩到）
+  - 现象：Reasonix 报 `JAI · Responses: Request endpoint not found (HTTP 404). Check the API format and request address.`
+    该文案**不是 JAI 产生的**（全仓库 grep 无此字符串），是 Reasonix 自己的报错模板，
+    `JAI · Responses` 只是「连接显示名 · API 格式」标签，不是 JAI 的响应内容。
+  - 根因（客户端侧）：Reasonix 桌面版「自定义供应商」表单把 **API 地址**当**精确请求地址**存进 `request_url`，
+    官方文档原文 *“Reasonix does not append or rewrite its path”*。用户填了网关页展示的 Base URL
+    `http://127.0.0.1:1314/v1`，请求就打到 `/v1` 上 —— JAI 无该路由 → 404。
+    实测对照：`POST /v1/responses` → 200；`POST /v1` → 404。
+  - 已解决（2026-09-20）：网关页「客户端接入」卡片**保留** Base URL 复制字段，另增「完整请求地址」区块
+    （5 条：Chat Completions / Anthropic Messages / Responses / 模型列表 / MCP 元数据，每条独立复制按钮）；
+    顶部常驻操作条加「复制完整地址」，一键复制接入清单（Base URL + API Key + 全部完整地址）；
+    卡片文案点明「精确请求地址（不会再补路径）」与填错会 404。
+  - 验证：新增探针 `tools/visual-regression/gateway-endpoints.mjs`（17 项断言：Base URL 复制功能仍在且内容正确 /
+    完整地址区块存在且恰好 5 条 / 每条都是完整端点而非裸 `/v1` / 端点集合与顺序一致 /
+    逐条点复制图标后**剪贴板内容逐条相符** / 一键复制含 Base URL + API Key + 全部完整地址 /
+    文案点出「精确请求地址」与「404」/ 无横向溢出且地址行内部无溢出 / 无控制台报错），
+    1180×800 与 900×600 双尺寸 **17/17 全绿**；`tsc --noEmit` 与 `vite build` 通过；
+    `fold.mjs --size=1180x800` 复核网关页 `pageHScroll 0 / mainHScroll 0 / clippedTextCount 0`
+    （新增的 4 个行内复制按钮落在折叠线以下，属既有「客户端接入卡片较长」范畴，主场景已由常驻条按钮覆盖）。
+  - 附带结论（**未改 JAI**）：JAI 的 `/v1/responses` 本身可用 —— 带 tools / streaming / reasoning 的 Agent 载荷
+    实测 200，SSE 事件链完整（`response.created` → `output_item.added` → `reasoning_summary_text.delta` →
+    `function_call_arguments.done` → `output_item.done` → `response.completed`），
+    且 dsh 就是走 `openai-responses` 线稳定在用。若日后仍要 JAI 侧兜底，可加 `/responses`（不带 `/v1`）别名路由；
+    **不建议**把裸 `/v1` 直接映射成 Responses —— 会掩盖客户端的配置错误，反而更难排查。
+  - 同批发现的 3 个 JAI 侧真实缺口（本次未改，待评估）：① 流式 `response.completed.response.output` 恒为 `[]`
+    （`RenderState` 不累积 output items，靠增量 `output_item.done` 解析的客户端无碍，读最终对象的有影响）；
+    ② 无状态：`GET`/`DELETE /v1/responses/{id}` 未实现，`store` / `previous_response_id` 被忽略；
+    ③ `web_search` 工具被静默忽略（`responses.rs` / `capability.rs` 无处理，返回 200 但不检索）。
+
 ## 3. 视觉回归（默认窗口 1180×800，最小 900×600）
 
 > v0.2.0 起默认窗口 980×640 → 1180×800（最小 760×520 → 900×600），见 §2 第 12 条。

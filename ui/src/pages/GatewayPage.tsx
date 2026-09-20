@@ -26,8 +26,20 @@ export function GatewayPage() {
   const [health, setHealth] = useState<HealthSummary | null>(null);
 
   const port = status?.port ?? 1314;
-  const baseUrl = `http://127.0.0.1:${port}/v1`;
-  const mcpUrl = `http://127.0.0.1:${port}/mcp`;
+  const origin = `http://127.0.0.1:${port}`;
+  const baseUrl = `${origin}/v1`;
+  const mcpUrl = `${origin}/mcp`;
+
+  /** 完整请求地址：部分客户端把配置项当**精确请求地址**用、不会再补路径
+   *  （典型：Reasonix 的「API 地址」即 `request_url`，填 `…/v1` 会打到 `/v1` 上得到 404）。
+   *  逐条列出真实端点供这类客户端整条复制；只填 Base URL 的客户端不受影响。 */
+  const endpoints = [
+    { label: "Chat Completions", method: "POST", url: `${origin}/v1/chat/completions` },
+    { label: "Anthropic Messages", method: "POST", url: `${origin}/v1/messages` },
+    { label: "Responses", method: "POST", url: `${origin}/v1/responses` },
+    { label: "模型列表", method: "GET", url: `${origin}/v1/models` },
+    { label: "MCP 元数据", method: "POST", url: mcpUrl },
+  ];
 
   async function refresh() {
     try {
@@ -108,6 +120,26 @@ export function GatewayPage() {
     }
   }
 
+  /** 复制全部接入地址：一份可直接粘进 Agent 配置的清单（含真实密钥，toast 已注明） */
+  async function doCopyEndpoints() {
+    try {
+      const real = revealKey || (await api.gatewayKeyReveal()).key;
+      const text = [
+        `JAI 网关接入信息（127.0.0.1:${port}）`,
+        "",
+        `Base URL  ${baseUrl}`,
+        `API Key   ${real}`,
+        "",
+        "完整请求地址（要求精确地址的客户端用这些，不会再自动补路径）",
+        ...endpoints.map((e) => `- ${e.label}（${e.method}）：${e.url}`),
+      ].join("\n");
+      await navigator.clipboard.writeText(text);
+      toast("已复制接入地址（含真实密钥）");
+    } catch {
+      toast("复制失败", "err");
+    }
+  }
+
   return (
     <div className="mx-auto max-w-2xl space-y-4">
       <PageHeader
@@ -133,6 +165,15 @@ export function GatewayPage() {
         <Button variant="outline" disabled={busy} onClick={() => void doCopyMcpConfig()}>
           <Copy aria-hidden />
           复制 MCP 配置
+        </Button>
+        <Button
+          variant="outline"
+          disabled={busy}
+          onClick={() => void doCopyEndpoints()}
+          data-testid="gateway-copy-endpoints"
+        >
+          <Copy aria-hidden />
+          复制完整地址
         </Button>
         <span className="ml-auto font-mono text-xs text-muted-foreground">
           127.0.0.1:{port}
@@ -209,10 +250,12 @@ export function GatewayPage() {
       <Card>
         <CardHeader>
           <CardTitle>客户端接入</CardTitle>
-          <CardDescription>把下面两个字段填进任意 OpenAI 兼容客户端即可。</CardDescription>
+          <CardDescription>
+            Base URL 与 API Key 是所有客户端都要的两项；要求「精确请求地址」的客户端改用下面的完整地址。
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4 text-sm">
-          <div className="space-y-1.5">
+          <div className="space-y-1.5" data-testid="gateway-base-url-row">
             <div className="text-muted-foreground">Base URL</div>
             <CopyField value={baseUrl} display={baseUrl} />
           </div>
@@ -247,6 +290,44 @@ export function GatewayPage() {
                 轮换密钥
               </Button>
             </CopyField>
+          </div>
+
+          {/* 完整请求地址与 Base URL 并存：Base URL 供「自己拼路径」的客户端，
+              完整地址供「配置项即精确地址」的客户端（典型：Reasonix 的「API 地址」）。 */}
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+              <span className="text-muted-foreground">完整请求地址</span>
+              <span className="text-xs text-muted-foreground">
+                客户端要求精确地址时整条复制，不会再自动补路径
+              </span>
+            </div>
+            <ul className="space-y-1.5" data-testid="gateway-endpoints">
+              {endpoints.map((e) => (
+                <li
+                  key={e.url}
+                  className="flex items-center gap-2"
+                  data-testid="gateway-endpoint"
+                  data-url={e.url}
+                >
+                  <span
+                    className="w-36 shrink-0 truncate text-xs text-muted-foreground"
+                    title={`${e.label}（${e.method}）`}
+                  >
+                    {e.label}
+                  </span>
+                  <span className="w-9 shrink-0 font-mono text-xs text-muted-foreground">
+                    {e.method}
+                  </span>
+                  <CopyField value={e.url} display={e.url} className="min-w-0 flex-1" />
+                </li>
+              ))}
+            </ul>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              例：Reasonix 的「API 地址」是<b>精确请求地址</b>（不会再补路径）—— 填{" "}
+              <code className="font-mono">{baseUrl}</code> 会打到{" "}
+              <code className="font-mono">/v1</code> 上返回 404，应改用 Responses 那一整条。
+              多数客户端（OpenAI SDK、dsh 等）只填 Base URL 即可。
+            </p>
           </div>
         </CardContent>
       </Card>
