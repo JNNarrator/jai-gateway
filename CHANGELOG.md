@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-09-20
+
+### Added
+- **网关页「客户端接入」补「完整请求地址」与一键复制**：原先只提供 Base URL
+  （`http://127.0.0.1:<端口>/v1`），而部分客户端把配置项当**精确请求地址**用、不会再补路径
+  （典型：Reasonix 桌面版的「API 地址」即 `request_url`，其文档写明
+  *“Reasonix does not append or rewrite its path”*）。把 Base URL 填进这类客户端，请求会打到
+  `/v1` 上，JAI 无该路由 → **404**；而客户端报错只说
+  `Request endpoint not found (HTTP 404). Check the API format and request address.`
+  （该文案**不是** JAI 产生的，是 Reasonix 自己的模板），很难定位到「少填了后缀」。
+  - 新增「完整请求地址」区块：Chat Completions / Anthropic Messages / Responses /
+    模型列表 / MCP 元数据 共 5 条真实端点，每条独立复制按钮；端口跟随实际监听端口，
+    被占用顺延时自动生效（非写死 1314）；
+  - 顶部常驻操作条新增「复制完整地址」：一键复制接入清单（Base URL + API Key + 全部完整地址）；
+  - **Base URL 复制字段保留**（两个功能并存），只填 Base URL 的客户端（OpenAI SDK、dsh 等）不受影响；
+  - 卡片文案点明「精确请求地址（不会再补路径）」与填错会 404 的后果。
+  - 验证：新增探针 `tools/visual-regression/gateway-endpoints.mjs`（17 项断言，含点复制后
+    **读剪贴板逐条比对**，以及「每条都是完整端点而非裸 `/v1`」这个本次踩坑形态的防退化断言），
+    1180×800 与 900×600 双尺寸 17/17 全绿；`tsc --noEmit` 与 `vite build` 通过；
+    `fold.mjs` 复核网关页 `pageHScroll 0 / mainHScroll 0 / clippedTextCount 0`。
+  - 附注：JAI 的 `/v1/responses` 本身可用（带 tools / streaming / reasoning 的 Agent 载荷实测 200，
+    SSE 事件链完整），**本次未改 JAI 服务端**；同批发现 3 个缺口已登记待评估
+    （流式 `response.completed.output` 恒空、无 `GET`/`DELETE /v1/responses/{id}`、
+    `web_search` 工具静默忽略）。
+
 ## [0.2.8] - 2026-09-18
 
 ### Fixed
