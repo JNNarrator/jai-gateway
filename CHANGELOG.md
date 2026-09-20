@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **流式 `response.completed.response.output` 恒为 `[]`** —— 只读最终对象的客户端会拿到一个**空回合**。
+  `RenderState::new_response` 把 `output` 写死成空数组，真实内容只存在于增量事件里；
+  同一份内容在非流式路径 `render_response` 里是完整的，**两条路径行为不一致**。
+  靠 delta 解析的客户端（Reasonix / dsh）无碍，但严格实现（只读最终对象）会丢整轮。
+  - 物证（2026-09-20 抓包实测，Reasonix 一次真实请求）：同一帧流里
+    **448 个 `response.output_text.delta` 带着完整文本**，而收尾帧是 `"output":[]`。
+  - 修法：`RenderState` 新增 `completed_items: Vec<Value>`，在三处 `output_item.done`
+    （reasoning / message / function_call）发出时同步累积；收尾改用新的
+    `completed_response(status)` 回填 `output`。`response.created` / `response.in_progress`
+    仍走 `new_response`（此时确实还没有 output）。
+  - **顺序语义**：累积顺序 = `output_item.done` 的**收尾顺序**。因为 `output_index` 只在收尾时
+    递增，收尾顺序必然等于递增的 `output_index` 顺序 —— 与客户端实际观察到的事件序一致。
+    注意「文本 + 工具调用同轮」时 `msg_started` 有意跨工具保持打开（为的是不重发
+    `output_item.added`），所以文本 item 的 index 在收尾时才落定，`output` 里呈现收尾顺序
+    而非「先文本后工具」的语义顺序；这是既有特性，本次**未改**，测试也不锁该顺序。
+  - `Ev::Start` 新增清空累积，避免上一轮的 item 串进本轮。
+  - 验证：新增 5 个单测（纯文本 / 推理+工具调用（抓包真实形状）/ 三类混合 / 反证「没有
+    `output_item.done` 就不该凭空多出 item」/ 反证「跨轮不泄漏」）。反证实测：把收尾帧改回
+    `new_response` 后，4 个用例精确变红、对照用例仍绿。
+    全量回归 **366 通过 / 0 失败**（原 361，+5）。
+  - 附注：既有测试只断言收尾帧「存在」（`contains("response.completed")`），**从没检查过 `output`**
+    —— 这正是该洞长期未被发现的原因。
+
 ### Changed
 - **限定名 `供应商/模型` 的语义从「只用这家」改为「优先这家」**，恢复故障转移。
   旧实现是 `candidates.retain(|c| c.provider_name == …)` —— 等于把故障转移**彻底关掉**：

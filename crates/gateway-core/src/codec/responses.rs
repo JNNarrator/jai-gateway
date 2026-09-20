@@ -1611,9 +1611,17 @@ pub struct RenderState {
     pub active_tool_call_id: String,
     pub active_tool_name: String,
     pub active_tool_args: String,
+    /// 已收尾的 output item（按 `output_index` 顺序累积）。
+    ///
+    /// `response.completed.response.output` **必须**回填这些：只读最终对象、不解析增量事件的
+    /// 客户端否则会拿到一个**空回合**。早期这里恒为 `[]`（`new_response` 写死），
+    /// 与非流式路径 `render_response` 的行为不一致 —— 同一份内容，流式给空、非流式给全。
+    /// 形状与非流式对齐：reasoning / message / function_call 都进 `output`。
+    pub completed_items: Vec<Value>,
 }
 
 impl RenderState {
+    /// `response.created` / `response.in_progress` 用：此时还没有任何 output。
     fn new_response(&self, status: &str) -> Value {
         json!({
             "id": self.response_id,
@@ -1623,6 +1631,16 @@ impl RenderState {
             "model": self.model,
             "output": [],
         })
+    }
+
+    /// `response.completed` 用：回填已收尾的 output item。
+    ///
+    /// 用 `.clone()` 而非取走：同一份状态可能被继续用于后续帧（例如上游在
+    /// `response.completed` 之后还有尾部事件），不能把累积清空。
+    fn completed_response(&self, status: &str) -> Value {
+        let mut v = self.new_response(status);
+        v["output"] = Value::Array(self.completed_items.clone());
+        v
     }
 }
 
@@ -1671,20 +1689,23 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
         // `summary` 是严格客户端回传历史时读取的位置（AI SDK 会把 reasoning item 的
         // summary[].text 变成下一次请求里的 reasoning item）；`content` 保留给既有客户端。
         let summary = json!([{"type": "summary_text", "text": text}]);
+        let item = json!({
+            "type": "reasoning",
+            "id": item_id,
+            "role": "assistant",
+            "summary": summary,
+            "content": [part],
+        });
         out.push(
             json!({
                 "type": "response.output_item.done",
                 "output_index": st.output_index,
-                "item": {
-                    "type": "reasoning",
-                    "id": item_id,
-                    "role": "assistant",
-                    "summary": summary,
-                    "content": [part],
-                },
+                "item": item.clone(),
             })
             .to_string(),
         );
+        // 累积给 `response.completed.response.output`（只读最终对象的客户端唯一真相来源）
+        st.completed_items.push(item);
         st.output_index += 1;
     }
     /// 关闭当前仍开着的工具 item：补 `function_call_arguments.done` + `output_item.done`。
@@ -1731,10 +1752,12 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             json!({
                 "type": "response.output_item.done",
                 "output_index": st.output_index,
-                "item": item,
+                "item": item.clone(),
             })
             .to_string(),
         );
+        // 累积给 `response.completed.response.output`
+        st.completed_items.push(item);
         st.output_index += 1;
     }
 
@@ -1750,6 +1773,8 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
             st.current_text.clear();
             st.reasoning_started = false;
             st.current_reasoning.clear();
+            // 新一轮必须清空累积，否则上一轮的 output 会串进本轮的 response.completed
+            st.completed_items.clear();
             vec![
                 json!({
                     "type": "response.created",
@@ -1944,20 +1969,23 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                     })
                     .to_string(),
                 );
+                let item = json!({
+                    "type": "message",
+                    "id": item_id,
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [part],
+                });
                 out.push(
                     json!({
                         "type": "response.output_item.done",
                         "output_index": st.output_index,
-                        "item": {
-                            "type": "message",
-                            "id": item_id,
-                            "role": "assistant",
-                            "status": "completed",
-                            "content": [part],
-                        },
+                        "item": item.clone(),
                     })
                     .to_string(),
                 );
+                // 累积给 `response.completed.response.output`
+                st.completed_items.push(item);
                 st.msg_started = false;
             }
             let status = match stop_reason {
@@ -1965,7 +1993,8 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                 _ => "completed",
             };
             let usage_json = build_usage(usage);
-            let mut response = st.new_response(status);
+            // 回填已收尾的 output item（早期恒为 `[]`，只读最终对象的客户端会拿到空回合）
+            let mut response = st.completed_response(status);
             response["usage"] = usage_json;
             out.push(
                 json!({
@@ -3411,5 +3440,259 @@ mod tests {
             fin.iter().any(|s| s.contains("response.output_text.done")),
             "Finish 应补齐 output_text.done"
         );
+    }
+
+    // ------------------------------------------------ response.completed 的 output 回填
+    //
+    // 回归背景（2026-09-20，抓包实测）：`response.completed.response.output` **恒为 `[]`** ——
+    // `new_response` 把 `output` 写死成空数组，真实内容只在增量事件里。
+    // 靠 delta 解析的客户端（Reasonix / dsh）无碍，但**只读最终对象的客户端会拿到一个空回合**；
+    // 同一份内容在非流式路径 `render_response` 里是完整的，两条路径行为不一致。
+    // 既有测试只断言收尾帧「存在」（`contains("response.completed")`），**从没检查过 `output`**，
+    // 所以这个洞一直没被发现。下面三条用例专补这一点。
+
+    /// 取出 `response.completed` 帧并解析成 JSON。
+    fn completed_frame(frames: &[String]) -> Value {
+        frames
+            .iter()
+            .find_map(|s| {
+                let v: Value = serde_json::from_str(s).ok()?;
+                (v.get("type").and_then(Value::as_str) == Some("response.completed")).then_some(v)
+            })
+            .expect("必须有可解析的 response.completed 帧")
+    }
+
+    fn mk_state() -> RenderState {
+        RenderState {
+            response_id: "resp_test".into(),
+            model: "gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn finish(st: &mut RenderState, stop: StopReason) -> Vec<String> {
+        render_stream_event(
+            &StreamEvent::Finish {
+                stop_reason: stop,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            },
+            st,
+        )
+    }
+
+    /// 纯文本：`output` 必须含那条 assistant message 及其完整文本。
+    #[test]
+    fn completed_frame_output_has_message_item() {
+        let mut st = mk_state();
+        render_stream_event(
+            &StreamEvent::Start {
+                model: "gpt-4o".into(),
+            },
+            &mut st,
+        );
+        render_stream_event(
+            &StreamEvent::TextDelta {
+                text: "答案".into(),
+            },
+            &mut st,
+        );
+        let fin = finish(&mut st, StopReason::EndTurn);
+
+        let out = completed_frame(&fin)["response"]["output"]
+            .as_array()
+            .expect("output 必须是数组")
+            .clone();
+        assert_eq!(out.len(), 1, "纯文本应恰好 1 个 output item，实际 {out:?}");
+        assert_eq!(out[0]["type"].as_str(), Some("message"));
+        assert_eq!(out[0]["role"].as_str(), Some("assistant"));
+        assert_eq!(out[0]["status"].as_str(), Some("completed"));
+        assert_eq!(
+            out[0]["content"][0]["text"].as_str(),
+            Some("答案"),
+            "message item 必须带完整文本（只读最终对象的客户端唯一来源）"
+        );
+    }
+
+    /// 推理 + 工具调用（**抓包实测的真实形状**）：两者都要进 `output`。
+    #[test]
+    fn completed_frame_output_has_reasoning_and_tool_call() {
+        let mut st = mk_state();
+        render_stream_event(
+            &StreamEvent::Start {
+                model: "gpt-4o".into(),
+            },
+            &mut st,
+        );
+        render_stream_event(
+            &StreamEvent::ThinkingDelta {
+                text: "先查天气".into(),
+            },
+            &mut st,
+        );
+        render_stream_event(
+            &StreamEvent::ToolCallStart {
+                index: 0,
+                id: "call_1".into(),
+                name: "get_weather".into(),
+            },
+            &mut st,
+        );
+        render_stream_event(
+            &StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                args_fragment: "{\"city\":\"bj\"}".into(),
+            },
+            &mut st,
+        );
+        let fin = finish(&mut st, StopReason::ToolUse);
+
+        let out = completed_frame(&fin)["response"]["output"]
+            .as_array()
+            .expect("output 必须是数组")
+            .clone();
+        let kinds: Vec<&str> = out.iter().filter_map(|i| i["type"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["reasoning", "function_call"],
+            "推理与工具调用都要进 output，实际 {kinds:?}"
+        );
+        assert_eq!(
+            out[0]["summary"][0]["text"].as_str(),
+            Some("先查天气"),
+            "reasoning item 要带 summary[].text（严格客户端回传历史时读这里）"
+        );
+        assert_eq!(out[1]["name"].as_str(), Some("get_weather"));
+        assert_eq!(out[1]["call_id"].as_str(), Some("call_1"));
+        assert_eq!(
+            out[1]["arguments"].as_str(),
+            Some("{\"city\":\"bj\"}"),
+            "工具 item 必须带**完整**参数，否则客户端无法重放这次调用"
+        );
+    }
+
+    /// 文本 + 工具调用混在一轮：三类 item 都要在，且各自数据完整。
+    ///
+    /// **顺序刻意不写死**：`msg_started` 有意跨工具调用保持打开（见字段注释，为的是不重发
+    /// `output_item.added`），于是文本 item 的 `output_index` 在收尾时才落定，`output` 里
+    /// 呈现的是**收尾顺序**（= 递增的 `output_index` 顺序），而非「先文本后工具」的语义顺序。
+    /// 这里只断言集合与数据，不锁顺序，避免把这一既有特性固化成断言。
+    #[test]
+    fn completed_frame_output_has_all_three_item_kinds() {
+        let mut st = mk_state();
+        render_stream_event(
+            &StreamEvent::Start {
+                model: "gpt-4o".into(),
+            },
+            &mut st,
+        );
+        render_stream_event(&StreamEvent::ThinkingDelta { text: "想".into() }, &mut st);
+        render_stream_event(
+            &StreamEvent::TextDelta {
+                text: "先说一句".into(),
+            },
+            &mut st,
+        );
+        render_stream_event(
+            &StreamEvent::ToolCallStart {
+                index: 0,
+                id: "call_9".into(),
+                name: "bash".into(),
+            },
+            &mut st,
+        );
+        render_stream_event(
+            &StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                args_fragment: "{\"command\":\"ls\"}".into(),
+            },
+            &mut st,
+        );
+        let fin = finish(&mut st, StopReason::ToolUse);
+
+        let out = completed_frame(&fin)["response"]["output"]
+            .as_array()
+            .expect("output 必须是数组")
+            .clone();
+        let mut kinds: Vec<&str> = out.iter().filter_map(|i| i["type"].as_str()).collect();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            vec!["function_call", "message", "reasoning"],
+            "三类 item 都要进 output，实际 {out:?}"
+        );
+        let msg = out
+            .iter()
+            .find(|i| i["type"] == "message")
+            .expect("应有 message item");
+        assert_eq!(msg["content"][0]["text"].as_str(), Some("先说一句"));
+        let fc = out
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("应有 function_call item");
+        assert_eq!(fc["call_id"].as_str(), Some("call_9"));
+    }
+
+    /// 反证：没有 `output_item.done` 就不该凭空多出 item（`output` 与增量帧必须同源）。
+    #[test]
+    fn completed_frame_output_is_empty_when_nothing_emitted() {
+        let mut st = mk_state();
+        render_stream_event(
+            &StreamEvent::Start {
+                model: "gpt-4o".into(),
+            },
+            &mut st,
+        );
+        let fin = finish(&mut st, StopReason::EndTurn);
+        let out = completed_frame(&fin)["response"]["output"]
+            .as_array()
+            .expect("output 必须是数组")
+            .clone();
+        assert!(out.is_empty(), "没有任何 item 时应为空，实际 {out:?}");
+    }
+
+    /// 新一轮 `Start` 必须清空累积，否则上一轮的 output 会串进本轮。
+    #[test]
+    fn completed_frame_output_does_not_leak_across_turns() {
+        let mut st = mk_state();
+        render_stream_event(
+            &StreamEvent::Start {
+                model: "gpt-4o".into(),
+            },
+            &mut st,
+        );
+        render_stream_event(
+            &StreamEvent::TextDelta {
+                text: "第一轮".into(),
+            },
+            &mut st,
+        );
+        let _ = finish(&mut st, StopReason::EndTurn);
+
+        // 第二轮：同一个 RenderState 复用
+        render_stream_event(
+            &StreamEvent::Start {
+                model: "gpt-4o".into(),
+            },
+            &mut st,
+        );
+        render_stream_event(
+            &StreamEvent::TextDelta {
+                text: "第二轮".into(),
+            },
+            &mut st,
+        );
+        let fin2 = finish(&mut st, StopReason::EndTurn);
+
+        let out = completed_frame(&fin2)["response"]["output"]
+            .as_array()
+            .expect("output 必须是数组")
+            .clone();
+        assert_eq!(out.len(), 1, "第二轮不该带上第一轮的 item，实际 {out:?}");
+        assert_eq!(out[0]["content"][0]["text"].as_str(), Some("第二轮"));
     }
 }

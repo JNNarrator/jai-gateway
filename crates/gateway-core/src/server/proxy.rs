@@ -2092,6 +2092,7 @@ async fn convert_streaming_response(
             current_reasoning: String::new(),
             tool_identities,
             active_tool_type: String::new(),
+            completed_items: Vec::new(),
         }),
     };
     // 渲染单个 IR 事件 → SSE 输出帧（一个 IR 事件可能展开多个 SSE 事件）
