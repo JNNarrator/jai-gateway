@@ -51,7 +51,11 @@ pub fn order_candidates(
     out
 }
 
-fn is_healthy(c: &StoreRouteCandidate, now_ms: i64) -> bool {
+/// 渠道健康判定（冷却窗口见 [`HEALTH_COOLDOWN_MS`]）。
+///
+/// 对外可见：`proxy.rs` 在兑现「限定名 `供应商/模型` 优先」时也要用它 ——
+/// 指定渠道已知不健康时不该去抢健康备渠道的位置。
+pub fn is_healthy(c: &StoreRouteCandidate, now_ms: i64) -> bool {
     match (c.last_ok_at, c.last_err_at) {
         (Some(ok), Some(err)) => ok >= err,
         (Some(_), None) => true,

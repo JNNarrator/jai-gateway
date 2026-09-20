@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **限定名 `供应商/模型` 的语义从「只用这家」改为「优先这家」**，恢复故障转移。
+  旧实现是 `candidates.retain(|c| c.provider_name == …)` —— 等于把故障转移**彻底关掉**：
+  只要客户端用的是 JAI `/v1/models` 推荐的限定名（Reasonix 就是这么选的），
+  这家上游一抖动就**没有任何退路**（实测该上游 502 占 9.78%，当天 20%），
+  与 v0.2.10 加的同渠道重试是同一问题的两个层面。
+  - 新语义：指定供应商**优先**，其余同模型候选保留为**后备**。
+  - **健康优先于指定**：指定渠道已知不健康时不抢健康备渠道的位置（否则每次都要先撞一次已知失败）。
+    四档顺序：健康+指定 → 健康+其它 → 不健康+指定 → 不健康+其它。
+    为此把 `router::is_healthy` 由私有改为 `pub`（`proxy.rs` 复用同一判定，不另写一套）。
+  - **保留一条硬约束**：指定供应商**一个候选都没命中时仍然 404**。否则供应商名打错会
+    静默换家出答案，比报错难排查得多。
+  - 排序用**稳定排序**叠加在既有「同族优先 + 健康/优先级/权重」序之后，
+    故每档内部顺序不变；`route_candidates` 精确匹配 `model_name`、逐候选按各自
+    `upstream_model_id` 改写模型名，回退到别家时模型名依然正确。
+  - 验证：新增 `crates/gateway-core/tests/m12_qualified_provider_fallback.rs`（4 用例）。
+    夹具里**指定供应商的 priority 刻意更差**（200 vs 100）—— 若「优先」没生效，
+    请求必然落到另一家，用例立刻变红。覆盖：
+    ① 指定渠道 500 → 回退到备渠道成功；② 同一夹具再发一次 → 指定渠道已被标记不健康，
+    健康逻辑接管，**指定渠道不再被尝试**；③ 两家都 200 → 用指定那家（优先压过更优 priority），
+    备渠道一次都没被碰；④ 供应商名对不上 → 404；⑤ 裸模型名行为不变（仍按 priority）。
+    反证实测：把实现退回 `retain` 后，用例 ①③⑤ 精确变红。
+  - 附注：仓库**没有**任何既有测试依赖旧的 `retain` 行为（已 grep 确认），故回归风险低。
+
+### Added
+- 新增诊断器 `crates/gateway-core/tests/diag_responses_conversion.rs`（默认 `#[ignore]`，不进回归）：
+  把 Responses 入站 → chat/completions 出站的转换结果**逐条打印**（role / content /
+  `reasoning_content` / `tool_calls` / `tool_call_id`），并自动检查 5 件事：最后一条是否为
+  用户真正的问题、system 是否来自 `instructions`、推理是否混进 `content`、工具调用与结果是否配对、
+  有无多余插入消息。客户端报「答非所问 / 上下文被插了东西」时先用它自查，不必改任何线上配置：
+  `cargo test --test diag_responses_conversion -- --ignored --nocapture`，
+  或 `JAI_DIAG_PAYLOAD=/tmp/real.json` 喂真实抓到的请求体。
+
 ## [0.2.10] - 2026-09-20
 
 ### Fixed

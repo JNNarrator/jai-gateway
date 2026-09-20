@@ -849,14 +849,36 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             }
         }
     };
+    // 限定名 `供应商/模型`：该供应商**优先**，其余同模型候选保留为**后备**。
+    //
+    // 旧行为是 `retain` 掉其它供应商，等于把故障转移彻底关掉 —— 只要客户端用的是
+    // `/v1/models` 推荐的限定名（Reasonix 就是），这家上游一抖动就**没有任何退路**
+    // （实测该上游 502 占 9.78%）。语义按「优先」而非「只用」实现。
+    //
+    // 但保留一条硬约束：**指定供应商一个候选都没命中时仍然 404**。
+    // 否则供应商名打错会静默换家出答案，比报错难排查得多。
     if let Some(provider_name) = &provider_filter {
-        candidates.retain(|c| c.provider_name == *provider_name);
+        if !candidates.iter().any(|c| c.provider_name == *provider_name) {
+            candidates.clear();
+        }
     }
+    let now = store::now_ms();
     // 高级路由：健康感知 + 同优先级权重负载均衡
-    candidates = router::order_candidates(candidates, store::now_ms());
+    candidates = router::order_candidates(candidates, now);
     // Responses 入站优先走同协议族直通（openai_responses），
     // 避免同名模型被 openai_compat 转换渠道按优先级截胡导致 400。
     candidates.sort_by_key(|c| c.family != wire.family());
+    // 限定名的「优先」在这里兑现，且**健康优先于指定**：
+    // 指定渠道已知不健康时不去抢健康备渠道的位置（否则每次都要先撞一次已知失败），
+    // 但在同一健康档内把指定供应商提到最前。四档顺序：
+    //   健康+指定 → 健康+其它 → 不健康+指定 → 不健康+其它
+    // 用稳定排序，故每档内部沿用上面已算好的「同族优先 + 优先级 + 权重」序。
+    if let Some(provider_name) = &provider_filter {
+        candidates.sort_by_key(|c| {
+            let named = c.provider_name == *provider_name;
+            (!router::is_healthy(c, now), !named)
+        });
+    }
 
     if candidates.is_empty() {
         let msg = format!("模型 {model:?} 不存在或其渠道未启用");
