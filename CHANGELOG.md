@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-09-20
+
 ### Fixed
 - **上游「连接类」失败改为同渠道重试一次**（`UPSTREAM_CONNECT_RETRY = 1`）。
   原先逐渠道尝试时，每个候选**只发一次**请求；候选列表里若只有一家供应商，
