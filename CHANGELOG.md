@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **上游「连接类」失败改为同渠道重试一次**（`UPSTREAM_CONNECT_RETRY = 1`）。
+  原先逐渠道尝试时，每个候选**只发一次**请求；候选列表里若只有一家供应商，
+  等于**既无下一渠道可切、也没有任何重试**，一次上游抖动就让整个回合失败。
+  - 实测依据：本机 `基元律动`（tokenrhythm.studio）502 占全量 **9.78%**
+    （2026-09-20 当天 20%），错误为 `上游连接失败: error sending request for url (…)`；
+    当时唯一救回来的是客户端自己的重试（Reasonix 2s 后同体重试即成功）。
+    该模型在 `route_candidates` 中精确匹配 `model_name` 只命中 1 个渠道，
+    且客户端用的是限定名 `基元律动/deepseek-flash`（JAI 会按供应商过滤候选），
+    两条路都指向「单渠道、零重试」。
+  - 重试范围**刻意收窄**：只重试 `send()` 阶段的连接类失败（建连/握手失败、
+    **响应头到达前连接被重置**）。判据排除 `is_timeout()`（等待预算已花掉，重试等于翻倍）
+    与 `is_builder()`（请求构造失败，重试必然再失败）；其余一律视为连接类 ——
+    **有意不收窄到 `is_connect()`**：上游偶发在发响应头前 RST，reqwest 常把它归到
+    request/body，只看 `is_connect()` 会漏掉真实场景。
+  - 安全性：走到该分支意味着响应头都还没到、下游一个字节未收，重试不会造成重复输出；
+    HTTP 层失败（含 5xx）**不重试** —— 链路已通，重试只会放大上游压力。
+  - 两条发送点都已覆盖：直通 `try_candidate` 与转换 `try_converted_candidate`。
+    顺带把两处请求组装收敛为闭包（reqwest 的 `RequestBuilder` 一次性，重试必须重建），
+    并去掉转换路径里 `(url, (out, body))` 的多余嵌套与只为消警告的 `drop(url)`。
+  - 验证：新增 `crates/gateway-core/tests/m11_connect_retry.rs`（3 用例）——
+    黑洞上游（accept 后立刻断开）+ **建连计数**证明「同渠道重试恰好 1 次」（直通/转换各一条），
+    外加反证「HTTP 500 不重试」（请求计数 == 1）。
+    反证实测：把 `UPSTREAM_CONNECT_RETRY` 置 0 后两条重试用例精确变红、5xx 用例仍绿。
+    全量回归 **357 通过 / 0 失败**（原 354，+3），`fmt --check`、`clippy -D warnings`、
+    `tsc --noEmit`、`vite build` 全绿。
+  - 附注（未改）：`route_candidates` + 限定名过滤导致的「限定名关掉故障转移」是另一个
+    独立问题，本次**按用户要求不动**，仅登记。
+
 ## [0.2.9] - 2026-09-20
 
 ### Added

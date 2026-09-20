@@ -59,6 +59,31 @@ fn sse_line_hold_timeout() -> Duration {
         .unwrap_or(SSE_LINE_HOLD_TIMEOUT)
 }
 
+/// 上游**连接类**失败在**同一渠道**内的额外重试次数。
+///
+/// 为什么需要：连接失败多为瞬时（连接池里的死连接、上游 LB 瞬时拒绝、TLS 抖动），
+/// 而「换下一渠道」对**单渠道模型**根本无路可走 —— 实测「基元律动」的 502 占全量 9.78%
+/// （2026-09-20 当天 20%），当时唯一能救回来的就是客户端自己重试。
+/// 只重试连接类失败：此时上游未回响应头、下游也一个字节未收到，重试安全且幂等。
+/// **不重试**超时与请求构造失败（理由见下）。
+pub const UPSTREAM_CONNECT_RETRY: usize = 1;
+
+/// 该 `send()` 失败是否值得同渠道立刻再试一次。
+///
+/// 判据刻意保守，只排除两类：
+/// - `is_timeout()`：`.timeout(300s)` / 10s 建连超时的等待预算已经花掉，重试等于把等待翻倍；
+/// - `is_builder()`：请求本身构造失败（非法 URL 等），重试必然再失败。
+///
+/// 其余 send 阶段错误（建连失败、握手失败、**响应头到达前连接被重置**）一律按「连接类」处理。
+/// 这里**有意不**收窄到 `is_connect()`：上游偶发在发出响应头前 RST，这类错误 reqwest 常归到
+/// request/body 而不是 connect，只看 `is_connect()` 会把真实场景漏掉。
+///
+/// 安全性：走到这里意味着 `send()` 返回了 Err —— 响应头都还没到，下游一个字节都没收到，
+/// 因此重试不会造成重复输出；代价上限是同渠道多打一次上游。
+fn should_retry_connect(e: &reqwest::Error, tries: usize) -> bool {
+    tries < UPSTREAM_CONNECT_RETRY && !e.is_timeout() && !e.is_builder()
+}
+
 // ---------------------------------------------------------------- 入站线（wire）
 
 /// 入站协议线。差异（路径/鉴权头/错误形状/日志族）全部收敛在此。
@@ -1145,28 +1170,45 @@ async fn try_candidate(
     };
 
     // ---- 组装上游请求（body 原样字节）----
-    let url = url_join(&cand.base_url, wire.upstream_path());
-    let mut out_req = wire.apply_auth(ctx.http.post(&url), &secret);
-    if let Some(eh_raw) = cand.extra_headers.as_deref() {
-        match serde_json::from_str::<serde_json::Map<String, Value>>(eh_raw) {
-            Ok(map) => {
-                for (k, v) in map {
-                    if let Some(s) = v.as_str() {
-                        if let (Ok(name), Ok(val)) = (
-                            HeaderName::from_bytes(k.as_bytes()),
-                            HeaderValue::from_str(s),
-                        ) {
-                            out_req = out_req.header(name, val);
+    // 包成闭包以便重建：reqwest 的 RequestBuilder 是一次性的，
+    // 同渠道重试（should_retry_connect）必须拿一份全新请求。
+    let build_upstream = || {
+        let url = url_join(&cand.base_url, wire.upstream_path());
+        let mut r = wire.apply_auth(ctx.http.post(&url), &secret);
+        if let Some(eh_raw) = cand.extra_headers.as_deref() {
+            match serde_json::from_str::<serde_json::Map<String, Value>>(eh_raw) {
+                Ok(map) => {
+                    for (k, v) in map {
+                        if let Some(s) = v.as_str() {
+                            if let (Ok(name), Ok(val)) = (
+                                HeaderName::from_bytes(k.as_bytes()),
+                                HeaderValue::from_str(s),
+                            ) {
+                                r = r.header(name, val);
+                            }
                         }
                     }
                 }
+                Err(e) => eprintln!("[proxy] extra_headers 解析失败(忽略): {e}"),
             }
-            Err(e) => eprintln!("[proxy] extra_headers 解析失败(忽略): {e}"),
         }
-    }
-    out_req = forward_inbound_headers(out_req, inbound_headers);
+        forward_inbound_headers(r, inbound_headers)
+    };
 
-    let upstream = out_req.body(body.clone()).send().await;
+    // 同渠道重试：连接类失败时立刻用一份新请求再试一次（见 UPSTREAM_CONNECT_RETRY）。
+    let mut connect_tries = 0usize;
+    let upstream = loop {
+        match build_upstream().body(body.clone()).send().await {
+            Ok(r) => break Ok(r),
+            Err(e) if should_retry_connect(&e, connect_tries) => {
+                connect_tries += 1;
+                eprintln!(
+                    "[proxy] 上游连接失败，同渠道重试 {connect_tries}/{UPSTREAM_CONNECT_RETRY}: {e}"
+                );
+            }
+            Err(e) => break Err(e),
+        }
+    };
     let resp = match upstream {
         Ok(r) => r,
         Err(e) => {
@@ -1462,8 +1504,8 @@ async fn try_converted_candidate(
         }
     }
 
-    // 3) 按上游协议族编码
-    let (url, auth_builder) = match cand.family.as_str() {
+    // 3) 按上游协议族编码（url + 上游请求体；builder 在 §4 逐次重建）
+    let (url, body_json) = match cand.family.as_str() {
         "anthropic" => {
             let body = match crate::codec::anthropic::encode_request(&req) {
                 Ok(b) => b,
@@ -1478,8 +1520,7 @@ async fn try_converted_candidate(
             };
             let url = url_join(&cand.base_url, "/v1/messages");
             // 鉴权：x-api-key + anthropic-version（代理调用上游）
-            let out = ctx.http.post(&url);
-            (url, (out, body))
+            (url, body)
         }
         "gemini" => {
             // Gemini 不接受任意外链（fileData 仅限 GCS URI）：
@@ -1510,8 +1551,7 @@ async fn try_converted_candidate(
                 url.push_str("?alt=sse");
             }
             // 鉴权：x-goog-api-key
-            let out = ctx.http.post(&url);
-            (url, (out, body))
+            (url, body)
         }
         "openai_compat" => {
             // M5：Anthropic 入站 → OpenAI 兼容上游
@@ -1527,8 +1567,7 @@ async fn try_converted_candidate(
                 }
             };
             let url = url_join(&cand.base_url, "/chat/completions");
-            let out = ctx.http.post(&url);
-            (url, (out, body))
+            (url, body)
         }
         "openai_responses" => {
             // Responses 入站 → Responses 同族上游（dsh/one-model）
@@ -1544,8 +1583,7 @@ async fn try_converted_candidate(
                 }
             };
             let url = url_join(&cand.base_url, "/responses");
-            let out = ctx.http.post(&url);
-            (url, (out, body))
+            (url, body)
         }
         other => {
             return Attempt::Failed {
@@ -1557,7 +1595,6 @@ async fn try_converted_candidate(
     };
 
     // 4) 取上游密钥并组装请求
-    let (out, body_json) = auth_builder;
     let secret = match cand.api_key.as_deref() {
         Some(k) => k.to_string(),
         None => {
@@ -1570,34 +1607,53 @@ async fn try_converted_candidate(
             };
         }
     };
-    let mut out_req = match cand.family.as_str() {
-        "anthropic" => out.header("x-api-key", &secret),
-        "gemini" => out.header("x-goog-api-key", &secret),
-        "openai_compat" | "openai_responses" => out.bearer_auth(&secret),
-        _ => out,
-    };
-    if let Some(eh_raw) = cand.extra_headers.as_deref() {
-        if let Ok(map) = serde_json::from_str::<serde_json::Map<String, Value>>(eh_raw) {
-            for (k, v) in map {
-                if let Some(s) = v.as_str() {
-                    if let (Ok(name), Ok(val)) = (
-                        HeaderName::from_bytes(k.as_bytes()),
-                        HeaderValue::from_str(s),
-                    ) {
-                        out_req = out_req.header(name, val);
+    // 包成闭包以便重建：reqwest 的 RequestBuilder 是一次性的，同渠道重试
+    // （should_retry_connect）必须拿一份全新请求；各分支的 builder 都是 post(&url)。
+    let build_upstream = || {
+        let mut r = match cand.family.as_str() {
+            "anthropic" => ctx.http.post(&url).header("x-api-key", &secret),
+            "gemini" => ctx.http.post(&url).header("x-goog-api-key", &secret),
+            "openai_compat" | "openai_responses" => ctx.http.post(&url).bearer_auth(&secret),
+            _ => ctx.http.post(&url),
+        };
+        if let Some(eh_raw) = cand.extra_headers.as_deref() {
+            if let Ok(map) = serde_json::from_str::<serde_json::Map<String, Value>>(eh_raw) {
+                for (k, v) in map {
+                    if let Some(s) = v.as_str() {
+                        if let (Ok(name), Ok(val)) = (
+                            HeaderName::from_bytes(k.as_bytes()),
+                            HeaderValue::from_str(s),
+                        ) {
+                            r = r.header(name, val);
+                        }
                     }
                 }
             }
         }
-    }
-    drop(url);
+        r
+    };
 
-    let resp = match out_req
-        .json(&body_json)
-        .timeout(Duration::from_secs(300))
-        .send()
-        .await
-    {
+    // 同渠道重试：连接类失败时立刻用一份新请求再试一次（见 UPSTREAM_CONNECT_RETRY）。
+    let mut connect_tries = 0usize;
+    let upstream = loop {
+        match build_upstream()
+            .json(&body_json)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+        {
+            Ok(r) => break Ok(r),
+            Err(e) if should_retry_connect(&e, connect_tries) => {
+                connect_tries += 1;
+                eprintln!(
+                    "[proxy] 上游连接失败，同渠道重试 {connect_tries}/{UPSTREAM_CONNECT_RETRY}: {e}"
+                );
+            }
+            Err(e) => break Err(e),
+        }
+    };
+
+    let resp = match upstream {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("上游连接失败: {e}");

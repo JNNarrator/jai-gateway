@@ -693,6 +693,52 @@
     ② 无状态：`GET`/`DELETE /v1/responses/{id}` 未实现，`store` / `previous_response_id` 被忽略；
     ③ `web_search` 工具被静默忽略（`responses.rs` / `capability.rs` 无处理，返回 200 但不检索）。
 
+- [x] 8. 上游「连接类」失败零重试：单渠道模型一次抖动就整回合失败（Reasonix 报「本轮已中断」）
+  - 现象：Reasonix 改对 `request_url` 后**能拉到模型、也能对话**，但**时不时**提示
+    「本轮已中断。上方的部分输出会永久保留供查看；只有完整工具调用及结果和有界恢复摘要会进入模型下一轮。」
+  - 排查手法：临时起一个本地抓包代理（`127.0.0.1:1399` → `1314`，只记 `Authorization` 是否存在、
+    不记其值），把 Reasonix 的 API 地址指过去复现一次。抓到 3 条：拉模型 200 → 对话 **502**
+    （199 字节 `all_providers_failed`）→ **2s 后同体请求 200**（22450 字节，流完整）。
+    两条请求体 SHA-256 相同 ⇒ 第二条是**客户端自己的重试**。
+    （注意：抓包期间日志里另有一批 30 万 token 的大请求，那是**本会话的 dsh** 直连 1314 的流量，
+    不是 Reasonix 的 —— 排查时先按端口区分客户端，否则极易误判。）
+  - 定位过程（两次自我纠错，记下来免得再踩）：
+    ① 先用抓到的请求体**原样重放**，JAI 返回 45 帧完整 SSE（`response.created` → `reasoning_summary_text.delta`
+    → `function_call_arguments.done` → `output_item.done` → `response.completed` → `[DONE]`）并正确产生
+    `bash` 工具调用 ⇒ **协议层没问题**，问题不在 JAI 的 Responses 实现；
+    ② 再统计全量日志：**502 占 9.78%（460/4705），当天 20%（66/329）**，错误为
+    `上游连接失败: error sending request for url (https://tokenrhythm.studio/v1/chat/completions)`，
+    另有 `LITELLM_UNAVAILABLE` / `SERVICE_BUSY` / `429` / `503` / `504`(ALB) / `403` ⇒ **上游本身不稳**；
+    ③ 关键结构发现：`route_candidates` 用 `m.model_name = ?1` **精确匹配**，该模型只命中 1 个渠道；
+    且客户端用的是限定名 `基元律动/deepseek-flash`，`proxy.rs` 里 `candidates.retain(|c| c.provider_name == …)`
+    会把候选**过滤到只剩这一家** ⇒ 「故障转移」形同虚设；
+    ④ 而 `proxy.rs` 逐候选**只发一次**、无任何同渠道重试 ⇒ 单渠道 = 零重试，
+    上游一抖就整回合失败。日志里成对的 `converted` + `passthrough` 两行**不是两次尝试**：
+    `passthrough` 那行 `provider_id` 为空，是整请求的汇总行。
+  - 已解决（2026-09-20，**按用户要求只做重试、不动故障转移**）：新增 `UPSTREAM_CONNECT_RETRY = 1`
+    与 `should_retry_connect(&e, tries)`，在 `try_candidate`（直通）与 `try_converted_candidate`（转换）
+    两处发送点对连接类失败**同渠道重试 1 次**。
+    判据 `tries < 1 && !e.is_timeout() && !e.is_builder()`：排除超时（等待预算已花掉，重试等于翻倍）
+    与请求构造失败；其余 send 阶段错误一律算连接类 —— **有意不收窄到 `is_connect()`**，
+    因为实测「accept 后立刻断开」这类错误 reqwest 报 `is_connect()=false / is_request()=true`，
+    只看 `is_connect()` 会漏掉真实场景。HTTP 层失败（含 5xx）**不重试**：链路已通，重试只会放大上游压力。
+    顺带把两处请求组装收敛为闭包（`RequestBuilder` 一次性，重试必须重建），
+    并去掉转换路径 `(url, (out, body))` 的多余嵌套与只为消警告的 `drop(url)`。
+  - 验证：新增 `crates/gateway-core/tests/m11_connect_retry.rs`（3 用例）——
+    黑洞上游（accept 后立刻断开）+ **建连计数**证明「同渠道恰好重试 1 次」（直通 / 转换各一条），
+    外加反证「HTTP 500 不重试」（请求计数 == 1）。反证实测：`UPSTREAM_CONNECT_RETRY` 置 0 →
+    两条重试用例精确变红（`实际 1 次`）、5xx 用例仍绿。
+    全量回归 **357 通过 / 0 失败**（原 354，+3）；`cargo fmt --check`、`clippy -D warnings`、
+    `tsc --noEmit`、`vite build` 全绿。
+  - 测试环境坑（值得记住）：本机开着系统代理（Clash `127.0.0.1:7890`）时，
+    用 `reqwest::Client::new()` 打本地黑洞端口会被代理接走并**回一个 HTTP 502**，
+    于是网关走 5xx 分支不重试，用例以「只建连 1 次」的假象失败。
+    集成测试里凡是打本地上游，客户端都必须显式 `.no_proxy()`，否则失败形态不确定。
+  - 遗留（**本次未动**）：① 限定名 `供应商/模型` 会 `retain` 掉其它供应商候选，
+    等于**关掉故障转移** —— 语义上更像「优先该供应商」而非「只用该供应商」，待评估；
+    ② 该模型只有 1 个渠道，根治要加第二家供应商；
+    ③ Reasonix 会话已 30 万 token（51.2 万窗口的 59%），每次请求重传约 1.4MB，放大了失败代价，可开 compact。
+
 ## 3. 视觉回归（默认窗口 1180×800，最小 900×600）
 
 > v0.2.0 起默认窗口 980×640 → 1180×800（最小 760×520 → 900×600），见 §2 第 12 条。
