@@ -600,6 +600,34 @@
   - 待办（未做）：`discover.rs`「发现模型」的 `/v1/models` 调用仍是单次发送，上游抖动即失败
     （用户同日遇到 `请求失败: error sending request for url (https://tokenrhythm.studio/v1/models)`）；
     计划加传输层重试（只重试发不出去的错误，不重试 HTTP 错误码）。
+
+- [x] 27. **`m4_conversion` 的 flood 护栏回归随机失败，会打红 CI**（bug 25 修复过程暴露）
+  - 现象：`cargo test --workspace` 偶发 `conversion_disconnects_on_newline_flood_upstream`
+    失败（实测 **8 轮 4 红**），但**单跑该文件恒绿** —— 典型负载敏感 flake。
+    断言期望「已断开」护栏文案，实际拿到 `stream aborted by upstream: ...`，
+    看起来像上游流中断或护栏失效，**方向极具误导性**。
+  - 根因（分诊取证，非推测）：**mock handler 不消费请求体** → hyper 在
+    `poll_drain_or_close_read` 走 `_ => self.close_read()`（`hyper-1.11.0/src/proto/h1/conn.rs:849`）
+    → 服务端 close 时接收缓冲区仍有客户端发来的未读字节 → 内核发 **RST 而非 FIN**
+    → **客户端接收缓冲区里已到达但应用尚未读走的数据被一并丢弃**。
+  - 证据链（三步排除法，每步实测）：
+    1. mock 侧显式打点确认 1056774 字节**全部写完** → 排除「上游没发完」；
+    2. 网关侧 `buf_len` 每次都不同（685204 / 751158 / 908054 / 924126 / 997438），
+       而 `content_length` 声明值一直是正确的 1056774；错误链为
+       `error decoding response body <- ... unexpected EOF during chunk size line`
+       → 排除「护栏逻辑错」，实为部分丢失；
+    3. **单变量验证**：只让 handler 消费请求体（`_req_body: axum::body::Bytes`）
+       → 连跑 6 轮全绿。
+  - 负载相关性由此解释：机器越忙 → 客户端读得越慢 → 接收缓冲区积压越多 → 被 RST 丢得越多。
+  - 修复：**生产代码零改动**（真实上游会读请求体，这是测试夹具缺陷）。两个 mock 都补
+    `_req_body`，根因写进 `m4_conversion.rs` 注释防复发。
+  - 教训：①「单跑绿、全量红」要优先怀疑**并发/时序/资源竞争**，而不是被测逻辑；
+    ② 断言里带**完整响应体**（而非截断 200 字符）是本次能一次定位的关键——
+    截断把真正的错误帧藏在了视野外；③ 分诊打点要打在**两侧**（mock 发完 / 网关读了多少），
+    单侧打点无法区分"没发"与"没收到"。
+  - 附带：同批 bug 25 的 4 个回归测试有 `unused_mut`（clippy `-D warnings` 门禁失败）
+    ——该批改动当初未过 clippy 就提交了，`release_check.sh` 首次运行即暴露。
+
 ## 2. 优化清单
 
 - [x] 1. 创建供应商弹框应该有按钮可以测试能不能获取到模型。
