@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-09-20
+
 ### Fixed
 - **流式 `response.completed.response.output` 恒为 `[]`** —— 只读最终对象的客户端会拿到一个**空回合**。
   `RenderState::new_response` 把 `output` 写死成空数组，真实内容只存在于增量事件里；
