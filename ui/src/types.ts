@@ -107,6 +107,8 @@ export interface WebDavConfigDto {
   autoPushEnabled: boolean;
   autoPushIntervalMin: number;
   autoPullEnabled: boolean;
+  /** 拉取间隔分钟数（与推送间隔相互独立） */
+  autoPullIntervalMin: number;
   password?: string | null;
 }
 

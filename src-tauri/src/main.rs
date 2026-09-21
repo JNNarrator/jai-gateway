@@ -24,6 +24,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
@@ -54,6 +55,12 @@ struct TrayHandles {
 pub struct AutopushHub {
     /// 配置变更计数器（watch 通道天然合并突发变更）
     tx: tokio::sync::watch::Sender<u64>,
+    /// 「调度参数变了，请重新评估」信号（WebDAV 开关/间隔被改时置位）
+    ///
+    /// 与 `tx` 分开是刻意的：`tx` 的语义是「业务数据变了 → 防抖后推一次」，
+    /// 而改调度参数（开关/间隔）**不该触发推送**，只需要让调度循环尽快重读配置。
+    /// 两者共用一个通道会让「改一下间隔」顺带推一次远端。
+    cfg_tx: tokio::sync::watch::Sender<u64>,
     /// 与手动推/拉互斥，避免并发写远端
     pub push_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// 手动拉取前后短暂置位，抑制变更触发的自动推送（防回声）
@@ -75,8 +82,10 @@ pub struct AutoPushStatus {
 impl AutopushHub {
     fn new() -> Self {
         let (tx, _rx) = tokio::sync::watch::channel(0);
+        let (cfg_tx, _cfg_rx) = tokio::sync::watch::channel(0);
         Self {
             tx,
+            cfg_tx,
             push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             suppress: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -88,6 +97,17 @@ impl AutopushHub {
     pub fn notify_change(&self) {
         let next = *self.tx.borrow() + 1;
         let _ = self.tx.send(next);
+    }
+
+    /// WebDAV 调度参数（自动推送/拉取开关、两个间隔）被修改时调用。
+    ///
+    /// 只让调度循环**立刻重读配置**（含「关→开」这类状态跃迁的采样），
+    /// 不触发任何推送、不走防抖。没有它就只能等睡眠到期才发现配置变了 ——
+    /// 那时长间隔（最长 6 小时）会让「改了没反应」，短窗口内的
+    /// 「关掉再打开」也可能整段被漏采样（重新启用本该重新等一个完整间隔）。
+    pub fn notify_config_change(&self) {
+        let next = *self.cfg_tx.borrow() + 1;
+        let _ = self.cfg_tx.send(next);
     }
 }
 
@@ -881,8 +901,10 @@ pub struct WebDavConfigDto {
     pub directory: String,
     pub auto_push_enabled: bool,
     pub auto_push_interval_min: u32,
-    /// 定时自动拉取总开关（与自动推送共用间隔，按 exportedAt 时间戳 last-write-wins）
+    /// 定时自动拉取总开关（按 exportedAt 时间戳 last-write-wins）
     pub auto_pull_enabled: bool,
+    /// 定时拉取间隔分钟数（与推送间隔**相互独立**）
+    pub auto_pull_interval_min: u32,
     /// 明文回显（0006 起密码入库并随同步携带，与网关 Key 同级安全模型）
     pub password: Option<String>,
 }
@@ -896,6 +918,7 @@ impl From<WebDavConfig> for WebDavConfigDto {
             auto_push_enabled: c.auto_push_enabled,
             auto_push_interval_min: c.auto_push_interval_min,
             auto_pull_enabled: c.auto_pull_enabled,
+            auto_pull_interval_min: c.auto_pull_interval_min,
             password: None,
         }
     }
@@ -917,6 +940,8 @@ pub struct WebDavConfigInput {
     pub auto_push_interval_min: Option<u32>,
     /// 自动拉取开关；None 保持原值
     pub auto_pull_enabled: Option<bool>,
+    /// 自动拉取间隔分钟；None 保持原值
+    pub auto_pull_interval_min: Option<u32>,
 }
 
 #[cfg(test)]
@@ -935,6 +960,323 @@ mod webdav_input_tests {
             serde_json::from_value(v).expect("缺 directory 也应反序列化成功");
         assert_eq!(input.directory, "");
         assert_eq!(input.url, "http://jn_file.88933.vip/");
+    }
+}
+
+/// 自动同步调度器的纯决策单测。
+///
+/// 这些用例覆盖 bug 清单 20：**定时唤醒点与两个动作的到期判定**。
+/// 全部用「基准时刻 + 偏移」构造「现在」，不依赖真实时间流逝，因此不会 flaky；
+/// 调度逻辑本身是纯函数（`Instant` 显式传入），这正是当初把它抽出来的原因 ——
+/// 旧实现把「睡多久」和「该不该跑」揉在循环体里，只能靠真实等待去验证。
+#[cfg(test)]
+mod autosync_schedule_tests {
+    use super::*;
+
+    fn mins(n: u64) -> Duration {
+        Duration::from_secs(n * 60)
+    }
+
+    /// 基准时刻 + n 分钟（可控时钟：所有「现在」都由它推导）。
+    fn at(base: Instant, n: u64) -> Instant {
+        base + mins(n)
+    }
+
+    /// 造一个动作：`Some(m)` = 已启用、间隔 m 分钟、启用起点为 `base`；`None` = 未启用。
+    fn action(base: Instant, interval_min: Option<u64>) -> SyncAction {
+        match interval_min {
+            Some(m) => {
+                let mut clock = ActionClock::disabled();
+                clock.sync_enabled(true, base);
+                SyncAction {
+                    interval: Some(mins(m)),
+                    clock,
+                }
+            }
+            None => SyncAction {
+                interval: None,
+                clock: ActionClock::disabled(),
+            },
+        }
+    }
+
+    /// 基线：刚启用的动作**不立刻跑**，而是等满一个间隔（与旧行为一致）。
+    #[test]
+    fn never_run_action_fires_after_one_full_interval() {
+        let base = Instant::now();
+        let push = action(base, Some(60));
+        assert!(!push.is_due(base), "刚启用不该立刻同步");
+        assert_eq!(push.time_until_due(base), Some(mins(60)));
+        assert!(!push.is_due(at(base, 59)));
+        assert!(push.is_due(at(base, 60)));
+        assert!(push.is_due(at(base, 61)), "过期也算到期");
+    }
+
+    /// **bug 20 主用例**：推送 6 小时 / 拉取 30 分钟 —— 拉取不得被推送的长间隔绑死。
+    ///
+    /// 旧实现 `let wait = push_interval.or(pull_interval)` 取的是推送的 6 小时，
+    /// 于是拉取实际也 6 小时一次（用户报「自动拉取没生效」）。
+    /// 反证：把 `next_wake` 改回「先看推送」，本用例立刻变红。
+    #[test]
+    fn pull_is_not_throttled_by_push_interval() {
+        let base = Instant::now();
+        let push = action(base, Some(360));
+        let pull = action(base, Some(30));
+        // 定时唤醒点 = 最近到期点 = 拉取的 30 分钟（旧实现会给 360）
+        assert_eq!(
+            next_wake(base, push, pull),
+            Some(mins(30)),
+            "唤醒点应取最近到期点，而不是 push.or(pull) 里那个推送的长间隔"
+        );
+        assert_eq!(push.time_until_due(base), Some(mins(360)));
+        // 30 分钟：拉取到期、推送未到期
+        let plan = plan_sync(at(base, 30), false, push, pull);
+        assert!(plan.pull, "拉取应按自己的 30 分钟间隔到期");
+        assert!(!plan.push, "推送不该被拉取的短间隔拽跑");
+        // 拉取跑完后，下一个到期点是 60 分钟（每 30 分钟一次）
+        let mut pull_after = pull;
+        pull_after.clock.mark_run(at(base, 30));
+        assert_eq!(next_wake(at(base, 30), push, pull_after), Some(mins(30)));
+    }
+
+    /// 反向护栏：拉取的短间隔不得把推送的到期点一起拽跑（旧实现「每 tick 都推」）。
+    #[test]
+    fn push_is_not_over_triggered_by_pull_ticks() {
+        let base = Instant::now();
+        let push = action(base, Some(360));
+        let pull = action(base, Some(30));
+        for m in [30u64, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330] {
+            let plan = plan_sync(at(base, m), false, push, pull);
+            assert!(plan.pull, "第 {m} 分钟拉取应到期");
+            assert!(
+                !plan.push,
+                "推送间隔 360 分钟，第 {m} 分钟不该推送（否则远端被反复覆盖）"
+            );
+        }
+        let plan = plan_sync(at(base, 360), false, push, pull);
+        assert!(plan.push, "第 360 分钟推送才该到期");
+        assert!(plan.pull, "第 360 分钟拉取同时到期");
+    }
+
+    /// **饿死回归**：变更唤醒不得把定时到期点往后推。
+    ///
+    /// 旧实现每轮循环都新建 `sleep(wait)`，`rx.changed()` 一到就把定时器丢弃重建，
+    /// 而 `notify_change()` 在供应商/模型/MCP/技能任一编辑时都会调用 ——
+    /// 于是「编辑得比间隔勤」的用户永远等不到定时 tick，自动拉取被饿死。
+    /// 这是 #20 描述的**同症状、不同根因**，且当时是可复现的真实缺陷。
+    ///
+    /// 反证：若到期点从「此刻」重新起算（旧行为），第 m 分钟的剩余时长会恒为
+    /// 30 分钟而不是 `30 - m`，本用例立刻变红。
+    #[test]
+    fn change_wakes_do_not_push_back_the_deadline() {
+        let base = Instant::now();
+        let push = action(base, Some(360));
+        let pull = action(base, Some(30));
+        // 模拟用户每分钟编辑一次（每次都会 notify_change → 变更唤醒），持续 29 分钟
+        for m in 1..30u64 {
+            let plan = plan_sync(at(base, m), true, push, pull);
+            assert!(!plan.pull, "变更唤醒不拉取（避免覆盖用户刚做的改动）");
+            assert_eq!(
+                next_wake(at(base, m), push, pull),
+                Some(mins(30 - m)),
+                "第 {m} 分钟的变更唤醒不得把拉取到期点往后推（否则自动拉取永远不跑）"
+            );
+        }
+        // 第 30 分钟定时唤醒：拉取照常到期
+        assert!(
+            plan_sync(at(base, 30), false, push, pull).pull,
+            "第 30 分钟定时唤醒必须能拉到"
+        );
+    }
+
+    /// 未启用的动作永不执行，也不参与唤醒点计算。
+    #[test]
+    fn disabled_action_never_runs() {
+        let base = Instant::now();
+        let off = action(base, None);
+        assert!(!off.is_enabled());
+        assert_eq!(off.time_until_due(base), None);
+        let plan = plan_sync(at(base, 1000), false, action(base, Some(60)), off);
+        assert!(!plan.pull);
+        assert!(plan.push);
+        assert_eq!(
+            next_wake(base, off, off),
+            None,
+            "均未启用 → 回落 30s 配置轮询"
+        );
+        assert_eq!(next_wake(base, action(base, Some(60)), off), Some(mins(60)));
+    }
+
+    /// 变更唤醒：开了自动推送就推一次（与间隔无关），未开则什么也不做。
+    #[test]
+    fn change_wake_pushes_regardless_of_interval() {
+        let base = Instant::now();
+        let plan = plan_sync(
+            at(base, 1),
+            true,
+            action(base, Some(360)),
+            action(base, Some(30)),
+        );
+        assert!(plan.push, "变更唤醒即推（改完就同步），与 360 分钟间隔无关");
+        assert!(!plan.pull, "变更唤醒绝不拉取");
+        // notify_change 与开关无关（导入/编辑都会调用），未启用时不能误推
+        let plan = plan_sync(
+            at(base, 1),
+            true,
+            action(base, None),
+            action(base, Some(30)),
+        );
+        assert!(!plan.push && !plan.pull);
+    }
+
+    /// 关掉再打开应重新等一个完整间隔，而不是「上次执行是三天前」就立刻同步。
+    #[test]
+    fn re_enable_restarts_the_interval() {
+        let base = Instant::now();
+        let mut clock = ActionClock::disabled();
+        clock.sync_enabled(true, base);
+        // 刚跑完（第 30 分钟）→ 距下次到期还有 30 分钟，不是「立刻又到期」
+        clock.mark_run(at(base, 30));
+        assert_eq!(clock.time_until_due(at(base, 30), mins(30)), Some(mins(30)));
+        assert_eq!(clock.time_until_due(at(base, 59), mins(30)), Some(mins(1)));
+        assert_eq!(
+            clock.time_until_due(at(base, 60), mins(30)),
+            Some(Duration::ZERO)
+        );
+        clock.sync_enabled(false, at(base, 30));
+        assert_eq!(
+            clock.time_until_due(at(base, 30), mins(30)),
+            None,
+            "停用即清空"
+        );
+        clock.sync_enabled(true, at(base, 30));
+        let act = SyncAction {
+            interval: Some(mins(30)),
+            clock,
+        };
+        assert_eq!(act.time_until_due(at(base, 30)), Some(mins(30)));
+        assert!(!act.is_due(at(base, 30)), "重新启用不该立刻同步");
+        assert!(act.is_due(at(base, 60)));
+    }
+
+    /// 改间隔按「上次执行 + 新间隔」重算：缩短可立即到期，延长则顺延。
+    #[test]
+    fn interval_change_reanchors_from_last_run() {
+        let base = Instant::now();
+        let mut clock = ActionClock::disabled();
+        clock.sync_enabled(true, base);
+        clock.mark_run(at(base, 100));
+        // 上次执行在第 100 分钟；间隔 30 → 第 130 分钟到期
+        assert_eq!(
+            clock.time_until_due(at(base, 100), mins(30)),
+            Some(mins(30)),
+            "刚跑完不该立刻又到期"
+        );
+        assert_eq!(
+            clock.time_until_due(at(base, 130), mins(30)),
+            Some(Duration::ZERO)
+        );
+        // 同一时刻（第 130 分钟）把间隔改成 360 → 还剩 330 分钟
+        // （按上次执行时刻算，而不是从改配置那一刻重新等 360 分钟）
+        assert_eq!(
+            clock.time_until_due(at(base, 130), mins(360)),
+            Some(mins(330))
+        );
+        // 把间隔从 360 缩短到 30 时，若距上次执行已超过 30 分钟则**立即到期**
+        // （缩短间隔即时生效，而不是再等一个完整新间隔）
+        assert_eq!(
+            clock.time_until_due(at(base, 200), mins(30)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// 两个动作同时到期时，唤醒点归零（本轮两个都跑）。
+    #[test]
+    fn both_due_yields_zero_wait() {
+        let base = Instant::now();
+        let push = action(base, Some(30));
+        let pull = action(base, Some(30));
+        assert_eq!(next_wake(at(base, 30), push, pull), Some(Duration::ZERO));
+        let plan = plan_sync(at(base, 30), false, push, pull);
+        assert!(plan.pull && plan.push);
+    }
+
+    /// 睡眠封顶：长间隔也要定期醒来重读配置（否则改了间隔要等最长 6 小时才生效，
+    /// 因为 `webdav_config_set` 不触发变更通知）。
+    ///
+    /// 反证：去掉 `.min(AUTOSYNC_MAX_SLEEP)`，推送 360 分钟时下面第一条断言立刻变红。
+    #[test]
+    fn sleep_duration_caps_long_waits() {
+        assert_eq!(sleep_duration(Some(mins(360))), AUTOSYNC_MAX_SLEEP);
+        assert_eq!(sleep_duration(Some(mins(30))), AUTOSYNC_MAX_SLEEP);
+        // 比封顶值更近的到期点按原值（不无谓地缩短）
+        assert_eq!(
+            sleep_duration(Some(Duration::from_secs(5))),
+            Duration::from_secs(5)
+        );
+        // 已到期 → 立刻醒（不做退避；退避只用于「拿不到锁」那条路径）
+        assert_eq!(sleep_duration(Some(Duration::ZERO)), Duration::ZERO);
+        // 均未启用 → 配置轮询
+        assert_eq!(sleep_duration(None), AUTOSYNC_CONFIG_POLL);
+        // 轮询间隔本身也应小于等于封顶值，否则「均未启用」会比封顶还慢
+        assert!(AUTOSYNC_CONFIG_POLL <= AUTOSYNC_MAX_SLEEP);
+    }
+
+    /// 端到端串一遍调度决策：360 分钟推送 + 30 分钟拉取，第 30 分钟那轮
+    /// 睡眠为 0（拉取已到期），执行后下一个唤醒点是封顶值（30 分钟后才再到期）。
+    #[test]
+    fn schedule_round_trip_for_360_push_and_30_pull() {
+        let base = Instant::now();
+        let push = action(base, Some(360));
+        let mut pull = action(base, Some(30));
+        // 起点：最近到期点是拉取的 30 分钟，但睡眠被封顶
+        assert_eq!(
+            sleep_duration(next_wake(base, push, pull)),
+            AUTOSYNC_MAX_SLEEP
+        );
+        // 第 30 分钟醒来：只拉不推
+        let t = at(base, 30);
+        let plan = plan_sync(t, false, push, pull);
+        assert!(plan.pull && !plan.push);
+        // 拉取执行完毕 → 重新锚定，下一个到期点是第 60 分钟
+        pull.clock.mark_run(t);
+        assert_eq!(next_wake(t, push, pull), Some(mins(30)));
+        assert_eq!(sleep_duration(next_wake(t, push, pull)), AUTOSYNC_MAX_SLEEP);
+        // 第 360 分钟：两个同时到期
+        let t = at(base, 360);
+        let plan = plan_sync(t, false, push, pull);
+        assert!(plan.pull && plan.push);
+    }
+
+    /// 「调度参数变了」与「业务数据变了」必须是**两个独立信号**。
+    ///
+    /// 反证：若让 `notify_config_change` 复用 `tx`（或反过来），改一次间隔就会
+    /// 顺带触发一次防抖推送 —— 把配置推上远端，而用户只是调了个间隔。
+    /// 本用例在任一方向合并通道时立刻变红。
+    #[test]
+    fn config_change_signal_is_independent_from_data_change() {
+        let hub = AutopushHub::new();
+        let mut data_rx = hub.tx.subscribe();
+        let mut cfg_rx = hub.cfg_tx.subscribe();
+
+        // 只发「调度参数变更」：数据通道不得被唤醒（否则会触发推送）
+        hub.notify_config_change();
+        assert!(cfg_rx.has_changed().unwrap(), "配置通道应被唤醒");
+        assert!(
+            !data_rx.has_changed().unwrap(),
+            "改间隔/开关不得触发推送（会顺带覆盖远端）"
+        );
+        // 标记已读，避免影响后续断言
+        cfg_rx.borrow_and_update();
+        data_rx.borrow_and_update();
+
+        // 只发「业务数据变更」：配置通道不得被唤醒
+        hub.notify_change();
+        assert!(data_rx.has_changed().unwrap(), "数据通道应被唤醒");
+        assert!(
+            !cfg_rx.has_changed().unwrap(),
+            "业务数据变更不得被当成调度参数变更"
+        );
     }
 }
 
@@ -1010,6 +1352,9 @@ async fn webdav_config_set(
             .auto_push_interval_min
             .unwrap_or(old.auto_push_interval_min),
         auto_pull_enabled: input.auto_pull_enabled.unwrap_or(old.auto_pull_enabled),
+        auto_pull_interval_min: input
+            .auto_pull_interval_min
+            .unwrap_or(old.auto_pull_interval_min),
     };
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
@@ -1017,7 +1362,11 @@ async fn webdav_config_set(
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(join_err)?
+    .map_err(join_err)??;
+    // 调度参数（开关/间隔）变了 → 让调度循环立刻重读配置。
+    // 只做「重新评估」，不触发推送：改间隔不该顺带把配置推上去。
+    core.autopush.notify_config_change();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1042,6 +1391,7 @@ async fn webdav_test(core: State<'_, AppCore>, input: WebDavConfigInput) -> Resu
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
     sync::probe(&core.http, &cfg, &password).await
 }
@@ -1390,153 +1740,391 @@ async fn webdav_snapshot_restore(core: State<'_, AppCore>) -> Result<import::Imp
     Ok(out)
 }
 
-/// WebDAV 自动同步循环：定时 tick 与变更通知合并；未启用时 30s 轮询配置等待开启。
-/// - 变更触发：防抖 30s 后自动推送（带「空配置不覆盖远端」护栏）
-/// - 定时触发：开启自动拉取则先按 exportedAt 时间戳拉取远端更新（last-write-wins，
-///   空远端/不比本地新不拉），再按需自动推送
+/// WebDAV 自动同步循环：定时 tick 与变更通知合并；均未启用时 30s 轮询配置等待开启。
+///
+/// 调度语义（bug 清单 20）：
+/// - **每个动作各自判定到期**：推送看 `auto_push_interval_min`、拉取看
+///   `auto_pull_interval_min`，各自从「上次执行时刻」起算。两个间隔完全独立，
+///   「推送 6 小时 / 拉取 30 分钟」这类组合按用户意图生效。
+/// - **定时唤醒点 = 最近的一个到期点**（既不是某个间隔本身，也不是各间隔的最小值）：
+///   不会像旧实现那样用 `push_interval.or(pull_interval)` 只取其中一个间隔
+///   （拉取被推送的长间隔绑死），也不会让到期早的动作把到期晚的动作一起拽跑
+///   （旧实现定时分支里「开了自动推送就每 tick 都推」）。
+/// - **到期点是绝对时刻，不因变更唤醒而重置**：旧实现每轮都新建 `sleep(wait)`，
+///   任何一次 `notify_change()`（供应商/模型/MCP/技能任一编辑都会触发）都会把它重置，
+///   于是「编辑得比间隔勤」的用户永远等不到定时 tick —— 自动拉取被饿死，
+///   症状正是用户报的「自动拉取没生效」。
+/// - 变更唤醒仍走防抖 30s 后推送一次（与间隔无关，这是「改完就同步」的体验保证）。
+/// - 时钟用**单调时钟** `Instant`：系统时间被 NTP 校正或用户手改，不该让同步
+///   饿死或瞬间风暴；挂钟毫秒（`AutoPushStatus::at_ms`）只用于界面展示。
+/// - **三类唤醒**：`Wake::Timer` 定时到期（按各自到期点判定）、
+///   `Wake::Change` 业务数据变更（防抖后推送一次）、`Wake::Config` 调度参数变更
+///   （只重读配置，**不推送**）。后两者都不移动到期点。
+/// - **读配置失败时不改时钟**：瞬时 IO 错误若被当成「用户关掉了」会清空锚点、
+///   重新计时，把下一次执行推迟一整个间隔 —— 见 `current_autosync_intervals`。
 fn spawn_autopush(core: AppCore, app: AppHandle) {
     // setup 闭包不在 tokio runtime 上下文内，必须经 tauri 托管 runtime spawn
     tauri::async_runtime::spawn(async move {
         let mut rx = core.autopush.tx.subscribe();
+        let mut cfg_rx = core.autopush.cfg_tx.subscribe();
+        let mut push_clock = ActionClock::disabled();
+        let mut pull_clock = ActionClock::disabled();
         loop {
-            let push_interval = current_autopush_interval(&core).await;
-            let pull_interval = current_autopull_interval(&core).await;
-            let wait = push_interval
-                .or(pull_interval)
-                .unwrap_or_else(|| std::time::Duration::from_secs(30));
-            let change = tokio::select! {
+            // 读配置失败时**不动时钟**（见 current_autosync_intervals 的说明），稍后重试
+            let Some((push_interval, pull_interval)) = current_autosync_intervals(&core).await
+            else {
+                tokio::time::sleep(AUTOSYNC_CONFIG_POLL).await;
+                continue;
+            };
+            let now = Instant::now();
+            push_clock.sync_enabled(push_interval.is_some(), now);
+            pull_clock.sync_enabled(pull_interval.is_some(), now);
+            let push = SyncAction {
+                interval: push_interval,
+                clock: push_clock,
+            };
+            let pull = SyncAction {
+                interval: pull_interval,
+                clock: pull_clock,
+            };
+
+            // 均未启用 → 30s 轮询配置；否则睡到最近的一个到期点
+            let wait = sleep_duration(next_wake(now, push, pull));
+            let wake = tokio::select! {
                 r = rx.changed() => {
                     if r.is_err() {
                         return; // hub 已随应用退出
                     }
-                    true
+                    Wake::Change
                 }
-                _ = tokio::time::sleep(wait) => false,
+                r = cfg_rx.changed() => {
+                    if r.is_err() {
+                        return; // hub 已随应用退出
+                    }
+                    // 调度参数（开关/间隔）被改：立刻回到循环顶部重读配置，
+                    // 让「关→开」这类跃迁被及时采样，也让新间隔立即生效。
+                    Wake::Config
+                }
+                _ = tokio::time::sleep(wait) => Wake::Timer,
             };
+            if wake == Wake::Config {
+                continue;
+            }
+            let change = wake == Wake::Change;
             if change {
+                // 变更唤醒只为自动推送服务：未开启则无需防抖等待
+                if !push.is_enabled() {
+                    continue;
+                }
                 // 防抖：等 30s 合并突发变更
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if core
-                    .autopush
-                    .suppress
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
+                tokio::time::sleep(AUTOSYNC_DEBOUNCE).await;
+                if core.autopush.suppress.load(Ordering::Relaxed) {
                     continue;
                 }
-                // 期间被关闭则不推
-                if current_autopush_interval(&core).await.is_none() {
-                    continue;
-                }
-            } else if push_interval.is_none() && pull_interval.is_none() {
-                // 定时醒来但均未启用：只是配置轮询
+            }
+
+            // 唤醒期间配置可能被改（开关/间隔），决策一律以最新配置为准；
+            // 这一次读取代了「防抖前再查一次开关」的预检 —— 若期间推送被关，
+            // 下面的 `plan_sync` 会因 `push.is_enabled() == false` 得出「不推」，
+            // 预检只会多一次读库、不可能多推出什么。
+            let Some((push_interval, pull_interval)) = current_autosync_intervals(&core).await
+            else {
+                continue; // 读失败：保持时钟不动，下一轮重试
+            };
+            let now = Instant::now();
+            push_clock.sync_enabled(push_interval.is_some(), now);
+            pull_clock.sync_enabled(pull_interval.is_some(), now);
+            let plan = plan_sync(
+                now,
+                change,
+                SyncAction {
+                    interval: push_interval,
+                    clock: push_clock,
+                },
+                SyncAction {
+                    interval: pull_interval,
+                    clock: pull_clock,
+                },
+            );
+            if !plan.pull && !plan.push {
                 continue;
             }
             // 抢不到锁（手动推/拉进行中）则跳过本轮
             let Ok(_guard) = core.autopush.push_lock.try_lock() else {
                 eprintln!("[autosync] 手动同步进行中，跳过本轮");
+                // 退避：动作已到期且锁被占时必须显式等一会儿，否则 `sleep(0)` 会空转
+                tokio::time::sleep(AUTOSYNC_LOCK_BACKOFF).await;
                 continue;
             };
-            let now_ms = || {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64
-            };
-            // 定时唤醒且开启自动拉取：先拉远端更新（exportedAt last-write-wins）
-            if !change && pull_interval.is_some() {
-                let at = now_ms();
-                let res = auto_pull_once(&core).await;
-                let st = match &res {
-                    Ok(()) => AutoPushStatus {
-                        at_ms: at,
-                        ok: true,
-                        message: "自动拉取完成".into(),
-                    },
-                    Err(e) => AutoPushStatus {
-                        at_ms: at,
-                        ok: false,
-                        message: e.clone(),
-                    },
-                };
-                eprintln!(
-                    "[autopull] {} {}",
-                    if st.ok { "ok" } else { "err" },
-                    st.message
-                );
-                if !st.ok {
-                    notify_autosync(&app, "WebDAV 自动拉取失败".to_string(), st.message.clone());
-                }
-                *core.autopush.last_pull.lock().await = Some(st);
+            // 拉取先于推送：先把远端更新拿下来，再按需把本机状态推上去
+            //
+            // 到期点按**动作结束后**的时刻重算（固定延迟），而不是动作开始前：
+            // 若某次同步耗时超过间隔（远端慢/卡），用开始时刻会让下一轮立刻又判定「已到期」，
+            // 变成背靠背连跑。固定延迟保证每次执行之间至少隔一个完整间隔。
+            if plan.pull {
+                run_auto_pull(&core, &app).await;
+                pull_clock.mark_run(Instant::now());
             }
-            // 变更唤醒或定时且开启自动推送：推送本机配置（带护栏）
-            if change || push_interval.is_some() {
-                let at = now_ms();
-                let res = auto_push_guarded(&core).await;
-                let st = match &res {
-                    Ok(()) => AutoPushStatus {
-                        at_ms: at,
-                        ok: true,
-                        message: "自动推送成功".into(),
-                    },
-                    Err(e) => AutoPushStatus {
-                        at_ms: at,
-                        ok: false,
-                        message: e.clone(),
-                    },
-                };
-                eprintln!(
-                    "[autopush] {} {}",
-                    if st.ok { "ok" } else { "err" },
-                    st.message
-                );
-                if !st.ok {
-                    notify_autosync(&app, "WebDAV 自动推送失败".to_string(), st.message.clone());
-                }
-                *core.autopush.last.lock().await = Some(st);
+            if plan.push {
+                run_auto_push(&core, &app).await;
+                push_clock.mark_run(Instant::now());
             }
         }
     });
 }
 
-/// 当前自动推送间隔；未启用 / 未配置返回 None。
-async fn current_autopush_interval(core: &AppCore) -> Option<std::time::Duration> {
-    let db = core.db.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        db.with_any(|c| sync::config_get(c).map_err(|e| e.to_string()))
-    })
-    .await
-    .map_err(join_err);
-    let cfg: Option<WebDavConfig> = match res {
-        Ok(Ok(c)) => c,
-        _ => return None,
-    };
-    let cfg = cfg?;
-    if !cfg.auto_push_enabled {
-        return None;
-    }
-    Some(std::time::Duration::from_secs(
-        u64::from(cfg.normalized_interval()) * 60,
-    ))
+/// 均未启用自动同步时的配置轮询间隔。
+const AUTOSYNC_CONFIG_POLL: Duration = Duration::from_secs(30);
+/// 变更唤醒后的防抖窗口（合并突发变更）。
+const AUTOSYNC_DEBOUNCE: Duration = Duration::from_secs(30);
+/// 单轮睡眠上限：到期点再远，也至少隔这么久重新读一次配置。
+///
+/// 为什么必须封顶：`webdav_config_set` **不**触发变更通知（它改的是调度参数本身，
+/// 不是要同步的业务数据）。若睡满一个长间隔（推送设 6 小时时），
+/// 用户刚把「拉取间隔」改成 30 分钟，也要等最长 6 小时才生效 —— 表现为「改了没反应」。
+/// 封顶后只是「醒来重新评估配置」，**不会提前执行动作**：是否该跑由 `plan_sync`
+/// 按绝对到期点判定，与睡眠时长无关。
+const AUTOSYNC_MAX_SLEEP: Duration = Duration::from_secs(60);
+/// 拿不到推送锁（手动推/拉进行中）时的退避时长。
+///
+/// 必需：改成「睡到到期点」后，若动作**已到期**且锁被占，`next_wake` 会返回
+/// `Some(ZERO)` → `sleep(0)` 立即返回 → 又拿不到锁 → `continue`，
+/// 形成**空转**（旧实现每轮固定睡满一个间隔，没有这个问题）。
+/// 退避保证最坏情况下也只是每 `AUTOSYNC_LOCK_BACKOFF` 重试一次。
+const AUTOSYNC_LOCK_BACKOFF: Duration = Duration::from_secs(5);
+
+/// 自动同步循环本轮是被什么唤醒的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    /// 业务数据变更（供应商/模型/MCP/技能等）→ 防抖后推一次
+    Change,
+    /// 调度参数变更（开关/间隔）→ 仅重新评估，不推送
+    Config,
+    /// 定时到期
+    Timer,
 }
 
-/// 当前自动拉取间隔；未启用 / 未配置返回 None（与自动推送共用间隔分钟数）。
-async fn current_autopull_interval(core: &AppCore) -> Option<std::time::Duration> {
+/// 一个自动同步动作的调度时钟（单调）。
+///
+/// 记录「上次实际执行时刻」与「本次启用起点」，取二者中**较晚**者作为计时基准 ——
+/// 于是**只有真正执行过**才会把到期点往后推，变更唤醒、配置重读都不会。
+/// 这正是旧实现缺的那一环：旧代码的定时器每轮重建，会被变更唤醒重置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActionClock {
+    /// 上次实际执行时刻（None = 尚未执行过）
+    last_run: Option<Instant>,
+    /// 本次「启用」的起点（None = 未启用）
+    enabled_at: Option<Instant>,
+}
+
+impl ActionClock {
+    fn disabled() -> Self {
+        Self {
+            last_run: None,
+            enabled_at: None,
+        }
+    }
+
+    /// 同步「是否启用」：启用且尚无起点则记下起点；停用则清空（重新启用重新计时）。
+    ///
+    /// 停用清空是刻意的：用户关掉再打开应重新等一个完整间隔，
+    /// 而不是因为「上次执行是三天前」而在打开瞬间立刻同步一次。
+    fn sync_enabled(&mut self, enabled: bool, now: Instant) {
+        match (enabled, self.enabled_at) {
+            (true, None) => self.enabled_at = Some(now),
+            (false, _) => {
+                self.enabled_at = None;
+                self.last_run = None;
+            }
+            (true, Some(_)) => {}
+        }
+    }
+
+    /// 距下次到期的剩余时长；未启用返回 None，已到期/过期返回 `Some(ZERO)`。
+    fn time_until_due(&self, now: Instant, interval: Duration) -> Option<Duration> {
+        let base = self.last_run.or(self.enabled_at)?;
+        Some(interval.saturating_sub(now.saturating_duration_since(base)))
+    }
+
+    /// 标记刚执行过（把到期点推到 `now + interval`）。
+    fn mark_run(&mut self, now: Instant) {
+        self.last_run = Some(now);
+    }
+}
+
+/// 一个自动同步动作的完整调度输入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncAction {
+    /// 间隔；None = 未启用
+    interval: Option<Duration>,
+    clock: ActionClock,
+}
+
+impl SyncAction {
+    fn is_enabled(&self) -> bool {
+        self.interval.is_some()
+    }
+
+    fn time_until_due(&self, now: Instant) -> Option<Duration> {
+        self.interval
+            .and_then(|i| self.clock.time_until_due(now, i))
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.time_until_due(now) == Some(Duration::ZERO)
+    }
+}
+
+/// 本次唤醒的执行计划。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncPlan {
+    pull: bool,
+    push: bool,
+}
+
+/// 距下一次定时唤醒的时长：两个动作中**最近**的一个到期点。
+/// 均未启用返回 None（调用方回落到配置轮询）。
+fn next_wake(now: Instant, push: SyncAction, pull: SyncAction) -> Option<Duration> {
+    match (push.time_until_due(now), pull.time_until_due(now)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// 本轮该睡多久：取「最近到期点」，但封顶在 `AUTOSYNC_MAX_SLEEP`；
+/// 均未启用时回落到 `AUTOSYNC_CONFIG_POLL`。
+///
+/// 只影响「隔多久重新评估一次配置」，不影响动作是否执行（见 `plan_sync`）。
+fn sleep_duration(next_due: Option<Duration>) -> Duration {
+    match next_due {
+        Some(d) => d.min(AUTOSYNC_MAX_SLEEP),
+        None => AUTOSYNC_CONFIG_POLL,
+    }
+}
+
+/// 本次唤醒该执行哪些动作。
+///
+/// - 变更唤醒：推送一次（与间隔无关，这是「改完就同步」的体验保证），
+///   **不拉取** —— 刚改完本地配置就去拉远端，可能把用户刚做的改动覆盖掉。
+/// - 定时唤醒：各自按自己的间隔判定是否到期（互不影响）。
+fn plan_sync(now: Instant, change_wake: bool, push: SyncAction, pull: SyncAction) -> SyncPlan {
+    if change_wake {
+        return SyncPlan {
+            pull: false,
+            push: push.is_enabled(),
+        };
+    }
+    SyncPlan {
+        pull: pull.is_due(now),
+        push: push.is_due(now),
+    }
+}
+
+/// 挂钟毫秒（仅用于界面展示；调度判定一律走单调时钟）。
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// 自动拉取一次并记录结果（失败发系统通知）。
+async fn run_auto_pull(core: &AppCore, app: &AppHandle) {
+    let at = wall_clock_ms();
+    let res = auto_pull_once(core).await;
+    record_auto_sync(
+        &core.autopush.last_pull,
+        app,
+        "autopull",
+        "WebDAV 自动拉取失败",
+        "自动拉取完成",
+        at,
+        &res,
+    )
+    .await;
+}
+
+/// 自动推送一次并记录结果（失败发系统通知）。
+async fn run_auto_push(core: &AppCore, app: &AppHandle) {
+    let at = wall_clock_ms();
+    let res = auto_push_guarded(core).await;
+    record_auto_sync(
+        &core.autopush.last,
+        app,
+        "autopush",
+        "WebDAV 自动推送失败",
+        "自动推送成功",
+        at,
+        &res,
+    )
+    .await;
+}
+
+/// 记录并外显一次自动同步结果：成功静默，失败发系统通知。
+async fn record_auto_sync(
+    slot: &Arc<tokio::sync::Mutex<Option<AutoPushStatus>>>,
+    app: &AppHandle,
+    tag: &str,
+    fail_title: &str,
+    ok_message: &str,
+    at_ms: u64,
+    res: &Result<(), String>,
+) {
+    let st = match res {
+        Ok(()) => AutoPushStatus {
+            at_ms,
+            ok: true,
+            message: ok_message.to_string(),
+        },
+        Err(e) => AutoPushStatus {
+            at_ms,
+            ok: false,
+            message: e.clone(),
+        },
+    };
+    eprintln!(
+        "[{tag}] {} {}",
+        if st.ok { "ok" } else { "err" },
+        st.message
+    );
+    if !st.ok {
+        notify_autosync(app, fail_title.to_string(), st.message.clone());
+    }
+    *slot.lock().await = Some(st);
+}
+
+/// 读取一次配置，同时给出推送/拉取两个间隔（`Some((None, None))` = 读到了但均未启用）。
+///
+/// 一次读库同时取两个值：既省一次查询，也避免两次读之间配置被改而拿到
+/// 「半个旧配置 + 半个新配置」。
+///
+/// **返回 `None` 表示「读配置失败」，与「读到了但未启用」严格区分**：
+/// 调用方在读失败时**不得**更新调度时钟。否则一次瞬时错误（SQLite busy、
+/// 磁盘抖动、`spawn_blocking` join 失败）会被 `sync_enabled(false, _)` 当成
+/// 「用户关掉了」→ 清空锚点 → 重新计时，把下一次执行整体推迟一个完整间隔。
+/// 那正是本条目要消灭的症状（自动同步被无限推迟），只是触发源换成了偶发 IO 错误。
+async fn current_autosync_intervals(
+    core: &AppCore,
+) -> Option<(Option<Duration>, Option<Duration>)> {
     let db = core.db.clone();
     let res = tokio::task::spawn_blocking(move || {
         db.with_any(|c| sync::config_get(c).map_err(|e| e.to_string()))
     })
     .await
     .map_err(join_err);
-    let cfg: Option<WebDavConfig> = match res {
-        Ok(Ok(c)) => c,
+    let cfg: WebDavConfig = match res {
+        // 读到了配置
+        Ok(Ok(Some(c))) => c,
+        // 读到了「没有配置」→ 均未启用（这是确定的信息，可以更新时钟）
+        Ok(Ok(None)) => return Some((None, None)),
+        // 读取失败 → 不返回结论，由调用方保持时钟不动
         _ => return None,
     };
-    let cfg = cfg?;
-    if !cfg.auto_pull_enabled {
-        return None;
-    }
-    Some(std::time::Duration::from_secs(
-        u64::from(cfg.normalized_interval()) * 60,
+    Some((
+        cfg.auto_push_enabled
+            .then(|| Duration::from_secs(u64::from(cfg.normalized_push_interval()) * 60)),
+        cfg.auto_pull_enabled
+            .then(|| Duration::from_secs(u64::from(cfg.normalized_pull_interval()) * 60)),
     ))
 }
 

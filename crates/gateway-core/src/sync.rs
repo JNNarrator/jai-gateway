@@ -17,7 +17,7 @@ const SNAPSHOT_META_KEY: &str = "webdav_last_snapshot";
 /// 最近一次成功推/拉的远端 exportedAt（last-write-wins 时间戳基线）。
 const LAST_SYNC_META_KEY: &str = "webdav_last_sync_exported_at";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WebDavConfig {
     pub url: String,
@@ -28,13 +28,52 @@ pub struct WebDavConfig {
     pub auto_push_enabled: bool,
     /// 定时推送间隔分钟数（30/60/360；默认 60）
     pub auto_push_interval_min: u32,
-    /// 定时自动拉取总开关（默认关；与自动推送共用间隔，按 exportedAt 时间戳 last-write-wins）
+    /// 定时自动拉取总开关（默认关；按 exportedAt 时间戳 last-write-wins）
     #[serde(default)]
     pub auto_pull_enabled: bool,
+    /// 定时拉取间隔分钟数（30/60/360；默认 60）—— 与推送间隔**相互独立**。
+    ///
+    /// 曾与推送共用一个间隔字段，「推送 6 小时 / 拉取 30 分钟」这种组合根本无法表达；
+    /// 独立之后由桌面壳调度器按各自「上次执行时间」分别判定到期（bug 清单 20）。
+    #[serde(default = "auto_sync_interval_default")]
+    pub auto_pull_interval_min: u32,
 }
 
-pub const AUTO_PUSH_INTERVAL_DEFAULT: u32 = 60;
-pub const AUTO_PUSH_INTERVAL_ALLOWED: [u32; 3] = [30, 60, 360];
+/// 自动同步间隔的允许值域（推送与拉取各自独立取值，但共用同一集合）。
+pub const AUTO_SYNC_INTERVAL_ALLOWED: [u32; 3] = [30, 60, 360];
+/// 自动同步间隔默认值（分钟）。
+pub const AUTO_SYNC_INTERVAL_DEFAULT: u32 = 60;
+
+/// `#[serde(default = ...)]` 需要一个函数路径（不能直接写常量）。
+const fn auto_sync_interval_default() -> u32 {
+    AUTO_SYNC_INTERVAL_DEFAULT
+}
+
+/// 手写 `Default`（而非 derive）：让「缺键反序列化」与「`WebDavConfig::default()`」
+/// 得到同一个值。derive 会给新字段 0，与 serde 缺省值 60 不一致 ——
+/// 虽然 `config_set` 会把非法值归一化，但读出来的值本身就该是合法的。
+impl Default for WebDavConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            username: String::new(),
+            directory: String::new(),
+            auto_push_enabled: false,
+            auto_push_interval_min: AUTO_SYNC_INTERVAL_DEFAULT,
+            auto_pull_enabled: false,
+            auto_pull_interval_min: AUTO_SYNC_INTERVAL_DEFAULT,
+        }
+    }
+}
+
+/// 间隔归一化：不在允许值域内一律回退默认值。
+fn normalize_interval(v: u32) -> u32 {
+    if AUTO_SYNC_INTERVAL_ALLOWED.contains(&v) {
+        v
+    } else {
+        AUTO_SYNC_INTERVAL_DEFAULT
+    }
+}
 
 impl WebDavConfig {
     /// 配置文件完整远端地址（目录各路径段按 URL 语义百分号编码，
@@ -43,13 +82,14 @@ impl WebDavConfig {
         join_remote_file(&self.url, &self.directory, CONFIG_FILE_NAME)
     }
 
-    /// 非法值回退默认 60 分钟。
-    pub fn normalized_interval(&self) -> u32 {
-        if AUTO_PUSH_INTERVAL_ALLOWED.contains(&self.auto_push_interval_min) {
-            self.auto_push_interval_min
-        } else {
-            AUTO_PUSH_INTERVAL_DEFAULT
-        }
+    /// 推送间隔归一化：非法值回退默认 60 分钟。
+    pub fn normalized_push_interval(&self) -> u32 {
+        normalize_interval(self.auto_push_interval_min)
+    }
+
+    /// 拉取间隔归一化：非法值回退默认 60 分钟。
+    pub fn normalized_pull_interval(&self) -> u32 {
+        normalize_interval(self.auto_pull_interval_min)
     }
 
     /// 配置文件所在远端目录（不含文件名；路径段已编码）。
@@ -110,7 +150,7 @@ pub fn snapshot_meta_key() -> &'static str {
     SNAPSHOT_META_KEY
 }
 
-/// **本机调度偏好**键：自动推送开关/间隔、自动拉取开关。
+/// **本机调度偏好**键：自动推送开关/间隔、自动拉取开关/间隔。
 ///
 /// 它们描述的是「这台机器多久同步一次」，不是共享配置，因此**不参与同步**：
 /// 导出侧剔除、导入侧忽略（两处共用本常量，避免再次漏改）。
@@ -121,10 +161,14 @@ pub fn snapshot_meta_key() -> &'static str {
 /// 对称地，B 机刻意关掉的「自动推送」也会被翻回开，让新机器反过来覆盖远端。
 /// 两处共用同一常量；导出侧也剔除，可在「只升级了一台机器」的半升级状态下
 /// 保护旧版本（旧版导入侧仍会收这些键，收不到就不会覆盖）。
-pub const MACHINE_LOCAL_META_KEYS: [&str; 3] = [
+///
+/// 新增键时**务必加进本数组**：调度偏好是「逐机」的，漏加会让 A 机的间隔
+/// 静默改写 B 机的间隔 —— 与 bug 19 同类，只是症状更隐蔽。
+pub const MACHINE_LOCAL_META_KEYS: [&str; 4] = [
     "webdav_auto_push_enabled",
     "webdav_auto_push_interval_min",
     "webdav_auto_pull_enabled",
+    "webdav_auto_pull_interval_min",
 ];
 
 /// 判断某个 meta key 是否属于「本机调度偏好」（同步时双向跳过）。
@@ -146,10 +190,13 @@ pub fn config_get(c: &Connection) -> Result<Option<WebDavConfig>, StoreError> {
             .unwrap_or(false),
         auto_push_interval_min: crate::store::meta_get(c, "webdav_auto_push_interval_min")?
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(AUTO_PUSH_INTERVAL_DEFAULT),
+            .unwrap_or(AUTO_SYNC_INTERVAL_DEFAULT),
         auto_pull_enabled: crate::store::meta_get(c, "webdav_auto_pull_enabled")?
             .map(|v| v == "1")
             .unwrap_or(false),
+        auto_pull_interval_min: crate::store::meta_get(c, "webdav_auto_pull_interval_min")?
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(AUTO_SYNC_INTERVAL_DEFAULT),
     }))
 }
 
@@ -166,12 +213,17 @@ pub fn config_set(c: &Connection, cfg: &WebDavConfig) -> Result<(), StoreError> 
     crate::store::meta_set(
         c,
         "webdav_auto_push_interval_min",
-        &cfg.normalized_interval().to_string(),
+        &cfg.normalized_push_interval().to_string(),
     )?;
     crate::store::meta_set(
         c,
         "webdav_auto_pull_enabled",
         if cfg.auto_pull_enabled { "1" } else { "0" },
+    )?;
+    crate::store::meta_set(
+        c,
+        "webdav_auto_pull_interval_min",
+        &cfg.normalized_pull_interval().to_string(),
     )?;
     Ok(())
 }
@@ -827,8 +879,9 @@ mod tests {
             username: username.into(),
             directory: directory.into(),
             auto_push_enabled: false,
-            auto_push_interval_min: AUTO_PUSH_INTERVAL_DEFAULT,
+            auto_push_interval_min: AUTO_SYNC_INTERVAL_DEFAULT,
             auto_pull_enabled: false,
+            auto_pull_interval_min: AUTO_SYNC_INTERVAL_DEFAULT,
         }
     }
 
@@ -839,6 +892,8 @@ mod tests {
         cfg.auto_push_enabled = true;
         cfg.auto_push_interval_min = 30;
         cfg.auto_pull_enabled = true;
+        // 推送 30 / 拉取 360：两个间隔必须各自独立往返（bug 清单 20 的配置前提）
+        cfg.auto_pull_interval_min = 360;
         config_set(&c, &cfg).unwrap();
         assert_eq!(config_get(&c).unwrap(), Some(cfg));
         snapshot_put(&c, "{}").unwrap();
@@ -850,7 +905,7 @@ mod tests {
         let c = open_and_migrate(":memory:").unwrap();
         // 未配置时：无连接配置，但间隔常量默认 60
         assert_eq!(config_get(&c).unwrap(), None);
-        assert_eq!(AUTO_PUSH_INTERVAL_DEFAULT, 60);
+        assert_eq!(AUTO_SYNC_INTERVAL_DEFAULT, 60);
         // 写入非法间隔 → 读出回落 60；auto_pull 未写 → 默认关
         let mut cfg = mk_cfg("https://dav.example.com/", "u", "");
         cfg.auto_push_interval_min = 7;
@@ -858,7 +913,56 @@ mod tests {
         let read = config_get(&c).unwrap().unwrap();
         assert!(!read.auto_push_enabled);
         assert!(!read.auto_pull_enabled);
-        assert_eq!(read.auto_push_interval_min, AUTO_PUSH_INTERVAL_DEFAULT);
+        assert_eq!(read.auto_push_interval_min, AUTO_SYNC_INTERVAL_DEFAULT);
+        assert_eq!(read.auto_pull_interval_min, AUTO_SYNC_INTERVAL_DEFAULT);
+    }
+
+    /// 拉取间隔是独立字段：非法值单独归一化，且**不受推送间隔影响**。
+    ///
+    /// 反证价值：若实现仍让两者共用一个字段（或让 `normalized_pull_interval`
+    /// 误读 `auto_push_interval_min`），把推送设成 30 会让拉取也变 30，
+    /// 下面的断言立刻变红。
+    #[test]
+    fn pull_interval_normalizes_independently_of_push() {
+        let c = open_and_migrate(":memory:").unwrap();
+        let mut cfg = mk_cfg("https://dav.example.com/", "u", "");
+        cfg.auto_push_interval_min = 30;
+        cfg.auto_pull_interval_min = 360;
+        config_set(&c, &cfg).unwrap();
+        let read = config_get(&c).unwrap().unwrap();
+        assert_eq!(read.normalized_push_interval(), 30);
+        assert_eq!(read.normalized_pull_interval(), 360);
+
+        // 拉取侧非法值单独回落，推送侧不动
+        let mut bad = read;
+        bad.auto_pull_interval_min = 7;
+        config_set(&c, &bad).unwrap();
+        let read = config_get(&c).unwrap().unwrap();
+        assert_eq!(read.auto_pull_interval_min, AUTO_SYNC_INTERVAL_DEFAULT);
+        assert_eq!(read.auto_push_interval_min, 30);
+    }
+
+    /// 缺键反序列化与 `Default::default()` 必须给出同一个值（两者都是 60）。
+    ///
+    /// 手写 `Default` 的意义就在这里：若改回 `derive(Default)`，
+    /// `WebDavConfig::default().auto_pull_interval_min` 会是 0，本用例变红。
+    #[test]
+    fn missing_pull_interval_key_falls_back_to_default() {
+        let json = r#"{
+            "url": "https://dav.example.com/",
+            "username": "u",
+            "directory": "",
+            "autoPushEnabled": false,
+            "autoPushIntervalMin": 30,
+            "autoPullEnabled": true
+        }"#;
+        let cfg: WebDavConfig =
+            serde_json::from_str(json).expect("旧配置缺 autoPullIntervalMin 也应能反序列化");
+        assert_eq!(cfg.auto_pull_interval_min, AUTO_SYNC_INTERVAL_DEFAULT);
+        assert_eq!(
+            WebDavConfig::default().auto_pull_interval_min,
+            AUTO_SYNC_INTERVAL_DEFAULT
+        );
     }
 
     #[test]

@@ -191,6 +191,7 @@ async fn pull_rejects_oversized_remote_config() {
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
 
     let e = sync::try_pull(&client, &cfg, "pw").await.unwrap_err();
@@ -237,6 +238,7 @@ async fn webdav_push_pull_roundtrip() {
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
     let client = reqwest::Client::new();
     let payload = r#"{"format":"jai-export/v1","providers":[]}"#.to_string();
@@ -279,6 +281,7 @@ async fn webdav_pull_imports_into_db() {
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
     let client = reqwest::Client::new();
     let text = sync::pull(&client, &cfg, "pw").await.unwrap();
@@ -302,6 +305,7 @@ async fn probe_verifies_credentials() {
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
 
     // 错误凭据 → 认证失败（此前 OPTIONS 匿名放行会把这里误报成「连接成功」）
@@ -323,6 +327,7 @@ async fn pull_push_error_hints_for_bad_credentials() {
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
 
     let e = sync::pull(&client, &cfg, "wrong").await.unwrap_err();
@@ -344,6 +349,7 @@ async fn pull_404_hints_missing_remote_file() {
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
 
     let e = sync::pull(&client, &cfg, "pw").await.unwrap_err();
@@ -370,6 +376,7 @@ async fn push_backs_up_existing_remote_before_overwrite() {
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
     let client = reqwest::Client::new();
     let empty = r#"{"format":"jai-export/v1","providers":[],"models":[]}"#.to_string();
@@ -418,6 +425,7 @@ async fn probe_404_hints_bad_path() {
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
     let err = sync::probe(&client, &cfg, "pw").await.unwrap_err();
     assert!(err.contains("路径不存在"), "{err}");
@@ -434,6 +442,7 @@ async fn webdav_backups_list_restore_delete_roundtrip() {
         auto_push_enabled: false,
         auto_push_interval_min: 60,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 60,
     };
     {
         let mut m = remote.lock().unwrap();
@@ -501,9 +510,9 @@ async fn webdav_backups_list_restore_delete_roundtrip() {
 
 /// 造一台「老机器 A」的完整导出物：带 key 的供应商 + 模型 + 网关 Key + A 机调度偏好。
 ///
-/// **刻意注入**三个 `webdav_auto_*`（模拟 v0.2.3 及更早推上去的远端内容——
+/// **刻意注入**四个 `webdav_auto_*`（模拟 v0.2.3 及更早推上去的远端内容——
 /// 也就是升级前真实存在于用户远端的那种 payload）：只有 payload 里带着它们，
-/// 才真正压住导入侧；若只依赖本版本的导出器（已剔除这三个键），
+/// 才真正压住导入侧；若只依赖本版本的导出器（已剔除这四个键），
 /// 导入侧即使退化回「照单全收」也测不出来。
 async fn machine_a_export(port: u16) -> String {
     let a = Db::in_memory().unwrap();
@@ -518,6 +527,7 @@ async fn machine_a_export(port: u16) -> String {
                 auto_push_enabled: true,
                 auto_push_interval_min: 30,
                 auto_pull_enabled: false,
+                auto_pull_interval_min: 30,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -550,11 +560,14 @@ async fn machine_a_export(port: u16) -> String {
         .with_any(|c| store::export::build_export_json(c).map_err(|e| e.to_string()))
         .unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&built).unwrap();
-    // 旧版形态：这三个键曾被导出、并随 payload 旅行到对方机器
+    // 旧版形态：这四个键曾被导出、并随 payload 旅行到对方机器
     let meta = v.get_mut("meta").unwrap().as_array_mut().unwrap();
     meta.push(json!(["webdav_auto_push_enabled", "1"]));
     meta.push(json!(["webdav_auto_push_interval_min", "30"]));
     meta.push(json!(["webdav_auto_pull_enabled", "0"]));
+    // 拉取间隔也注入，且**故意取 360**：B 机本机值是 30，若导入侧把本机调度偏好
+    // 照单全收，B 的 30 会被改成 360，下面的断言立刻变红（可反证）。
+    meta.push(json!(["webdav_auto_pull_interval_min", "360"]));
     v.to_string()
 }
 
@@ -572,6 +585,7 @@ fn export_omits_machine_local_switches() {
                 auto_push_enabled: true,
                 auto_push_interval_min: 30,
                 auto_pull_enabled: true,
+                auto_pull_interval_min: 30,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -613,6 +627,7 @@ fn cfg_for(port: u16) -> WebDavConfig {
         auto_push_enabled: true,
         auto_push_interval_min: 30,
         auto_pull_enabled: false,
+        auto_pull_interval_min: 30,
     }
 }
 
@@ -676,7 +691,8 @@ async fn pull_must_not_clobber_local_auto_switches() {
         .await
         .unwrap();
 
-    // B 机：用户已按自己的意愿设定本机偏好 —— 自动拉取开、自动推送关、间隔 360
+    // B 机：用户已按自己的意愿设定本机偏好 —— 自动拉取开、自动推送关、
+    // 推送间隔 360、拉取间隔 30（推送/拉取两个间隔刻意不同，且都不同于 A 机）
     let b = Db::in_memory().unwrap();
     b.with_any(|c| {
         sync::config_set(
@@ -688,6 +704,7 @@ async fn pull_must_not_clobber_local_auto_switches() {
                 auto_push_enabled: false,
                 auto_push_interval_min: 360,
                 auto_pull_enabled: true,
+                auto_pull_interval_min: 30,
             },
         )
         .map_err(|e| e.to_string())
@@ -722,5 +739,9 @@ async fn pull_must_not_clobber_local_auto_switches() {
     assert_eq!(
         after.auto_push_interval_min, 360,
         "拉取不得改掉本机的自动推送间隔"
+    );
+    assert_eq!(
+        after.auto_pull_interval_min, 30,
+        "拉取不得改掉本机的自动拉取间隔（A 机 payload 里注入的是 360，不该被导入）"
     );
 }

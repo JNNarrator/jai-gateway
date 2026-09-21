@@ -31,6 +31,11 @@ node tools/visual-regression/mcp-switches.mjs --size=900x600
 # 网关页接入地址的说明性回归（Base URL 复制仍在 / 完整地址 5 条 / 复制内容逐条相符 / 无溢出）
 node tools/visual-regression/gateway-endpoints.mjs --size=1180x800
 node tools/visual-regression/gateway-endpoints.mjs --size=900x600
+
+# 同步页「推送间隔 / 拉取间隔各自独立」的说明性回归
+# （两个选择器独立 / 各写各的 IPC 字段 / 文案不再声称共用 / 无溢出）
+node tools/visual-regression/sync-intervals.mjs --size=1180x800
+node tools/visual-regression/sync-intervals.mjs --size=900x600
 ```
 
 `gateway-endpoints.mjs` 需要剪贴板读写授权（脚本内 `ctx.grantPermissions(["clipboard-read","clipboard-write"])`）——
@@ -57,3 +62,26 @@ node tools/visual-regression/gateway-endpoints.mjs --size=900x600
   `text-overflow: ellipsis` 或 `.truncate` 且 `scrollWidth > clientWidth` 且无 `title` 才算问题。
 - 命中区：审计的 rect 数值**不等于**有效命中区，需用 `probe-hits.mjs` 复核；
   Radix 的 `aria-hidden` 隐藏代理（1×1 `select` 等）不是可点元素，属假阳性。
+
+- **`.vr/run.mjs` 是本地镜像，改了 `tools/visual-regression/run.mjs` 必须同步过去**
+  （2026-09-20 踩到）：`audit.mjs` / `deep.mjs` / `deep2.mjs` / `fold.mjs` / `probe-*.mjs`
+  共 **12 个**探针是从 `path.resolve(".vr/run.mjs")` 读 `installMock` 的，**不是**读仓库里
+  那份（`audit.mjs` 的注释写「复用 run.mjs 里的 invoke mock」具有误导性）。
+  `.vr/` 在 `.gitignore` 中，所以这是「未跟踪副本」，改了源文件而忘了同步时，
+  探针会静默继续用**旧 mock** —— 排查方向会被彻底带偏。改动后请：
+
+  ```bash
+  cp tools/visual-regression/run.mjs       .vr/run.mjs
+  cp tools/visual-regression/fixtures.mjs  .vr/fixtures.mjs
+  ```
+
+  （长期修法是把那 12 处改成读仓库内路径，尚未做。）
+- **「无控制台报错」断言曾长期恒假**（2026-09-20 修）：`@tauri-apps/api` 的 `_unlisten`
+  直接读 `window.__TAURI_EVENT_PLUGIN_INTERNALS__`（真实运行由 Tauri 注入），
+  而 mock 只装了 `__TAURI_INTERNALS__`/`__TAURI__`。于是 `TitleBar` 的
+  `win.onResized()` 清理路径在**每个页面**都抛
+  `Cannot read properties of undefined (reading 'unregisterListener')`，
+  三个断言「无控制台报错」的探针（`mcp-switches` / `gateway-endpoints` / `sync-intervals`）
+  一律为红，久而久之被当成「已知噪音」忽略 —— 等于这条断言从未生效。
+  现在四个 mock 都补了该内部对象（含 `run.mjs`，从而覆盖从它提取 mock 的探针）。
+  **教训**：一条一直红的断言比没有断言更危险，它会训练人忽略红色。

@@ -117,6 +117,11 @@ function installMock() {
     registerPlugin() {},
   };
   window.__TAURI__ = { event: {}, window: {}, core: {} };
+  // 见 mcp-switches.mjs 同处注释：`_unlisten` 需要 Tauri 注入的事件插件内部对象，
+  // 缺了它 TitleBar 的 onResized 清理会抛 pageerror。
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+    unregisterListener(_event, id) { cb.delete(id); },
+  };
 }
 
 // ───────────────────────── 探针 ─────────────────────────

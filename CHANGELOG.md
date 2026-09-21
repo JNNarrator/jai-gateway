@@ -4,6 +4,89 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-09-21
+
+### Fixed
+- **「自动拉取没生效」的真因：变更唤醒把定时器重置，自动拉取被饿死**（bug 清单 20）。
+  `spawn_autopush` 每轮循环都**新建** `tokio::time::sleep(wait)`，`rx.changed()` 一到就在
+  `select!` 里丢弃它并重建 —— 即「任何一次变更唤醒都重置定时倒计时」。而 `notify_change()`
+  在 **15 处**调用（供应商增删改、模型改别名/限额/模态、MCP、技能、网关 Key 重生成、导入、
+  快照恢复……），全是日常编辑动作。只要用户**编辑得比间隔勤**（间隔 30/60 分钟时很常见，
+  360 分钟几乎必然），定时 tick 永远等不到，自动拉取再也不会跑；自动推送的定时分支同样失效。
+  - 附带纠正原条目的判断：原文点名的 `let wait = push_interval.or(pull_interval)`
+    当时**不是活跃缺陷** —— 全项目只有一个间隔字段，两边恒等，`or` 取哪个都一样。
+    它是「一旦把两个间隔拆开就会静默踩中」的潜在隐患，本次一并消除。
+  - 修法：调度抽成纯函数 `plan_sync` / `next_wake` + `ActionClock`
+    （记录「上次实际执行时刻」与「启用起点」）。到期点 = `anchor + interval`，
+    **只有真正执行过才往后推**，变更唤醒与配置重读都不再重置它 —— 饿死路径从结构上消失。
+    定时唤醒点取**最近的一个到期点**，同时修掉旧代码「开了自动推送就每 tick 都推」。
+  - 时钟用**单调时钟** `Instant`；挂钟毫秒（`at_ms`）只用于界面展示，不参与判定 ——
+    系统时间被 NTP 校正或手改，不该让同步饿死或瞬间风暴。
+  - 顺带修掉改调度时**自己引入**的两个风险（自查发现，各配单测）：
+    ① **拿不到锁时的空转**：改成「睡到到期点」后，若动作已到期而手动推/拉正持锁，
+       `next_wake` 返回 `Some(ZERO)` → `sleep(0)` 立即返回 → 又拿不到锁 → `continue`，
+       变成空转 + 刷屏（旧实现每轮固定睡满一个间隔，没有这个问题）。
+       新增 `AUTOSYNC_LOCK_BACKOFF`（5s）显式退避。
+    ② **配置改动生效滞后**：`webdav_config_set` 原先不通知调度循环（它改的是调度参数本身），
+       若睡满一个长间隔（推送 6 小时），用户刚把「拉取间隔」改成 30 分钟也要等最长 6 小时才生效。
+       新增**独立的**配置变更信号 `AutopushHub::cfg_tx` + `notify_config_change()`，
+       调度循环 `select!` 多一路 `Wake::Config`：只回循环顶部重读配置，**不推送、不走防抖**
+       （复用 `tx` 会变成「改个间隔就顺带推一次远端」）。
+       另加 `AUTOSYNC_MAX_SLEEP`（60s）作纯安全网 —— 只是「醒来重新评估配置」，
+       **不会提前执行动作**（是否该跑由 `plan_sync` 按绝对到期点判定，与睡眠时长无关）。
+  - 对抗性代码审查（`code-reviewer` 子代理）后另补一个真缺陷：
+    **瞬时读库失败被当成「用户关掉了」**。`current_autosync_intervals` 原先把
+    「读配置失败」与「读到了但未启用」都返回 `(None, None)`，调用方据此
+    `sync_enabled(false, _)` → **清空锚点** → 恢复后重新计时，
+    把下一次执行整体推迟一个完整间隔（最长 6 小时）—— 正是本次要消灭的症状，
+    只是触发源换成了偶发 IO 错误（SQLite busy / 磁盘抖动 / `spawn_blocking` join 失败）。
+    改为返回 `Option<...>`：`None` = 读失败 → **保持时钟不动**，睡 `AUTOSYNC_CONFIG_POLL` 后重试；
+    `Some((None, None))` = 确定的「未启用」。
+
+### Changed
+- **自动推送与自动拉取各自拥有独立间隔**（bug 清单 20）。
+  此前两者共用一个 `auto_push_interval_min`，「推送 6 小时 / 拉取 30 分钟」这种组合
+  **根本无法配置**。现拆为 `auto_push_interval_min` 与 `auto_pull_interval_min`
+  （`normalized_interval()` 相应更名 `normalized_push_interval()`，新增 `normalized_pull_interval()`），
+  同步页从「一个共用间隔」改为**推送 / 拉取各一个**选择器，文案明确两者相互独立。
+  - 新 meta 键 `webdav_auto_pull_interval_min` 已加入 `MACHINE_LOCAL_META_KEYS`
+    （本机调度偏好，导出剔除 + 导入忽略）：漏加就是 bug 19 的同类问题（A 机间隔静默改写 B 机）。
+    常量注释里补了「新增键务必加进本数组」的纪律。
+  - 兼容：旧配置无该键时按 serde 缺省回落到 60 分钟（与推送间隔同默认值），
+    且 `Default` 改为手写，保证「缺键反序列化」与 `WebDavConfig::default()` 取值一致。
+  - 语义：两个间隔都从**上次成功执行完成**起算（固定延迟，避免慢同步背靠背连跑）；
+    刚启用或关掉再打开都重新等一个完整间隔（避免打开瞬间立刻同步一次）；
+    缩短间隔**即时生效**（按上次执行时刻重算）。
+
+### Added
+- 调度器单测 `mod autosync_schedule_tests`（12 条，**可控时钟**：全部用「基准时刻 + 偏移」
+  构造 now，不依赖真实时间流逝，不会 flaky）。覆盖：拉取不被推送长间隔绑死
+  （360/30 → 唤醒点取 30）、推送不被拉取短 tick 拽跑（30…330 分钟只拉不推，第 360 分钟才推）、
+  **变更唤醒不推迟到期点**（第 m 分钟剩余时长须为 `30-m` —— 饿死回归）、关掉再打开重新计时、
+  改间隔按上次执行重算、刚启用不立刻同步。
+- `sync.rs` 新增 2 条单测：拉取间隔独立归一化（不受推送间隔影响）、
+  缺键反序列化与 `Default` 取值一致。
+- `m7_import_webdav.rs` 的 bug 19 守门人测试扩到新键：B 机推送间隔 360 / 拉取间隔 30，
+  A 机 payload **注入** `webdav_auto_pull_interval_min=360`，断言拉取后 B 仍为 30
+  （导入侧若退化即精确变红）。
+
+### 工程 / 测试基建
+- 新增视觉回归探针 `tools/visual-regression/sync-intervals.mjs`：把「两个间隔各自独立」
+  固化成断言 —— 两个选择器分别存在且纵向分离、初始值各来自自己的字段（fixture 刻意取
+  推送 30 / 拉取 360）、**改拉取只写 `autoPullIntervalMin` 且不碰推送**（反向同理，
+  比对 IPC 参数而非只看界面）、文案不再声称共用、无横向溢出、选择器完整可见。
+  1180×800 与 900×600 双尺寸全绿。
+- **修掉视觉回归探针里两个「让断言静默失效」的坑**（bug 清单 28）：
+  ① 三个断言「无控制台报错」的探针（`mcp-switches` / `gateway-endpoints` / `sync-intervals`）
+  **长期恒红**——`@tauri-apps/api` 的 `_unlisten` 需要 Tauri 注入的
+  `window.__TAURI_EVENT_PLUGIN_INTERNALS__`，而 mock 只装了 `__TAURI_INTERNALS__`；
+  `TitleBar` 的 `onResized` 清理在每个页面都抛 pageerror。四个 mock 已补齐该对象，
+  三者修后全绿（`gateway-endpoints` 17/17）。
+  ② `audit.mjs` / `deep*.mjs` / `fold.mjs` / `probe-*.mjs` 共 **12 个**探针读的是
+  `.vr/run.mjs`（未跟踪的本地镜像）而非仓库内 `run.mjs`——改源文件不同步镜像时，
+  探针会静默沿用旧 mock（本次实测：改完 audit 的 pageerror 依旧）。已同步镜像，
+  并把纪律写进 `tools/visual-regression/README.md`。
+
 ## [0.2.11] - 2026-09-20
 
 ### Fixed

@@ -422,15 +422,91 @@
     且**新机器必须先手工填一次 WebDAV 地址/账号/密码**（凭据是"能拉取"的前提，无法自举）。
     升级后建议在新机器上按自己的意愿重新设置「自动拉取/自动推送」开关——从此不再被对方改掉。
 
-- [ ] 20. 自动拉取的时间节奏被自动推送的间隔绑住（相邻缺陷，本次未改）
-  - 位置：`src-tauri/src/main.rs::spawn_autopush` —— `let wait = push_interval.or(pull_interval)`，
-    一个 tick 只取**其中一个**间隔；且定时分支里「开了自动推送就每 tick 都推」。
-  - 后果：若自动推送设 360 分钟、自动拉取设 30 分钟，则拉取实际也是 360 分钟一次
-    （用户会以为「自动拉取没生效」）。bug 19 修好后三个开关各自独立，这个耦合反而更容易被踩到。
-  - 建议修法：tick 取启用项的最小间隔，并按各自「上次执行时间」分别判定是否该跑
-    （状态已在 `autopush.last` / `autopush.last_pull` 里，`at_ms` 可直接用），
-    避免把 360 分钟的推送也压成 30 分钟。需要一个可控时钟的测试。
-  - 影响面：仅调度节奏，不影响数据正确性（`should_pull` 的 last-write-wins 仍会拦住重复导入）。
+- [x] 20. 自动拉取的时间节奏被自动推送的间隔绑住（2026-09-20 修复）
+  - **先修正原条目的判断**：原文说「若自动推送设 360 分钟、自动拉取设 30 分钟，则拉取实际也是
+    360 分钟一次」。核对代码后确认：**这个场景当时根本无法配置出来** —— 全项目只有一个间隔字段
+    `auto_push_interval_min`（`WebDavConfig`），`current_autopush_interval` 与
+    `current_autopull_interval` 都读它，同步页也只有一个「定时间隔」选择器。
+    所以 `push_interval.or(pull_interval)` 两边恒等，`or` 取哪个都一样 ——
+    原文点名的 `or` 是**潜在隐患**（一旦有人把两个间隔拆开就会静默踩中），不是当时的活跃缺陷。
+  - **但症状是真的，根因是另一个（且当时可复现）**：`spawn_autopush` 每轮循环都**新建**
+    `tokio::time::sleep(wait)`，`rx.changed()` 一到就在 `select!` 里丢弃它并重建 ——
+    即「任何一次变更唤醒都会把定时倒计时重置」。而 `notify_change()` 在
+    **15 处**调用（供应商增删改、模型改别名/限额/模态、MCP、技能、网关 Key 重生成、
+    导入、快照恢复……），全是日常编辑动作。
+    ⇒ 只要用户**编辑得比间隔勤**（间隔 30/60 分钟时很常见，360 分钟几乎必然），
+    定时 tick 永远等不到，**自动拉取被饿死**，症状正是原条目写的「用户以为自动拉取没生效」。
+    连带自动推送的定时分支也一起失效（只剩变更触发）。
+  - 处置（一次做完，两件事同源）：
+    1. **拆出独立的拉取间隔**（本次按用户拍板加）：`WebDavConfig` 新增
+       `auto_pull_interval_min` + `normalized_pull_interval()`，meta 键
+       `webdav_auto_pull_interval_min`；`normalized_interval()` 更名 `normalized_push_interval()`
+       （消除「一个名字管两边」的歧义）。同步页从「一个共用间隔」改为**推送/拉取各一个**选择器。
+       新增键**必须**进 `MACHINE_LOCAL_META_KEYS`（本机调度偏好，双向不参与同步）——
+       漏加就是 bug 19 的同类问题（A 机间隔静默改写 B 机），已在常量注释里写明这条纪律。
+    2. **重写调度**：抽成纯函数 `plan_sync` / `next_wake` + `ActionClock`
+       （记录「上次实际执行时刻」与「启用起点」，单调时钟 `Instant`）。
+       到期点 = `anchor + interval`，**只有真正执行过才会往后推** ——
+       变更唤醒、配置重读都不再重置它，饿死路径从结构上消失。
+       定时唤醒点取**最近的一个到期点**（不是 `or` 取其一，也不是各间隔的最小值）：
+       既修掉拉取被长间隔绑死，也修掉旧代码「开了自动推送就每 tick 都推」
+       （那会让 360 分钟的推送被 30 分钟的拉取拽成 30 分钟一次，反复覆盖远端）。
+       挂钟毫秒（`at_ms`）**只用于界面展示**，不参与判定：系统时间被 NTP 校正或手改
+       不该让同步饿死或瞬间风暴（这是没照抄「直接用 `at_ms`」建议的原因）。
+       顺带把两处重复的结果记录/通知收敛成 `record_auto_sync`，配置读取由「每轮两次」
+       并为一次（避免两次读之间配置被改而拿到半个旧配置）。
+    3. **自查改调度时自己引入的两个风险**（各配单测）：
+       ① **拿不到锁时的空转**：改成「睡到到期点」后，若动作已到期而手动推/拉正持锁，
+       `next_wake` 返回 `Some(ZERO)` → `sleep(0)` 立即返回 → 又拿不到锁 → `continue`，
+       变成空转 + 反复打日志（**旧实现每轮固定睡满一个间隔，没有这个问题** ——
+       是本次改成「睡到到期点」才引入的）。新增 `AUTOSYNC_LOCK_BACKOFF`（5s）显式退避。
+       ② **配置改动生效滞后**：`webdav_config_set` **不**触发变更通知（它改的是调度参数本身，
+       不是要同步的业务数据），若睡满一个长间隔（推送设 6 小时），用户刚把「拉取间隔」
+       改成 30 分钟也要等最长 6 小时才生效，表现为「改了没反应」。
+       新增 `AUTOSYNC_MAX_SLEEP`（60s）封顶 —— 只是「醒来重新评估配置」，
+       **不会提前执行动作**（是否该跑由 `plan_sync` 按绝对到期点判定，与睡眠时长无关）。
+       两条都有单测：`sleep_duration_caps_long_waits`（去掉 `.min()` 即变红）、
+       `schedule_round_trip_for_360_push_and_30_pull`（360/30 组合串一遍决策与锚定）。
+    4. **对抗性代码审查（`code-reviewer` 子代理）后补掉的两个真缺陷**：
+       ① **瞬时读库失败被当成「用户关掉了」**：`current_autosync_intervals` 原先把
+       「读配置失败」与「读到了但未启用」都返回 `(None, None)`，调用方据此
+       `sync_enabled(false, _)` → **清空锚点** → 恢复后重新计时，
+       把下一次执行整体推迟一个完整间隔（最长 6 小时）。触发源是偶发 IO 错误
+       （SQLite busy、磁盘抖动、`spawn_blocking` join 失败），概率低但后果正是本条目
+       要消灭的症状。改为返回 `Option<...>`：`None` = 读失败 → **保持时钟不动**、
+       睡 `AUTOSYNC_CONFIG_POLL` 后重试；`Some((None, None))` = 确定未启用。
+       ② **「关掉再打开」可能整段被漏采样**：`webdav_config_set` 原先不通知调度循环，
+       状态跃迁只能靠睡眠到期才发现 —— 短窗口内的 off→on 会让
+       `sync_enabled(false)` 从未执行，锚点残留，重新启用可能立刻同步一次
+       （与 `re_enable_restarts_the_interval` 的语义相悖）。
+       新增**独立的**配置变更信号 `AutopushHub::cfg_tx` + `notify_config_change()`：
+       调度循环 `select!` 多一路 `Wake::Config`，只回到循环顶部重读配置，
+       **不推送、不走防抖**（若复用 `tx` 会变成「改个间隔就顺带推一次远端」）。
+       顺带让「改间隔」立刻生效，`AUTOSYNC_MAX_SLEEP` 退化为纯安全网。
+       配套单测 `config_change_signal_is_independent_from_data_change`
+       （两个通道任一方向被合并即变红）。
+  - 验证：`src-tauri/src/main.rs` 新增 `mod autosync_schedule_tests`（12 个用例，
+    **可控时钟**：全部用「基准时刻 + 偏移」构造 now，不依赖真实时间流逝，不会 flaky）。
+    关键几条：`pull_is_not_throttled_by_push_interval`（360/30 → 唤醒点取 30，拉取到期而推送不到期）、
+    `push_is_not_over_triggered_by_pull_ticks`（30…330 分钟只拉不推，第 360 分钟才推）、
+    `change_wakes_do_not_push_back_the_deadline`（第 m 分钟变更唤醒后剩余时长必须是 `30-m`
+    而不是恒为 30 —— 这正是饿死回归）、`re_enable_restarts_the_interval`、
+    `interval_change_reanchors_from_last_run`、`never_run_action_fires_after_one_full_interval`
+    （保住「刚启用不立刻同步」的既有语义）。
+    `sync.rs` 新增 2 条（独立归一化 + 缺键反序列化与 `Default` 一致）；
+    `m7_import_webdav.rs` 的 bug 19 守门人测试扩到新键：B 机推送间隔 360 / 拉取间隔 30，
+    A 机 payload 里**注入** `webdav_auto_pull_interval_min=360`，
+    断言拉取后 B 仍是 30（导入侧若退化就精确变红）。
+    写测试时自己踩了一次坑并已修正：`mark_run(now)` 之后再断言「立刻到期」是错的 ——
+    刚跑完应当剩一整个间隔；把期望值写对后两条用例才真正测到「从上次执行起算」。
+    全量回归 **380 通过 / 0 失败 / 2 ignored**（原 366，+14 = 调度器 12 + sync.rs 2），
+    四段门禁全绿（`cargo fmt --check` / `clippy -D warnings` / `cargo test --workspace` /
+    前端 `tsc --noEmit + vite build`）。
+  - 影响面：修前仅调度节奏受影响、不影响数据正确性（`should_pull` 的 last-write-wins
+    仍会拦住重复导入；推送侧有「空配置不覆盖远端」护栏）。修后两个节奏各自独立可控。
+  - 用户须知：**两个间隔都从「上次成功执行完成」起算**（固定延迟：远端慢/卡导致一次同步耗时超过间隔时，
+    不会背靠背连跑）；刚启用或刚关掉再打开，都重新等一个完整间隔（避免打开瞬间立刻同步一次）。
+    缩短间隔**即时生效**（按上次执行时刻重算，若已超过新间隔则立即到期）。
 
 - [x] 21. **zcode 经 JAI 测试连接恒失败：「Provider rejected the model request.」**
   - 现象：zcode 自定义 Provider（`openai-responses` → `http://127.0.0.1:1314/v1`，模型
@@ -627,6 +703,35 @@
     单侧打点无法区分"没发"与"没收到"。
   - 附带：同批 bug 25 的 4 个回归测试有 `unused_mut`（clippy `-D warnings` 门禁失败）
     ——该批改动当初未过 clippy 就提交了，`release_check.sh` 首次运行即暴露。
+
+- [x] 28. **视觉回归探针的「无控制台报错」断言长期恒假**（2026-09-20 修复，做 bug 20 时发现）
+  - 现象：新增 `sync-intervals.mjs` 后跑 1180×800 与 900×600，**功能断言全绿**，
+    但末尾「无控制台报错」恒红：`pageerror: Cannot read properties of undefined
+    (reading 'unregisterListener')`。拿既有探针做对照 —— `mcp-switches.mjs` **一模一样地红**。
+  - 根因：`@tauri-apps/api` 的 `_unlisten()` 直接读
+    `window.__TAURI_EVENT_PLUGIN_INTERNALS__.unregisterListener`（真实运行由 Tauri 注入），
+    而探针 mock 只装了 `__TAURI_INTERNALS__` / `__TAURI__`。
+    `TitleBar` 的 `win.onResized()`（自绘标题栏监听窗口尺寸）在每个页面都会注册并在
+    cleanup 时 unlisten → 于是**每个页面**都抛该 pageerror。
+  - 后果（比报错本身严重）：三个断言「无控制台报错」的探针
+    （`mcp-switches` / `gateway-endpoints` / `sync-intervals`）**永远不可能变绿**，
+    等于这条断言从未生效 —— 真正的控制台错误会被这条已知噪音淹没。
+    这属于「一直红的断言比没有断言更危险」：它训练人忽略红色。
+  - 修复：四个 mock（`mcp-switches` / `gateway-endpoints` / `sync-intervals` / `run.mjs`）
+    补上 `window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener(_e, id) { cb.delete(id); } }`。
+    修后三者全绿（`sync-intervals` 1180×800 与 900×600 **全部通过**、
+    `mcp-switches` 双尺寸全部通过、`gateway-endpoints` 17/17）。
+    `audit.mjs` 的 `page errors` 输出行也随之为空。
+  - **同批发现的第二个坑（更隐蔽）**：`audit.mjs` / `deep.mjs` / `deep2.mjs` / `fold.mjs` /
+    `probe-*.mjs` 共 **12 个**探针，是从 `path.resolve(".vr/run.mjs")` 读 `installMock` 的
+    —— 即读 `.vr/` 下那份**未跟踪的本地镜像**，不是仓库里 `tools/visual-regression/run.mjs`。
+    `audit.mjs` 的注释写「复用 run.mjs 里的 invoke mock（避免两份实现漂移）」，
+    但实际读的是本地副本，**恰恰会漂移**：我改了仓库里那份后重跑 audit，
+    pageerror 依旧 —— 因为它用的还是 9/16 的旧 mock。
+    已同步镜像并把这个「改源文件必须 `cp` 过去」的纪律写进
+    `tools/visual-regression/README.md`（长期修法是那 12 处改读仓库内路径，尚未做）。
+  - 教训：探针的 mock 必须与「真实注入的全局对象集合」对齐；
+    缺一个全局对象就会让**断言整体失效**，而失效方式是「一直红」，最容易被当成噪音。
 
 ## 2. 优化清单
 

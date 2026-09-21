@@ -51,6 +51,43 @@ const INTERVAL_OPTIONS: { value: number; label: string }[] = [
   { value: 360, label: "每 6 小时" },
 ];
 
+/** 自动同步间隔选择器：推送与拉取各一个，互不影响。 */
+function IntervalSelect({
+  label,
+  ariaLabel,
+  value,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  ariaLabel: string;
+  value: number;
+  disabled?: boolean;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <Select
+        value={String(value)}
+        disabled={disabled}
+        onValueChange={(v) => onChange(Number(v))}
+      >
+        <SelectTrigger size="sm" className="w-36" aria-label={ariaLabel}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {INTERVAL_OPTIONS.map((o) => (
+            <SelectItem key={o.value} value={String(o.value)}>
+              {o.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 export function SyncPage() {
   const [importText, setImportText] = useState("");
   const [cfg, setCfg] = useState<{ url: string; username: string; directory: string }>({
@@ -61,7 +98,7 @@ export function SyncPage() {
   const [pw, setPw] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [autoPush, setAutoPush] = useState({ enabled: false, intervalMin: 60 });
-  const [autoPull, setAutoPull] = useState(false);
+  const [autoPull, setAutoPull] = useState({ enabled: false, intervalMin: 60 });
   const [lastAuto, setLastAuto] = useState<WebDavAutoPushStatus | null>(null);
   const [lastAutoPull, setLastAutoPull] = useState<WebDavAutoPushStatus | null>(null);
   const [snapInfo, setSnapInfo] = useState<WebDavSnapshotInfo | null>(null);
@@ -101,7 +138,7 @@ export function SyncPage() {
           setCfg(c);
           setPw(c.password ?? "");
           setAutoPush({ enabled: c.autoPushEnabled, intervalMin: c.autoPushIntervalMin });
-          setAutoPull(c.autoPullEnabled);
+          setAutoPull({ enabled: c.autoPullEnabled, intervalMin: c.autoPullIntervalMin });
         }
       })
       .catch(() => {});
@@ -187,7 +224,7 @@ export function SyncPage() {
     }
   }
 
-  async function saveAuto(next: { enabled: boolean; intervalMin: number }) {
+  async function saveAutoPush(next: { enabled: boolean; intervalMin: number }) {
     setErr("");
     if (!cfg.url.trim()) {
       setErr("请先填写并保存 WebDAV 连接配置");
@@ -209,7 +246,7 @@ export function SyncPage() {
     }
   }
 
-  async function saveAutoPull(enabled: boolean) {
+  async function saveAutoPull(next: { enabled: boolean; intervalMin: number }) {
     setErr("");
     if (!cfg.url.trim()) {
       setErr("请先填写并保存 WebDAV 连接配置");
@@ -221,10 +258,11 @@ export function SyncPage() {
         username: cfg.username,
         directory: cfg.directory,
         password: null,
-        autoPullEnabled: enabled,
+        autoPullEnabled: next.enabled,
+        autoPullIntervalMin: next.intervalMin,
       });
-      setAutoPull(enabled);
-      setMsg(enabled ? "自动拉取已开启" : "自动拉取已关闭");
+      setAutoPull(next);
+      setMsg(next.enabled ? "自动拉取已开启" : "自动拉取已关闭");
     } catch (e) {
       setErr(String(e));
     }
@@ -525,58 +563,61 @@ export function SyncPage() {
 
 
           <div className="space-y-3 rounded-md border bg-muted/30 p-3">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-sm font-medium">自动推送</div>
-                <div className="text-xs leading-relaxed text-muted-foreground">
-                  配置变更后防抖 30 秒推送一次，并按所选间隔定时推送。以本机为准，直接覆盖远端。
-                  护栏：本机配置为空而远端有内容时自动跳过（避免覆盖远端备份），需手动推送。
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">自动推送</div>
+                  <div className="text-xs leading-relaxed text-muted-foreground">
+                    配置变更后防抖 30 秒推送一次，并按「推送间隔」定时推送。以本机为准，直接覆盖远端。
+                    护栏：本机配置为空而远端有内容时自动跳过（避免覆盖远端备份），需手动推送。
+                  </div>
                 </div>
+                <Switch
+                  checked={autoPush.enabled}
+                  disabled={!cfg.url.trim()}
+                  aria-label="自动推送开关"
+                  onCheckedChange={(v) =>
+                    void saveAutoPush({ enabled: v, intervalMin: autoPush.intervalMin })
+                  }
+                />
               </div>
-              <Switch
-                checked={autoPush.enabled}
+              <IntervalSelect
+                label="推送间隔"
+                ariaLabel="自动推送间隔"
+                value={autoPush.intervalMin}
                 disabled={!cfg.url.trim()}
-                aria-label="自动推送开关"
-                onCheckedChange={(v) =>
-                  void saveAuto({ enabled: v, intervalMin: autoPush.intervalMin })
+                onChange={(v) =>
+                  void saveAutoPush({ enabled: autoPush.enabled, intervalMin: v })
                 }
               />
             </div>
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-sm font-medium">自动拉取</div>
-                <div className="text-xs leading-relaxed text-muted-foreground">
-                  按所选间隔定时拉取远端更新（last-write-wins：仅当远端比上次成功同步更新时导入；
-                  空远端不拉取，防远端空配置清空本机）。
+            <div className="space-y-2 border-t pt-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">自动拉取</div>
+                  <div className="text-xs leading-relaxed text-muted-foreground">
+                    按「拉取间隔」定时拉取远端更新（last-write-wins：仅当远端比上次成功同步更新时导入；
+                    空远端不拉取，防远端空配置清空本机）。与推送间隔相互独立。
+                  </div>
                 </div>
+                <Switch
+                  checked={autoPull.enabled}
+                  disabled={!cfg.url.trim()}
+                  aria-label="自动拉取开关"
+                  onCheckedChange={(v) =>
+                    void saveAutoPull({ enabled: v, intervalMin: autoPull.intervalMin })
+                  }
+                />
               </div>
-              <Switch
-                checked={autoPull}
+              <IntervalSelect
+                label="拉取间隔"
+                ariaLabel="自动拉取间隔"
+                value={autoPull.intervalMin}
                 disabled={!cfg.url.trim()}
-                aria-label="自动拉取开关"
-                onCheckedChange={(v) => void saveAutoPull(v)}
-              />
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-muted-foreground">定时间隔</span>
-              <Select
-                value={String(autoPush.intervalMin)}
-                disabled={!autoPush.enabled && !autoPull}
-                onValueChange={(v) =>
-                  void saveAuto({ enabled: autoPush.enabled, intervalMin: Number(v) })
+                onChange={(v) =>
+                  void saveAutoPull({ enabled: autoPull.enabled, intervalMin: v })
                 }
-              >
-                <SelectTrigger size="sm" className="w-36">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {INTERVAL_OPTIONS.map((o) => (
-                    <SelectItem key={o.value} value={String(o.value)}>
-                      {o.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              />
             </div>
             {lastAuto && (
               <div className="text-xs text-muted-foreground">

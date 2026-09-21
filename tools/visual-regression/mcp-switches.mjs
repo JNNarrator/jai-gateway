@@ -79,6 +79,14 @@ function installMock() {
     registerPlugin() {},
   };
   window.__TAURI__ = { event: {}, window: {}, core: {} };
+  // `@tauri-apps/api` 的 `_unlisten` 会直接读这个对象（真实运行由 Tauri 注入）。
+  // 不补它，TitleBar 的 `win.onResized()` 清理路径就抛
+  // `Cannot read properties of undefined (reading 'unregisterListener')` ——
+  // 该 pageerror 在**每个页面**都会发生，于是「无控制台报错」这条断言恒为假、永久失效
+  // （2026-09-20 实测：既有 mcp-switches.mjs 也一直是红的，只是没人注意）。
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+    unregisterListener(_event, id) { cb.delete(id); },
+  };
 }
 
 const out = { size: `${VW}x${VH}`, checks: [], errors: [], startedAt: new Date().toISOString() };

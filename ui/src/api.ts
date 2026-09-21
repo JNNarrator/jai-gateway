@@ -128,6 +128,7 @@ export const api = {
     autoPushEnabled?: boolean;
     autoPushIntervalMin?: number;
     autoPullEnabled?: boolean;
+    autoPullIntervalMin?: number;
   }) => invoke<void>("webdav_config_set", { input }),
   webdavAutopushStatus: () =>
     invoke<WebDavAutoPushStatus | null>("webdav_autopush_status"),
