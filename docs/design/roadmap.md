@@ -456,9 +456,15 @@
 
 ### 待办（下一里程碑）
 
-1. 配置 CI secrets（`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，及可选 Apple/Windows 证书）并完成首次 tag 触发验证（见 release.md §3）
+1. ~~配置 CI secrets 并完成首次 tag 触发验证~~ —— ✅ **已完成**（secrets 就位；tag 触发验证
+   自 v0.2.6 起反复通过，最近一次 **v0.2.12**（2026-09-21，run 35552099194，3/3 job success，
+   feed 校验 `version=0.2.12`）。见 `docs/design/release.md` §3）
 2. 真机验收 M1–M9 + MCP/Skill（Claude Code/Codex 跨族链路、WebDAV、签名安装包、48h 常驻）
-3. 打 tag `v0.1.0-beta` 转正式发布
+3. **macOS 补齐 Intel（x64）产物**：目前只有 `aarch64`，Intel Mac 无安装包也无法自动更新
+   （bug 清单 §2 第 10 条，自 v0.2.10 起如此，非回归）
+
+> 发布节奏：自 v0.2.4 起已持续以 patch 版本正式发布（最新 **v0.2.12**），
+> 不再需要「打 `v0.1.0-beta` 转正式」这一步。
 
 > 历史快照：M1–M9 + MCP/Skill 管理（含工具发现/调用、技能自动注入）快照已并入本节；更早的记录见 git 历史。
 

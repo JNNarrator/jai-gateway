@@ -914,6 +914,19 @@
     `Transfer-Encoding`，urllib 已自动解开 chunked，原样转会让客户端解析乱码并提前断开；
     SSE 判定要看**响应头 Content-Type**，不要在 body 上猜）。
 
+- [ ] 10. **macOS 产物只有 Apple Silicon（Intel Mac 既无安装包也无法自动更新）**（2026-09-21 发 v0.2.12 时确认）
+  - 现象：Release 产物固定为 `JAI_<ver>_aarch64.dmg` + `JAI_aarch64.app.tar.gz(.sig)`，
+    updater feed 里只有 `darwin-aarch64` / `darwin-aarch64-app`，**没有 `darwin-x64`**。
+    Intel Mac 用户下载不到 macOS 安装包，应用内「检查更新」也拿不到版本。
+  - 根因：`.github/workflows/release.yml` 的 macOS 矩阵是 `macos-latest`，
+    该 runner 现已是 **arm64**，`tauri-action` 未指定 `--target` 时只产出宿主架构。
+  - **不是回归**：v0.2.10 / v0.2.11 / v0.2.12 三版产物形状完全一致，自始如此。
+  - 建议修法：矩阵加一条 `macos-13`（x64 runner）+ `args: --target x86_64-apple-darwin`，
+    使 feed 同时产出 `darwin-x64`。注意 `latest.json` 的平台键由 tauri-action 合并，
+    两条 macOS 矩阵需各自上传同一 release（现有 `releaseId` 机制已支持）。
+  - 影响面：仅影响 Intel Mac 用户；Apple Silicon 与 Windows 用户不受影响。
+  - 已同步记入 `docs/design/release.md` §1（避免下次发版又当成新问题排查）。
+
 ## 3. 视觉回归（默认窗口 1180×800，最小 900×600）
 
 > v0.2.0 起默认窗口 980×640 → 1180×800（最小 760×520 → 900×600），见 §2 第 12 条。

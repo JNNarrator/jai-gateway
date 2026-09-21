@@ -4,10 +4,16 @@
 
 ## 1. 版本与产物
 
-- 版本：`src-tauri/tauri.conf.json` `"version"`（当前 `0.1.0`）
+- 版本：`src-tauri/tauri.conf.json` `"version"`（当前 `0.2.12`）
 - 产物：
   - macOS：`.dmg` / `.app`（Tauri bundle `targets: all`）
-  - Windows：`.msi` / `.exe`（NSIS 或 MSI）
+    - ⚠️ **只有 `aarch64`（Apple Silicon）**：`macos-latest` runner 已是 arm64，
+      产物为 `JAI_<ver>_aarch64.dmg` + `JAI_aarch64.app.tar.gz(.sig)`，
+      updater feed 里也只有 `darwin-aarch64*`。**Intel Mac 既没有安装包、也无法自动更新。**
+      自 v0.2.10 起稳定如此（v0.2.10 / v0.2.11 / v0.2.12 三版产物形状完全一致），
+      非某次改动的回归。如需覆盖 Intel：加一条 `macos-13`（x64）矩阵 +
+      `--target x86_64-apple-darwin`，让 feed 同时产出 `darwin-x64`。
+  - Windows：`.msi` / `.exe`（NSIS 或 MSI），x64，含 `.sig`
 - 更新通道：Tauri Updater ✅ 已装配
   - 公钥签名：`tauri signer generate` ✅ 已生成（私钥 `~/.tauri/jai.key` + 密码 `~/.tauri/jai.key.password`，**仅存发布主机，勿入库**）
   - `tauri.conf.json` 已配置 `plugins.updater.pubkey` 与 `endpoints`（指向 GitHub Releases `latest.json`）
@@ -31,7 +37,12 @@
 - [x] Updater 签名密钥已生成并写入本地（见 §1）；CI secrets 需配置：
   - `TAURI_SIGNING_PRIVATE_KEY`：私钥文件内容（`~/.tauri/jai.key`）
   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码（`~/.tauri/jai.key.password`）
-- [ ] 首次 tag 触发验证：构建产物（macOS dmg/app、Windows msi/exe）均含 `.sig` 与 updater 元数据
+- [x] tag 触发验证：**v0.2.12 实测**（run 35552099194，12m34s，3/3 job success）——
+      macOS dmg + app.tar.gz/.sig、Windows msi/exe + .sig、`latest.json` 齐全；
+      `prerelease=false`；发布后 feed 校验 `version=0.2.12`
+      （`https://github.com/JNNarrator/jai-gateway/releases/latest/download/latest.json`）。
+      该步是 v0.2.6 的翻车点（草稿建成 prerelease 会让 feed 停在上一版且无报错），
+      每次发布都必须跑。
 
 ## 4. 发布前门禁
 
