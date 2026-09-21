@@ -4,7 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-09-21
+
+### Added
+- **UI 规范门禁**：`node tools/visual-regression/gate.mjs` 一条命令在 **1180×800 与 900×600
+  双尺寸 × light/dark 双主题**下验收 UI 规范，**单一退出码**；判据集中在该文件里
+  （对比度 AA / 字号 ≥11px / 截断有 title 兜底 / 无横向溢出 / 弹窗几何 /
+  弹窗 footer 不与 toast 占位带重叠 / 主操作首屏可达 / 行内控件不被折叠线切半 /
+  吸顶表头真的吸顶 / 表格不溢出容器 / 有效命中区 ≥24×24）。
+  新增零依赖静态检查 `scripts/ui_lint.sh`（字号 / 图标按钮可访问名 / 列表 key / 命中区手法）；
+  已接进 `scripts/release_check.sh` 第 6 步。探针的 Playwright/Chrome 定位统一到
+  `tools/visual-regression/_env.mjs`（可用 `PLAYWRIGHT_PATH`/`CHROME_PATH` 覆盖），
+  15 个探针不再有写死的绝对路径；`ui` 新增 devDependency `playwright-core`（只驱动系统 Chrome）。
+
+### Changed
+- **模型页改为「只读表格 + 右侧详情抽屉」**：行内可交互控件 **194 → 68**，表头吸顶，
+  单个模型的全部编辑项在抽屉里**一次保存**（与「添加/编辑」弹窗同一套 footer / 校验 / 保存反馈）。
+  900×600 下表格横向溢出由 +8px 变为 **-50px**（有余量）。
+- 弹窗最大高度改为 `calc(100dvh - 8rem)`，使弹窗底边恒在 toast 占位带上方
+  （900×600 下此前 toast 会视觉压住弹窗主按钮 2.4 秒；默认窗口行为不变）。
+
 ### Fixed
+- **改表单不保存就切页/关窗会静默丢失**：新增脏状态 guard（`ui/src/lib/dirty.ts` +
+  `components/common/UnsavedGuard.tsx`），供应商 / MCP / 技能 / 设置四处表单接入
+  （弹窗内与页内表单均覆盖），并拦 `beforeunload`。
+- **日志页轮询不随可见性暂停**：`document.hidden` 时停轮询，恢复可见立即刷新一次
+  （不误开用户手动关掉的开关）。
+- **命中区「已修」项实测不达标**：模型页「复制模型名」有效命中区只有 **6×30**、
+  供应商页「官网」**54×18** —— 伪元素热区被 DOM 在后、paint 在上的相邻小芯片抢走。
+  改用**真实盒子** + 负 margin 抵消布局影响，并以 `z-10` 赢下重叠区。
+- 4 处 `text-[10px]`（推理档位 / 工具声明数上限编辑器）改 `text-[11px]`，由 `ui_lint` 守住。
+- **日志页与模型页的吸顶表头此前从未真正生效**（确实声明了 `sticky top-0`，实际照旧滚走）：
+  根因是 `Table` 基座自带的 `div[data-slot=table-container].overflow-x-auto` 成了 thead
+  的最近可滚动祖先且自身无纵向溢出；现把 `max-h + overflow:auto` 加到**那一层**。
+- 探针自身的三处「假绿」：`fold.mjs` 的「顶部操作区」选择器永不匹配（恒为「—」，死字段）；
+  `clippedRows` 45/102 步把滚动容器误报成 `html`；`gate.mjs` 会在探针**崩溃**时读到上次的
+  旧 JSON 并报「全部通过」（现改为跑前删旧结果 + 探针退出码非 0 直接判失败）。
+- `gate.mjs` 自己创建 `<repo>/.vr/tmp`：此前只有 `.vr/tmp` 恰好存在时才能跑，
+  全新克隆/CI 上第一次运行会 `ENOENT: mkdtemp '…/.vr/tmp/playwright-artifacts-…'`。
 - **截断（`max_output_tokens`）被误报成「可重试错误」，把一次截断放大成 10 次重试风暴**（bug 清单 11）。
   Responses 转换路径的收尾帧只把 `response.status` 写成 `"incomplete"`，事件名恒为
   `response.completed`，且**从不输出 `incomplete_details`**（全仓库零命中）。只读 `status` 的
