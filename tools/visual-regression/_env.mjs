@@ -19,9 +19,15 @@ export const REPO_ROOT = path.resolve(HERE, "../..");
 export const UI_DIR = path.join(REPO_ROOT, "ui");
 export const VR_DIR = path.join(REPO_ROOT, ".vr");
 export const SHOTS_DIR = path.join(VR_DIR, "shots");
+/** 探针的临时目录：`gate.mjs` 会把 TMPDIR 指到这里，Playwright 在此 mkdtemp。
+ *  **必须在门禁自己这边建好** —— 否则全新克隆/CI 上第一次跑就会
+ *  `browserType.launch: ENOENT: mkdtemp '…/.vr/tmp/playwright-artifacts-…'` 直接崩
+ *  （本机曾经能跑只是因为 `.vr/tmp` 恰好早就手工建过；本轮在干净 worktree 上复现了这个坑）。 */
+export const TMP_DIR = path.join(VR_DIR, "tmp");
 export const DEFAULT_URL = process.env.JAI_VR_URL || "http://127.0.0.1:5173/";
 
 fs.mkdirSync(SHOTS_DIR, { recursive: true });
+fs.mkdirSync(TMP_DIR, { recursive: true });
 
 /** 找到可用的 playwright 包目录；返回 null 表示只能靠 NODE_PATH / 全局解析。 */
 function findPlaywrightDir() {

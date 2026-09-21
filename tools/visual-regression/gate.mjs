@@ -22,6 +22,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "../..");
 const VR = path.join(REPO, ".vr");
 fs.mkdirSync(VR, { recursive: true });
+// 探针会被传 TMPDIR=<VR>/tmp（Playwright 在它下面 mkdtemp）。**这里必须自己建好**，
+// 否则全新克隆 / CI 上第一次跑就 `ENOENT: mkdtemp '…/.vr/tmp/playwright-artifacts-…'` 崩掉。
+fs.mkdirSync(path.join(VR, "tmp"), { recursive: true });
 
 const argv = Object.fromEntries(
   process.argv.slice(2).map((s) => {
