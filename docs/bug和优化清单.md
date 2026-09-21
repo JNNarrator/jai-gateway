@@ -921,9 +921,19 @@
   - 根因：`.github/workflows/release.yml` 的 macOS 矩阵是 `macos-latest`，
     该 runner 现已是 **arm64**，`tauri-action` 未指定 `--target` 时只产出宿主架构。
   - **不是回归**：v0.2.10 / v0.2.11 / v0.2.12 三版产物形状完全一致，自始如此。
-  - 建议修法：矩阵加一条 `macos-13`（x64 runner）+ `args: --target x86_64-apple-darwin`，
-    使 feed 同时产出 `darwin-x64`。注意 `latest.json` 的平台键由 tauri-action 合并，
-    两条 macOS 矩阵需各自上传同一 release（现有 `releaseId` 机制已支持）。
+  - **建议修法（先纠正一个错误结论）**：我最初写的「加一条 `macos-13`」**是错的** ——
+    `macos-13` 已被 GitHub 下架（`actions/runner-images` README 已无该 label）。
+    现存 x64 标签是 `macos-15-intel` / `macos-26-intel`，但它们属 **larger runners**：
+    **按分钟计费（公开仓库也不免费）**，且必须先在 org/repo 设置里创建该 runner，
+    否则 `runs-on` 找不到匹配 runner 直接失败。
+  - 两条可行路径：
+    - **路 A（便宜，推荐先试）**：在现有 arm64 runner 上**交叉编译** ——
+      `rustup target add x86_64-apple-darwin`，构建参数加 `--target x86_64-apple-darwin`。
+      同一个 job 产出两套 bundle，feed 多一个 `darwin-x64`。不额外占 runner、不额外计费。
+    - **路 B（贵，需先配置）**：用 macOS x64 larger runner（`macos-15-intel`），
+      多一条矩阵 + 计费 + 设置里先建 runner。
+  - 无论哪条路，`latest.json` 的平台键由 tauri-action 合并，两条产物需上传同一 release
+    （现有 `releaseId` 机制已支持）。**改动必须靠一次真实发版验证**（feed 里要出现 `darwin-x64`）。
   - 影响面：仅影响 Intel Mac 用户；Apple Silicon 与 Windows 用户不受影响。
   - 已同步记入 `docs/design/release.md` §1（避免下次发版又当成新问题排查）。
 

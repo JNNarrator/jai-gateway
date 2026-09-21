@@ -11,8 +11,15 @@
       产物为 `JAI_<ver>_aarch64.dmg` + `JAI_aarch64.app.tar.gz(.sig)`，
       updater feed 里也只有 `darwin-aarch64*`。**Intel Mac 既没有安装包、也无法自动更新。**
       自 v0.2.10 起稳定如此（v0.2.10 / v0.2.11 / v0.2.12 三版产物形状完全一致），
-      非某次改动的回归。如需覆盖 Intel：加一条 `macos-13`（x64）矩阵 +
-      `--target x86_64-apple-darwin`，让 feed 同时产出 `darwin-x64`。
+      非某次改动的回归。**补 Intel 不是「加一行矩阵」那么简单**，见下方两条路与代价：
+      - 路 A（便宜，推荐先试）：在**现有 arm64 runner 上交叉编译** ——
+        `rustup target add x86_64-apple-darwin` + `args: --target x86_64-apple-darwin`。
+        同 job 内多出一个 bundle，feed 多一个 `darwin-x64` 键，不额外占 runner。
+      - 路 B（贵，且要先手工配置）：用 GitHub 的 **macOS x64 larger runner**
+        （`macos-15-intel` / `macos-26-intel`）。注意 `macos-13` **已下架**；
+        且 `-intel` / `-large` 后缀属 **larger runners：按分钟计费（公开仓库也不免费）**，
+        还必须先在 org/repo 设置里创建该 runner，否则 `runs-on` 直接找不到匹配 runner。
+        → 不要照抄旧文档里的 `macos-13`，那个 label 已不存在。
   - Windows：`.msi` / `.exe`（NSIS 或 MSI），x64，含 `.sig`
 - 更新通道：Tauri Updater ✅ 已装配
   - 公钥签名：`tauri signer generate` ✅ 已生成（私钥 `~/.tauri/jai.key` + 密码 `~/.tauri/jai.key.password`，**仅存发布主机，勿入库**）
