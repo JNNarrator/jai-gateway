@@ -1,30 +1,22 @@
 // 扩展视觉审计：逐屏 + 逐个弹窗，做「肉眼类」缺陷的可量化测量
-//   对比度(WCAG, 含半透明根底的白/黑最坏情况) / 字号 / 命中区尺寸 / 无可访问名
-//   容器底部半行截断 / 横向溢出 / 弹窗高度增长 / toast 遮挡
-// 用法：node .vr/audit.mjs --size=980x640 --theme=dark
-import { createRequire } from "node:module";
+//   对比度(WCAG, 含半透明根底的白/黑最坏情况) / 字号 / 无可访问名
+//   容器底部半行截断 / 横向溢出 / 弹窗高度增长 / toast
+//   —— 命中区**不在此处判定**（见下方注释：rect 测不到伪元素外扩），唯一判据在 probe-hits.mjs
+// 用法：node tools/visual-regression/audit.mjs --size=1180x800 --theme=dark
 import fs from "node:fs";
 import path from "node:path";
+import { launchBrowser, parseArgv, parseSize, SHOTS_DIR, VR_DIR, DEFAULT_URL, TABS as ALL_TABS, TAB_LABEL as ALL_TAB_LABEL } from "./_env.mjs";
 
-const require = createRequire(
-  "/Users/jiangnan/Documents/workspace/deepseek-harness/node_modules/.pnpm/playwright@1.61.1/node_modules/playwright/",
-);
-const { chromium } = require("playwright");
 const { fixtures } = await import(new URL("./fixtures.mjs", import.meta.url).href);
 
-const argv = Object.fromEntries(
-  process.argv.slice(2).map((s) => {
-    const m = s.match(/^--([^=]+)(?:=(.*))?$/);
-    return m ? [m[1], m[2] ?? true] : [s, true];
-  }),
-);
-const [VW, VH] = (argv.size || "980x640").split("x").map(Number);
+const argv = parseArgv();
+const [VW, VH] = parseSize(argv.size, "1180x800");
 const THEME = argv.theme || "dark";
-const TABS = (argv.tabs ? String(argv.tabs).split(",") : ["gateway", "sync", "mcp", "skills", "providers", "models", "stats", "logs", "settings"]);
-const TAB_LABEL = { gateway: "网关", sync: "同步", mcp: "MCP", skills: "技能", providers: "供应商", models: "模型", stats: "统计", logs: "日志", settings: "设置" };
+const TABS = argv.tabs ? String(argv.tabs).split(",") : ALL_TABS;
+const TAB_LABEL = ALL_TAB_LABEL;
 const TAG = `audit-${THEME}-${VW}x${VH}`;
-const SHOTS = path.resolve(".vr/shots");
-const ROOT = path.resolve(".vr");
+const SHOTS = SHOTS_DIR;
+const ROOT = VR_DIR;
 
 // 复用 run.mjs 里的 invoke mock（避免两份实现漂移）
 // 读**仓库内**那份 run.mjs（相对本脚本解析，不依赖 cwd，也不是 `.vr/` 下的本地镜像）。
@@ -102,8 +94,13 @@ const EXT_PROBE = function () {
   const res = {
     vw, vh, theme: document.documentElement.classList.contains("dark") ? "dark" : "light",
     rootAlpha: (() => { const c = rgba(getComputedStyle(document.body).backgroundColor); return c[3]; })(),
-    contrast: [], tiny: [], smallTargets: [], noName: [], truncated: [],
+    contrast: [], tiny: [], noName: [], truncated: [],
     clippedRows: [], hScroll: [], dialogs: [], toasts: [], focusBelowFold: [],
+    // 本文件**不再**产出「命中区不达标」的判定：视觉盒子（getBoundingClientRect）看不到
+    // `::after` 伪元素 / `<label>` 包裹造成的热区外扩，据此判定的结论长期与 probe-hits 矛盾
+    // （audit 报 42 处，probe-hits 复核后大多合格）。命中区的**唯一**判据在 probe-hits.mjs
+    // （elementFromPoint 逐点探测有效命中区）。本文件只管能用 rect 可靠测量的事：
+    // 对比度 / 字号 / 截断 / 溢出 / 弹窗几何。
   };
 
   // 1) 文本对比度 / 字号（白底与黑底两种 backdrop 各算一次，取最坏）
@@ -129,30 +126,40 @@ const EXT_PROBE = function () {
     if (size < 11) res.tiny.push({ text: el.textContent.trim().slice(0, 40), size: +size.toFixed(1), path: pathOf(el) });
   }
 
-  // 2) 交互控件：命中区尺寸 / 可访问名
+  // 2) 交互控件：只查「有没有可访问名」。
   const INTER = "button,a[href],input,select,textarea,[role=button],[role=menuitem],[role=switch],[role=checkbox],[role=combobox],[role=radio],[role=tab]";
   for (const el of document.querySelectorAll(INTER)) {
     if (!vis(el)) continue;
     const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
     const name = (el.getAttribute("aria-label") || el.textContent || el.getAttribute("title") || el.getAttribute("placeholder") || "").trim();
     const hasSvg = !!el.querySelector("svg");
-    if ((r.width < 24 || r.height < 26) && r.width > 0) {
-      res.smallTargets.push({ name: name.slice(0, 30), w: Math.round(r.width), h: Math.round(r.height), path: pathOf(el), inDlg: !!el.closest('[role="dialog"]') });
-    }
-    if (!name && hasSvg && r.width > 0) {
+    if (!name && hasSvg) {
       res.noName.push({ path: pathOf(el), cls: (el.className.toString() || "").slice(0, 40) });
     }
   }
 
-  // 3) 容器底部「半行截断」：滚动容器里被切一半的行/卡片
-  const containers = [document.documentElement, document.body, ...document.querySelectorAll("main,[data-slot=dialog-content],[role=dialog],aside nav,overflow-y-auto")];
+  // 3) 容器底部「半行截断」：**非滚动**容器里被切一半的行/卡片（真正切掉就再也看不到）。
+  //
+  // 旧实现把 `document.documentElement` / `document.body` 也当容器，并为它们特判
+  // 「子元素取 `main > *`」——于是拿 main 的子元素去和 **html 的底边（=视口高）** 比较，
+  // 而 main 是滚动容器、内容本来就会越过视口底 → 每页都稳定产出 `cutBy: 700 / container: html`
+  // 的假阳性（实测 45/102 步非空），把真问题淹掉。现在：
+  //   ① 只测真正的布局容器（main / 弹窗 / 侧栏 / .overflow-y-auto），不再测 html、body；
+  //   ② 子元素一律取 `:scope > *`（不再有特判分支）；
+  //   ③ 滚动容器里的「看不见」是正常现象，归 focusBelowFold，不计入 clippedRows。
+  // 另：旧选择器里的 `overflow-y-auto` 是 Tailwind 类名，`querySelectorAll("overflow-y-auto")`
+  // 按**标签名**匹配、永不命中（死代码）；已改为 `.overflow-y-auto`。
+  const containers = Array.from(
+    document.querySelectorAll("main,[data-slot=dialog-content],[role=dialog],aside nav,.overflow-y-auto"),
+  );
   for (const c of containers) {
     const cs = getComputedStyle(c);
     const scrollable = /(auto|scroll)/.test(cs.overflowY);
     const cr = c.getBoundingClientRect();
     if (cr.width < 1 || cr.height < 1) continue;
-    const bottom = scrollable ? Math.min(cr.bottom, vh) : Math.min(cr.bottom, vh);
-    const kids = c === document.documentElement || c === document.body ? document.querySelectorAll("main > *, [data-slot=dialog-content] > *") : c.querySelectorAll(":scope > *");
+    const bottom = Math.min(cr.bottom, vh);
+    const kids = c.querySelectorAll(":scope > *");
     for (const k of kids) {
       if (!vis(k)) continue;
       const kr = k.getBoundingClientRect();
@@ -224,7 +231,7 @@ const EXT_PROBE = function () {
       return !scrollable;
     });
     const footerBtn = kids.filter((k) => /保存|确定|创建|更新|推送|拉取|导入|删除|恢复|启动|连接|测试/.test((k.textContent || "").trim()));
-    const fr = footerBtn.map((k) => { const rr = k.getBoundingClientRect(); return { text: k.textContent.trim().slice(0, 16), top: Math.round(rr.top), bottom: Math.round(rr.bottom), visible: rr.top >= 0 && rr.bottom <= vh }; });
+    const fr = footerBtn.map((k) => { const rr = k.getBoundingClientRect(); return { text: k.textContent.trim().slice(0, 16), x: Math.round(rr.left), w: Math.round(rr.width), top: Math.round(rr.top), bottom: Math.round(rr.bottom), visible: rr.top >= 0 && rr.bottom <= vh }; });
     res.dialogs.push({
       slot: dlg.getAttribute("data-slot"),
       title: (dlg.querySelector("[data-slot=dialog-title],[data-slot=alert-dialog-title],[role=heading]")?.textContent || "").trim().slice(0, 30),
@@ -246,7 +253,7 @@ const EXT_PROBE = function () {
   return res;
 };
 
-const browser = await chromium.launch({ executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
+const browser = await launchBrowser();
 const ctx = await browser.newContext({ viewport: { width: VW, height: VH }, deviceScaleFactor: 2, locale: "zh-CN" });
 await ctx.addInitScript({ content: `window.__JAI_FIX__ = ${JSON.stringify(fixtures)}; window.__VR_VW__=${VW}; window.__VR_VH__=${VH};` });
 await ctx.addInitScript({ content: `(${mockSrc})();` });
@@ -279,8 +286,8 @@ async function snap(label) {
   let p;
   try { p = await page.evaluate(EXT_PROBE); } catch (e) { p = { err: String(e.message) }; }
   out.steps.push({ n, label, shot: path.relative(".", file), ext: p });
-  const c = p.contrast?.length ?? 0, t = p.tiny?.length ?? 0, s = p.smallTargets?.length ?? 0, d = (p.dialogs || []).filter((x) => x.overTop > 1 || x.overBottom > 1 || x.unreachable > 0).length;
-  console.log(`[${n}] ${label} :: contrast=${c} tiny=${t} smallTarget=${s} noName=${p.noName?.length ?? 0} trunc=${p.truncated?.length ?? 0} clipRow=${p.clippedRows?.length ?? 0} hScroll=${p.hScroll?.length ?? 0} dlgBad=${d}`);
+  const c = p.contrast?.length ?? 0, t = p.tiny?.length ?? 0, d = (p.dialogs || []).filter((x) => x.overTop > 1 || x.overBottom > 1 || x.unreachable > 0).length;
+  console.log(`[${n}] ${label} :: contrast=${c} tiny=${t} noName=${p.noName?.length ?? 0} trunc=${p.truncated?.length ?? 0} clipRow=${p.clippedRows?.length ?? 0} hScroll=${p.hScroll?.length ?? 0} dlgBad=${d}`);
   fs.writeFileSync(path.join(ROOT, `${TAG}.json`), JSON.stringify({ ...out, errors: [...new Set(errors)] }, null, 2));
 }
 

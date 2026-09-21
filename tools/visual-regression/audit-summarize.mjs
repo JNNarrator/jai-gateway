@@ -18,10 +18,7 @@ for (const s of j.steps) {
     const k = `T|${c.path}|${c.size}`;
     if (!byKey.has(k)) byKey.set(k, { kind: "tiny", ...c, tab });
   }
-  for (const c of p.smallTargets || []) {
-    const k = `S|${c.path}|${c.w}x${c.h}`;
-    if (!byKey.has(k)) byKey.set(k, { kind: "small", ...c, tab });
-  }
+  // smallTargets 已从 audit 移除（命中区判据唯一归属 probe-hits.mjs，见 audit.mjs 内注释）
   for (const c of p.clippedRows || []) {
     const k = `C|${c.container}|${c.child}`;
     if (!byKey.has(k)) byKey.set(k, { kind: "clipRow", ...c, tab });
@@ -40,7 +37,6 @@ for (const s of j.steps) {
 
 const contrast = [...byKey.values()].filter((x) => !x.kind && typeof x.worst === "number").sort((a, b) => a.worst - b.worst);
 const tiny = [...byKey.values()].filter((x) => x.kind === "tiny");
-const small = [...byKey.values()].filter((x) => x.kind === "small");
 const clip = [...byKey.values()].filter((x) => x.kind === "clipRow");
 const hs = [...byKey.values()].filter((x) => x.kind === "hscroll");
 
@@ -51,8 +47,7 @@ for (const c of contrast.slice(0, 18)) {
 }
 console.log(`\n## 2. 字号 < 11px  共 ${tiny.length} 类`);
 for (const c of tiny.slice(0, 12)) console.log(`  ${c.size}px [${c.tab}] "${c.text}" ${c.path}`);
-console.log(`\n## 3. 命中区 < 24×26  共 ${small.length} 类`);
-for (const c of small.slice(0, 16)) console.log(`  ${c.w}×${c.h} [${c.tab}] "${c.name}" ${c.path}${c.inDlg ? " (弹窗内)" : ""}`);
+console.log(`\n## 3. 命中区 —— 已移交 probe-hits.mjs（本汇总不再给判定，避免两处结论互相矛盾）`);
 console.log(`\n## 4. 容器底部/折叠线半行截断  共 ${clip.length} 类`);
 for (const c of clip.slice(0, 10)) console.log(`  切掉${c.cutBy}px (行高${c.childH}) [${c.tab}] "${c.text}" 容器${c.container}`);
 console.log(`\n## 5. 横向溢出  共 ${hs.length} 类`);

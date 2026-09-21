@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { requestLeave } from "./dirty";
 
 export type Tab =
   | "gateway" | "sync" | "mcp" | "skills" | "providers"
@@ -23,7 +24,11 @@ export function goTab(tab: Tab) {
 
 export function NavProvider({ children }: { children: ReactNode }) {
   const [tab, setTabState] = useState<Tab>("gateway");
-  const setTab = useCallback((t: Tab) => setTabState(t), []);
+  // 切页统一走 requestLeave：有未保存的改动时先弹确认框，用户确认「放弃改动并离开」
+  // 才真正执行 setTabState。goTab（页面内跳转）复用同一个 setTab，故一并被覆盖。
+  const setTab = useCallback((t: Tab) => {
+    requestLeave(() => setTabState(t));
+  }, []);
   const value = useMemo(() => ({ tab, setTab }), [tab, setTab]);
 
   useEffect(() => {

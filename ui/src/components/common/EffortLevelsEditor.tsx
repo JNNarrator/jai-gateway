@@ -95,7 +95,10 @@ export function EffortLevelsEditor({
           aria-label={scope}
           className={
             verbose
-              ? "relative inline-flex items-center gap-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline after:absolute after:-inset-x-2 after:-inset-y-1.5 after:content-['']"
+              ? // 真实盒子 ≥24px 高（`py-1` + `-my-1` 抵消，视觉不变）：只靠 `after:-inset-y-1.5`
+                // 外扩会被相邻元素抢走热区（实测「官网」按钮就是这么被压到 18px 高的）。
+                // 横向仍用伪元素外扩，因为宽度已足够、且不会与谁争。
+                "relative z-10 -my-1 inline-flex items-center gap-1 py-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline after:absolute after:-inset-x-2 after:content-['']"
               : "relative rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground after:absolute after:-inset-2 after:content-['']"
           }
         >
@@ -108,7 +111,7 @@ export function EffortLevelsEditor({
             </span>
           )}
           {!verbose && (
-            <span className="text-[10px]">
+            <span className="text-[11px]">
               {declared ? `${levels!.length}档` : "档位?"}
             </span>
           )}
@@ -132,7 +135,7 @@ export function EffortLevelsEditor({
               }
             }}
           />
-          <p className="mt-1 text-[10px] text-muted-foreground">
+          <p className="mt-1 text-[11px] text-muted-foreground">
             声明序逗号分隔，回车保存；留空 = 未声明（原样透传）。
           </p>
         </div>

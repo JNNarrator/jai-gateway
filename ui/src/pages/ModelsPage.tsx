@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { ArrowUpDown, Boxes, Copy, Minus, Search } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { ArrowUpDown, Boxes, Copy, Search } from "lucide-react";
 import { api } from "../api";
 import type { Modality, ModelRow, ProviderDto } from "../types";
 import { toast } from "../lib/toast";
@@ -11,15 +11,6 @@ import { MaxToolsEditor } from "@/components/common/MaxToolsEditor";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuCheckboxItem,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -28,6 +19,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Sheet,
+  SheetBody,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
 import {
   Table,
@@ -38,6 +38,20 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
+/**
+ * 模型默认值页 —— **只读列表 + 右侧详情抽屉**。
+ *
+ * 为什么不再做「行内编辑表格」（2026-09-21 UI 优化专题）：
+ * 旧实现每行 9 个控件（2 个数字 Input + 别名 Input + 模态下拉 + 推理档位芯片 +
+ * 工具上限芯片 + 启用开关 + 复制 + 保存），21 行 = **194 个可交互控件、117 个在折叠线下**，
+ * 首屏只有 44%；900×600 下 7 列表宽 732 > 容器 724（溢出 8px），行内输入还被折叠线切 28px。
+ * 而且新增的「推理档位值域 / 工具声明数上限」两个芯片把「模型名」列撑宽，
+ * 正是 §3 第 5 条自己记下的教训（降级 badge 的文案长度直接决定列宽）。
+ *
+ * 现在：表格只读（每行仅「复制 / 启用 / 详情」三个控件），全部编辑项收进抽屉一次保存；
+ * 表格加**吸顶表头**（与日志页一致），并给 Table 加 `table-fixed`，
+ * 让列宽由表头声明决定、不再被单元格内容撑破容器。
+ */
 export function ModelsPage() {
   const [providers, setProviders] = useState<ProviderDto[]>([]);
   const [selId, setSelId] = useState<string>("");
@@ -45,6 +59,8 @@ export function ModelsPage() {
   const [q, setQ] = useState("");
   const [sortAsc, setSortAsc] = useState(true);
   const [loading, setLoading] = useState(true);
+  /** 详情抽屉：只存 id，数据始终从 models 里取最新的那份，避免抽屉里拿着陈旧快照 */
+  const [detailId, setDetailId] = useState<string | null>(null);
 
   useEffect(() => {
     api.providerList().then(setProviders).catch(() => {});
@@ -54,9 +70,16 @@ export function ModelsPage() {
     if (providers.length && !selId) setSelId(providers[0].id);
   }, [providers, selId]);
 
+  const reload = async (providerId: string) => {
+    const next = await api.modelList(providerId);
+    setModels(next);
+    return next;
+  };
+
   useEffect(() => {
     if (!selId) return;
     setLoading(true);
+    setDetailId(null);
     api
       .modelList(selId)
       .then(setModels)
@@ -79,12 +102,14 @@ export function ModelsPage() {
           await api.modelToggle(m.id, enabled);
         }
       }
-      if (selId) setModels(await api.modelList(selId));
+      if (selId) await reload(selId);
       toast(enabled ? "已全部启用" : "已全部禁用");
     } catch (e) {
       toast(String(e), "err");
     }
   }
+
+  const detail = detailId ? models.find((m) => m.id === detailId) ?? null : null;
 
   return (
     <div className="mx-auto max-w-4xl space-y-4">
@@ -105,7 +130,7 @@ export function ModelsPage() {
 
       <div className="flex flex-wrap items-center gap-2">
         <Select value={selId} onValueChange={setSelId}>
-          <SelectTrigger className="w-56">
+          <SelectTrigger className="w-56" aria-label="选择供应商">
             <SelectValue
               placeholder={providers.length === 0 ? "先在「供应商」页添加并拉取模型" : "选择供应商"}
             />
@@ -126,6 +151,7 @@ export function ModelsPage() {
           <Input
             className="w-56 pl-8"
             placeholder="搜索模型名…"
+            aria-label="搜索模型名"
             value={q}
             onChange={(e) => setQ(e.target.value)}
           />
@@ -142,6 +168,7 @@ export function ModelsPage() {
       </div>
       <p className="text-xs text-muted-foreground">
         这些值是跨协议转换与调用方提示的基础；仅本机模型名对齐时直通也会透传。
+        点行内「详情」可编辑该模型的全部配置。
       </p>
 
       {loading ? (
@@ -154,191 +181,339 @@ export function ModelsPage() {
         />
       ) : (
         <>
-        {/* 窄窗口（最小 760px）下 7 列会横向溢出：表格容器内可横向滚动 */}
-        <div className="rounded-lg border">
-          <Table>
-            <TableHeader>
-              <TableRow className="bg-muted/50 hover:bg-muted/50">
-                <TableHead className="w-1/5">模型名</TableHead>
-                <TableHead className="w-1/5">上游模型 ID</TableHead>
-                <TableHead className="w-1/6">上下文</TableHead>
-                <TableHead className="w-1/6">最大输出</TableHead>
-                <TableHead className="hidden w-28 text-center lg:table-cell">
-                  模态（入/出）
-                </TableHead>
-                <TableHead className="w-1/12 text-center">启用</TableHead>
-                <TableHead className="w-20 text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody className="divide-y">
-              {filtered.map((m) => (
-                <ModelRowEditor
-                  key={m.id}
-                  m={m}
-                  onSave={async (ctx, out, alias) => {
-                    await api.modelSetLimits({
-                      modelId: m.id,
-                      contextWindow: ctx,
-                      maxOutputTokens: out,
-                    });
-                    await api.modelSetAlias(m.id, alias);
-                    setModels(await api.modelList(selId));
-                  }}
-                  onToggle={async (v) => {
-                    await api.modelToggle(m.id, v);
-                    setModels(await api.modelList(selId));
-                  }}
-                  onSetModalities={async (input, output) => {
-                    await api.modelSetModalities(m.id, input, output);
-                    setModels(await api.modelList(selId));
-                  }}
-                  onSetReasoningLevels={async (levels) => {
-                    await api.modelSetReasoningLevels(m.id, levels);
-                    setModels(await api.modelList(selId));
-                  }}
-                  onSetMaxTools={async (maxTools) => {
-                    await api.modelSetMaxTools(m.id, maxTools);
-                    setModels(await api.modelList(selId));
-                  }}
-                />
-              ))}
-            </TableBody>
-          </Table>
-          {filtered.length === 0 && (
-            <div className="px-4 py-8 text-center text-sm text-muted-foreground">
-              没有匹配的模型
-            </div>
-          )}
-        </div>
-        {/* 窄窗（<1024px）下「模态（入/出）」列隐藏、该信息并回「模型名」列的 badge，
-            以收回 112px 宽度（最小 900 窗口实测原溢出 77px）；其余列仍可横向滚动 */}
-        <p className="hidden text-[11px] text-muted-foreground max-lg:block">
-          窗口较窄：模态标注已并入「模型名」列（悬停可见完整集合），其余列可左右滑动。
-        </p>
+          {/* `table-fixed`：列宽由表头声明决定。旧实现是自动布局，单元格内容（行内输入、
+              推理档位芯片）会把表撑得比容器宽 —— 900×600 下实测溢出 8px。 */}
+          {/* 吸顶表头的**必要**条件（踩坑记录 2026-09-21，与日志页同因）：
+              `Table` 基座自带一层 `div[data-slot=table-container].overflow-x-auto`，
+              它的 `overflow-y` 会随之计算成 `auto` → 它是 thead 的**最近可滚动祖先**。
+              而它自己没有纵向溢出，于是 `sticky top-0` 完全失效（实测滚动 596px 后
+              `th.top` 213 → -383，表头照旧滚走）。把 `max-height` + `overflow:auto` 加到
+              **这一层**（而不是外面再套一个 div），它才成为真正的纵向滚动容器，sticky 才生效。
+              注：`border-collapse` 与「sticky 放 thead 还是 th」都不是原因（都试过，无效）。 */}
+          <div className="rounded-lg border [&_[data-slot=table-container]]:max-h-[calc(100dvh-18rem)] [&_[data-slot=table-container]]:overflow-auto">
+            <Table className="table-fixed">
+              <TableHeader className="sticky top-0 z-10 bg-muted/50 backdrop-blur">
+                <TableRow className="hover:bg-muted/50">
+                  <TableHead className="w-[34%]">模型名</TableHead>
+                  <TableHead className="w-[22%]">上游模型 ID</TableHead>
+                  <TableHead className="w-[13%]">上下文</TableHead>
+                  <TableHead className="w-[13%]">最大输出</TableHead>
+                  <TableHead className="hidden w-[12%] text-center lg:table-cell">
+                    模态（入/出）
+                  </TableHead>
+                  <TableHead className="w-16 text-center">启用</TableHead>
+                  <TableHead className="w-16 text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody className="divide-y">
+                {filtered.map((m) => (
+                  <TableRow key={m.id} className={m.enabled ? "" : "opacity-50"}>
+                    <TableCell className="font-mono text-xs">
+                      <span className="inline-flex min-w-0 items-center gap-1">
+                        <span className="truncate" title={m.modelName}>
+                          {m.modelName}
+                        </span>
+                        {/* 视觉仍是 16×16 图标，但**真实盒子**做成 24×24（WCAG 2.2 AA 最小目标尺寸），
+                            用 `-m-1` 抵消多出来的 8px，表格行高不变。
+                            为什么不用 `after:-inset-2` 伪元素外扩（旧写法）：probe-hits 逐点实测有效命中区
+                            只有 **6×30** —— 右侧紧邻的元素也有伪元素外扩、且 DOM 在后、paint 在上，
+                            把那一侧的 8px 全抢走了。`z-10` 让本按钮赢下重叠区。 */}
+                        <button
+                          className="relative z-10 -m-1 grid size-6 shrink-0 place-items-center rounded text-muted-foreground/60 hover:bg-muted hover:text-foreground"
+                          title="复制模型名"
+                          aria-label={`复制模型名 ${m.modelName}`}
+                          onClick={() => copyText(m.modelName)}
+                        >
+                          <Copy className="size-3" aria-hidden />
+                        </button>
+                        {/* <lg 时「模态（入/出）」列被隐藏（列降级），模态信息并回本列，避免信息凭空消失 */}
+                        <ModalityCompact m={m} />
+                      </span>
+                    </TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">
+                      <span className="block truncate" title={m.upstreamModelId ?? "（同名）"}>
+                        {m.upstreamModelId ?? "（同名）"}
+                      </span>
+                    </TableCell>
+                    <TableCell className="text-xs tabular-nums text-muted-foreground">
+                      {fmtNum(m.contextWindow)}
+                    </TableCell>
+                    <TableCell className="text-xs tabular-nums text-muted-foreground">
+                      {fmtNum(m.maxOutputTokens)}
+                    </TableCell>
+                    <TableCell className="hidden text-center lg:table-cell">
+                      <span className="flex flex-col items-center gap-0.5">
+                        <span className="flex items-center gap-1">
+                          <span className="text-[11px] text-muted-foreground">入</span>
+                          <ModalityBadges list={m.inputModalities} />
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <span className="text-[11px] text-muted-foreground">出</span>
+                          <ModalityBadges list={m.outputModalities} />
+                        </span>
+                      </span>
+                    </TableCell>
+                    <TableCell className="text-center">
+                      <Switch
+                        checked={m.enabled}
+                        onCheckedChange={(v) => {
+                          void api
+                            .modelToggle(m.id, v)
+                            .then(() => reload(selId))
+                            .catch((e) => toast(String(e), "err"));
+                        }}
+                        aria-label={`启用 ${m.modelName}`}
+                        className="mx-auto"
+                      />
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2"
+                        aria-label={`编辑详情 ${m.modelName}`}
+                        onClick={() => setDetailId(m.id)}
+                      >
+                        详情
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            {filtered.length === 0 && (
+              <div className="px-4 py-8 text-center text-sm text-muted-foreground">
+                没有匹配的模型
+              </div>
+            )}
+          </div>
+          {/* 窄窗（<1024px）下「模态（入/出）」列隐藏、该信息并回「模型名」列的 badge */}
+          <p className="hidden text-[11px] text-muted-foreground max-lg:block">
+            窗口较窄：模态标注已并入「模型名」列（悬停可见完整集合），其余列可左右滑动。
+          </p>
         </>
+      )}
+
+      {/* key={detail.id}：换模型时强制重挂载，抽屉一律以该模型的最新数据起草，
+          不会沿用上一个模型的残留（与「添加/编辑」弹窗的 onOpenChange 重起草同一思路）。 */}
+      {detail && (
+        <ModelDetailSheet
+          key={detail.id}
+          m={detail}
+          onClose={() => setDetailId(null)}
+          onSaved={async () => {
+            await reload(selId);
+          }}
+        />
       )}
     </div>
   );
 }
 
-function ModelRowEditor({
+/** 数字列的展示格式：未知显示「—」，千位分隔 */
+function fmtNum(n: number | null | undefined) {
+  if (n == null) return "—";
+  return n.toLocaleString("en-US");
+}
+
+// ---------------------------------------------------------------- 详情抽屉
+
+/**
+ * 单个模型的全部编辑项，**一次保存**（与「添加/编辑」弹窗同一套交互形态：
+ * 三段式 Header/Body/Footer、Footer 常驻、保存中禁用、成功 toast、失败 toast）。
+ */
+function ModelDetailSheet({
   m,
-  onSave,
-  onToggle,
-  onSetModalities,
-  onSetReasoningLevels,
-  onSetMaxTools,
+  onClose,
+  onSaved,
 }: {
   m: ModelRow;
-  onSave: (ctx: number | null, out: number, alias: string | null) => Promise<void>;
-  onToggle: (enabled: boolean) => Promise<void>;
-  onSetModalities: (input: Modality[] | null, output: Modality[] | null) => Promise<void>;
-  onSetReasoningLevels: (levels: string[] | null) => Promise<void>;
-  onSetMaxTools: (maxTools: number | null) => Promise<void>;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
 }) {
-  const [ctx, setCtx] = useState(m.contextWindow ?? 128000);
-  const [out, setOut] = useState(m.maxOutputTokens);
   const [alias, setAlias] = useState(m.upstreamModelId ?? "");
-  const [saved, setSaved] = useState(false);
+  const [ctx, setCtx] = useState(String(m.contextWindow ?? 128000));
+  const [out, setOut] = useState(String(m.maxOutputTokens));
+  const [inputModalities, setInputModalities] = useState<Modality[]>(m.inputModalities ?? []);
+  const [outputModalities, setOutputModalities] = useState<Modality[]>(m.outputModalities ?? []);
+  const [levels, setLevels] = useState<string[] | null>(m.reasoningEffortLevels ?? null);
+  const [maxTools, setMaxTools] = useState<number | null>(m.maxTools ?? null);
+  const [enabled, setEnabled] = useState(m.enabled);
+  const [saving, setSaving] = useState(false);
 
-  async function handleSave() {
-    await onSave(
-      m.contextWindow == null && ctx === 128000 ? null : ctx,
-      out,
-      alias.trim() || null
-    );
-    setSaved(true);
-    window.setTimeout(() => setSaved(false), 3000);
+  async function save() {
+    setSaving(true);
+    try {
+      const ctxNum = Number(ctx);
+      const outNum = Number(out);
+      if (!Number.isFinite(outNum) || outNum <= 0) {
+        toast("最大输出必须是正整数", "err");
+        return;
+      }
+      await api.modelSetLimits({
+        modelId: m.id,
+        contextWindow: Number.isFinite(ctxNum) && ctxNum > 0 ? ctxNum : null,
+        maxOutputTokens: outNum,
+      });
+      await api.modelSetAlias(m.id, alias.trim() || null);
+      await api.modelSetModalities(
+        m.id,
+        inputModalities.length ? inputModalities : null,
+        outputModalities.length ? outputModalities : null
+      );
+      await api.modelSetReasoningLevels(m.id, levels);
+      await api.modelSetMaxTools(m.id, maxTools);
+      if (enabled !== m.enabled) await api.modelToggle(m.id, enabled);
+      await onSaved();
+      toast("已保存");
+      onClose();
+    } catch (e) {
+      toast(String(e), "err");
+    } finally {
+      setSaving(false);
+    }
   }
 
+  const field = (
+    id: string,
+    label: string,
+    hint: string,
+    control: ReactNode
+  ) => (
+    <div className="space-y-1.5">
+      <label htmlFor={id} className="text-xs font-medium text-foreground">
+        {label}
+      </label>
+      {control}
+      <p className="text-[11px] text-muted-foreground">{hint}</p>
+    </div>
+  );
+
   return (
-    <TableRow className={m.enabled ? "" : "opacity-50"}>
-      <TableCell className="font-mono text-xs">
-        <span className="inline-flex items-center gap-1">
-          {m.modelName}
-          {/* 视觉 16×16，命中区靠伪元素扩到 32×32（与 Switch 同一手法：
-              图标按钮不做视觉放大，避免撑开表格行高） */}
-          <button
-            className="relative rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground after:absolute after:-inset-2 after:content-['']"
-            title="复制模型名"
-            aria-label={`复制模型名 ${m.modelName}`}
-            onClick={() => copyText(m.modelName)}
-          >
-            <Copy className="size-3" aria-hidden />
-          </button>
-          {/* <lg 时「模态（入/出）」列被隐藏（列降级，见 §3 第 5 条），
-              模态信息降级为一行紧凑 badge，避免信息凭空消失。 */}
-          <ModalityCompact m={m} />
-          {/* 推理档位值域（0011）：同理不新增列（7 列已吃掉全部宽度），
-              以紧凑芯片就地编辑，避免窄窗横向溢出回归。 */}
-          <EffortLevelsEditor
-            levels={m.reasoningEffortLevels ?? null}
-            scopeLabel={`模型 ${m.modelName}`}
-            onChange={(levels) =>
-              onSetReasoningLevels(levels).catch((e) => toast(String(e), "err"))
-            }
-          />
-          {/* 工具声明数上限（0012）：同上，就地编辑不新增列 */}
-          <MaxToolsEditor
-            maxTools={m.maxTools ?? null}
-            scopeLabel={`模型 ${m.modelName}`}
-            onChange={(n) => onSetMaxTools(n).catch((e) => toast(String(e), "err"))}
-          />
-        </span>
-      </TableCell>
-      <TableCell>
-        <Input
-          className="h-8 w-32 max-lg:w-24 text-xs"
-          value={alias}
-          placeholder="同模型名"
-          title="发给上游时使用的真实模型 ID；留空表示同名"
-          onChange={(e) => {
-            setSaved(false);
-            setAlias(e.target.value);
-          }}
-        />
-      </TableCell>
-      <TableCell>
-        <Input
-          className="h-8 w-28 max-lg:w-20 text-xs"
-          type="number"
-          step={1024}
-          value={ctx}
-          onChange={(e) => {
-            setSaved(false);
-            setCtx(Number(e.target.value));
-          }}
-        />
-      </TableCell>
-      <TableCell>
-        <Input
-          className="h-8 w-24 max-lg:w-20 text-xs"
-          type="number"
-          step={1024}
-          value={out}
-          onChange={(e) => {
-            setSaved(false);
-            setOut(Number(e.target.value));
-          }}
-        />
-      </TableCell>
-      <TableCell className="hidden text-center lg:table-cell">
-        <ModalityEditor m={m} onChange={onSetModalities} />
-      </TableCell>
-      <TableCell className="text-center">
-        <Switch
-          checked={m.enabled}
-          onCheckedChange={(v) => void onToggle(v)}
-          aria-label={`启用 ${m.modelName}`}
-          className="mx-auto"
-        />
-      </TableCell>
-      <TableCell className="text-right">
-        <Button variant="outline" size="sm" className="h-8" onClick={() => void handleSave()}>
-          {saved ? "已保存" : "保存"}
-        </Button>
-      </TableCell>
-    </TableRow>
+    <Sheet open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <SheetContent aria-describedby={undefined}>
+        <SheetHeader>
+          <SheetTitle className="pr-8 font-mono">{m.modelName}</SheetTitle>
+          <SheetDescription>
+            该模型的全部配置。改完点「保存」一次性写入；关闭或「取消」不会保存。
+          </SheetDescription>
+        </SheetHeader>
+
+        <SheetBody className="space-y-4">
+          {field(
+            "md-alias",
+            "上游模型 ID",
+            "发给上游时使用的真实模型 ID；留空表示与模型名同名。",
+            <Input
+              id="md-alias"
+              className="h-9 font-mono text-xs"
+              value={alias}
+              placeholder="（同名）"
+              onChange={(e) => setAlias(e.target.value)}
+            />
+          )}
+
+          <div className="grid grid-cols-2 gap-3">
+            {field(
+              "md-ctx",
+              "上下文窗口",
+              "tokens；留空 = 未知（由上游声明兜底）。",
+              <Input
+                id="md-ctx"
+                className="h-9 text-xs"
+                type="number"
+                step={1024}
+                min={0}
+                value={ctx}
+                onChange={(e) => setCtx(e.target.value)}
+              />
+            )}
+            {field(
+              "md-out",
+              "最大输出",
+              "tokens；必填。",
+              <Input
+                id="md-out"
+                className="h-9 text-xs"
+                type="number"
+                step={1024}
+                min={1}
+                value={out}
+                onChange={(e) => setOut(e.target.value)}
+              />
+            )}
+          </div>
+
+          <div className="space-y-2">
+            <span className="text-xs font-medium text-foreground">模态标注</span>
+            <ModalityChips
+              label="输入类型"
+              value={inputModalities}
+              onChange={setInputModalities}
+            />
+            <ModalityChips
+              label="输出类型"
+              value={outputModalities}
+              onChange={setOutputModalities}
+            />
+            <p className="text-[11px] text-muted-foreground">
+              全部不选 = 未知（不臆断）；上游未声明时保持未知即可。
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <span className="text-xs font-medium text-foreground">推理档位值域</span>
+            <div>
+              <EffortLevelsEditor
+                verbose
+                levels={levels}
+                scopeLabel={`模型 ${m.modelName}`}
+                onChange={async (next) => setLevels(next)}
+              />
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              留空 = 继承供应商级；供应商级也为空则原样透传。
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <span className="text-xs font-medium text-foreground">工具声明数上限</span>
+            <div>
+              <MaxToolsEditor
+                verbose
+                maxTools={maxTools}
+                scopeLabel={`模型 ${m.modelName}`}
+                onChange={async (n) => setMaxTools(n)}
+              />
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              留空 = 继承供应商级；都不声明则不拦（由上游裁决）。
+            </p>
+          </div>
+
+          <div className="flex items-center justify-between rounded-md border border-border/60 px-3 py-2">
+            <div className="space-y-0.5">
+              <div className="text-xs font-medium text-foreground">启用</div>
+              <p className="text-[11px] text-muted-foreground">关闭的模型不参与路由。</p>
+            </div>
+            <Switch
+              checked={enabled}
+              onCheckedChange={setEnabled}
+              aria-label={`启用 ${m.modelName}`}
+            />
+          </div>
+        </SheetBody>
+
+        <SheetFooter>
+          <Button variant="outline" onClick={onClose} disabled={saving}>
+            取消
+          </Button>
+          <Button onClick={() => void save()} disabled={saving}>
+            {saving ? "保存中…" : "保存"}
+          </Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   );
 }
 
@@ -384,7 +559,7 @@ function ModalityCompact({ m }: { m: ModelRow }) {
   return (
     <Badge
       variant={unknown ? "outline" : "secondary"}
-      className="px-1 py-0 text-[11px] font-normal lg:hidden"
+      className="shrink-0 px-1 py-0 text-[11px] font-normal lg:hidden"
       title={`模态标注 — 输入：${label(inList)}；输出：${label(outList)}（宽窗口下可直接编辑）`}
     >
       {unknown ? "模态?" : short || "非文本"}
@@ -409,76 +584,46 @@ function ModalityBadges({ list }: { list: Modality[] | null }) {
 }
 
 /**
- * 输入/输出模态编辑器：勾选即存即生效（菜单不关闭，可连续标注）；
- * 「清除标注」= 两维一起回到「未知」（后端同时把 0009 旧布尔列置 NULL）。
- * 取消最后一个勾选亦等价于「未知」——不引入「已知为空」这一无意义状态。
+ * 抽屉里的模态选择器：**本地 state + 芯片切换**，随「保存」一起提交
+ * （旧实现是下拉菜单「勾选即存」，与抽屉的「一次保存」语义冲突）。
+ * 全部取消勾选 = 未知（不引入「已知为空」这一无意义状态）。
  */
-function ModalityEditor({
-  m,
+function ModalityChips({
+  label,
+  value,
   onChange,
 }: {
-  m: ModelRow;
-  onChange: (input: Modality[] | null, output: Modality[] | null) => Promise<void>;
+  label: string;
+  value: Modality[];
+  onChange: (next: Modality[]) => void;
 }) {
-  const toggle = (dim: "in" | "out", x: Modality) => {
-    const cur = (dim === "in" ? m.inputModalities : m.outputModalities) ?? [];
-    const picked = cur.includes(x) ? cur.filter((y) => y !== x) : [...cur, x];
-    const ordered = MODALITY_ORDER.filter((y) => picked.includes(y));
-    const next = ordered.length ? ordered : null;
-    void onChange(
-      dim === "in" ? next : m.inputModalities,
-      dim === "out" ? next : m.outputModalities
-    );
+  const toggle = (x: Modality) => {
+    const picked = value.includes(x) ? value.filter((y) => y !== x) : [...value, x];
+    onChange(MODALITY_ORDER.filter((y) => picked.includes(y)));
   };
-
-  const dimension = (label: string, which: "in" | "out", list: Modality[] | null) => (
-    <>
-      <DropdownMenuLabel className="text-[11px] text-muted-foreground">
-        {label}
-      </DropdownMenuLabel>
-      {MODALITY_ORDER.map((x) => (
-        <DropdownMenuCheckboxItem
-          key={`${which}-${x}`}
-          checked={(list ?? []).includes(x)}
-          onSelect={(e) => e.preventDefault()}
-          onCheckedChange={() => toggle(which, x)}
-        >
-          {MODALITY_LABEL[x]}
-        </DropdownMenuCheckboxItem>
-      ))}
-    </>
-  );
-
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="mx-auto h-auto flex-col gap-0.5 px-2 py-1"
-          title="标注该模型支持的输入/输出模态；未知 = 上游未声明或已清除"
-          aria-label={`模态标注 ${m.modelName}`}
-        >
-          <span className="flex items-center gap-1 text-[11px]">
-            <span className="text-muted-foreground">入</span>
-            <ModalityBadges list={m.inputModalities} />
-          </span>
-          <span className="flex items-center gap-1 text-[11px]">
-            <span className="text-muted-foreground">出</span>
-            <ModalityBadges list={m.outputModalities} />
-          </span>
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="center" className="w-36">
-        {dimension("输入类型", "in", m.inputModalities)}
-        <DropdownMenuSeparator />
-        {dimension("输出类型", "out", m.outputModalities)}
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void onChange(null, null)}>
-          <Minus className="size-3.5" aria-hidden />
-          清除标注（未知）
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="w-16 shrink-0 text-[11px] text-muted-foreground">{label}</span>
+      {MODALITY_ORDER.map((x) => {
+        const on = value.includes(x);
+        return (
+          <button
+            key={x}
+            type="button"
+            aria-pressed={on}
+            aria-label={`${label} ${MODALITY_LABEL[x]}`}
+            onClick={() => toggle(x)}
+            className={
+              "rounded-md border px-2 py-1 text-[11px] transition-colors " +
+              (on
+                ? "border-primary/40 bg-primary/10 text-foreground"
+                : "border-border/60 text-muted-foreground hover:bg-muted hover:text-foreground")
+            }
+          >
+            {MODALITY_LABEL[x]}
+          </button>
+        );
+      })}
+    </div>
   );
 }

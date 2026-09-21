@@ -23,6 +23,7 @@ import { EffortLevelsEditor } from "@/components/common/EffortLevelsEditor";
 import { MaxToolsEditor } from "@/components/common/MaxToolsEditor";
 import { FormField } from "@/components/common/FormField";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { useDirtyGuard } from "@/lib/dirty";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -316,10 +317,14 @@ function ProviderCard(props: {
             <div className="truncate font-mono text-xs text-muted-foreground" title={p.baseUrl}>
               {p.baseUrl}
             </div>
+            {/* 「官网」真实盒子做成 ≥24px 高（`py-1` + `-my-1` 抵消，视觉与行距不变）。
+                旧写法只靠 `after:-inset-y-1.5` 外扩，probe-hits 实测有效命中区 54×18
+                （高只有 18 < 24）：下方「推理档位值域 / 工具上限」两个触发器也有伪元素外扩
+                且 DOM 在后，把本按钮的下半截热区抢走了。`z-10` 让本按钮赢下重叠区。 */}
             {p.website && (
               <button
                 type="button"
-                className="relative inline-flex items-center gap-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline after:absolute after:-inset-x-2 after:-inset-y-1.5 after:content-['']"
+                className="relative z-10 -my-1 inline-flex items-center gap-1 py-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
                 onClick={() => {
                   api.openWebsite(p.website!).catch((e) =>
                     toast(`打开官网失败: ${e}`)
@@ -449,7 +454,7 @@ function ProviderDialog({
     watch,
     getValues,
     setValue,
-    formState: { errors, isSubmitting },
+    formState: { errors, isDirty, isSubmitting },
   } = useForm<FormValues>({
     resolver: zodResolver(mode === "create" ? createSchema : editSchema),
     defaultValues: {
@@ -464,6 +469,10 @@ function ProviderDialog({
     },
   });
   const { fields, append, remove } = useFieldArray({ control, name: "extraHeaders" });
+
+  // 未保存改动追踪：本组件只在弹窗打开时挂载（父层是 `{dialog && <ProviderDialog/>}`），
+  // 所以 isDirty 天然只在弹窗打开期间参与判定；关弹窗 → 卸载 → 自动注销脏源。
+  useDirtyGuard("供应商表单", isDirty);
 
   const family = watch("family");
   const meta = FAMILY_HINT[family] ?? FAMILY_HINT.openai_compat;

@@ -1,6 +1,7 @@
 import { SidebarNav } from "./components/layout/SidebarNav";
 import { TitleBar } from "./components/layout/TitleBar";
 import { CommandPalette } from "./components/common/CommandPalette";
+import { UnsavedGuard } from "./components/common/UnsavedGuard";
 import { useNav } from "./lib/nav";
 import { GatewayPage } from "./pages/GatewayPage";
 import { SyncPage } from "./pages/SyncPage";
@@ -17,6 +18,8 @@ export default function App() {
   return (
     <div className="flex h-screen flex-col bg-background text-foreground">
       <CommandPalette />
+      {/* 未保存改动的全局拦截（切页确认框 + beforeunload），必须常驻、只挂一次 */}
+      <UnsavedGuard />
       <TitleBar />
       <div className="flex min-h-0 flex-1">
         <SidebarNav />

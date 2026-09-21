@@ -1,13 +1,9 @@
 // 定向解剖 v2：每个用例前先重载页面，避免弹窗残留串味
 // node .vr/deep2.mjs --size=980x640
-import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
+import { launchBrowser } from "./_env.mjs";
 
-const require = createRequire(
-  "/Users/jiangnan/Documents/workspace/deepseek-harness/node_modules/.pnpm/playwright@1.61.1/node_modules/playwright/",
-);
-const { chromium } = require("playwright");
 const { fixtures } = await import(new URL("./fixtures.mjs", import.meta.url).href);
 const argv = Object.fromEntries(process.argv.slice(2).map((s) => { const m = s.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [s, true]; }));
 const [VW, VH] = (argv.size || "980x640").split("x").map(Number);
@@ -16,7 +12,7 @@ const mockSrc = fs.readFileSync(new URL("./run.mjs", import.meta.url), "utf8").m
 const URL_ = argv.url || "http://127.0.0.1:5173/";
 const say = console.log;
 
-const browser = await chromium.launch({ executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
+const browser = await launchBrowser();
 const ctx = await browser.newContext({ viewport: { width: VW, height: VH }, deviceScaleFactor: 2, locale: "zh-CN" });
 await ctx.addInitScript({ content: `window.__JAI_FIX__ = ${JSON.stringify(fixtures)}; window.__VR_VW__=${VW}; window.__VR_VH__=${VH};` });
 await ctx.addInitScript({ content: `(${mockSrc})();` });

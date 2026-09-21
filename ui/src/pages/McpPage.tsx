@@ -9,6 +9,7 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { useDirtyGuard } from "@/lib/dirty";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -484,6 +485,17 @@ function McpDialog({
   const [argsErr, setArgsErr] = useState("");
   const [nameErr, setNameErr] = useState("");
   const [envErr, setEnvErr] = useState("");
+
+  // 未保存改动追踪：本组件只在弹窗打开时挂载（父层是 `{dialog?.mode === ... && <McpDialog/>}`），
+  // 所以这里逐字段与「打开时的初始值」比对即可，关闭弹窗 → 卸载 → 自动注销脏源。
+  const dirty =
+    name !== (initial?.name ?? "") ||
+    kind !== (initial?.kind ?? "stdio") ||
+    command !== (initial?.command ?? "") ||
+    args !== (initial?.args ?? "") ||
+    url !== (initial?.url ?? "") ||
+    env !== (initial?.env ?? "");
+  useDirtyGuard("MCP Server 表单", dirty);
 
   async function submit() {
     if (!name.trim()) {

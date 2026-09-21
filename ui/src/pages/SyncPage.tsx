@@ -475,8 +475,12 @@ export function SyncPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* 主操作条：置于 WebDAV 卡片顶部并吸顶，避免默认窗口下需要滚动上千像素才点到 */}
-          <div className="sticky top-0 z-10 -mx-6 flex flex-wrap gap-2 border-b border-border/60 bg-card px-6 py-3">
+          {/* 主操作条：置于 WebDAV 卡片顶部并吸顶，避免默认窗口下需要滚动上千像素才点到。
+              data-slot=page-actions 是探针契约（fold.mjs 据此认定本页主操作并断言首屏可达）。 */}
+          <div
+            data-slot="page-actions"
+            className="sticky top-0 z-10 -mx-6 flex flex-wrap gap-2 border-b border-border/60 bg-card px-6 py-3"
+          >
             <Button onClick={saveCfg}>保存配置</Button>
             <Button variant="outline" onClick={testWebdav}>
               测试连接

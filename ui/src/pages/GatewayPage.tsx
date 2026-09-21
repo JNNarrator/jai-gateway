@@ -150,7 +150,12 @@ export function GatewayPage() {
       {/* 主操作条：吸顶常驻。此页内容高 ~1093px（默认窗口 764 可视），
           「复制配置」原在 MCP 卡片里，滚动时会被折叠线切掉一截；
           启停与复制是本页高频操作，因此上移到常驻条（状态卡内不再重复放一份）。 */}
-      <div className="sticky top-0 z-10 -mx-2 flex flex-wrap items-center gap-2 border-b border-border/60 bg-card px-2 py-3">
+      {/* data-slot=page-actions：探针契约，fold.mjs 据此认定「本页主操作」并断言首屏可达
+          （页级主操作 + 吸顶条内按钮都算；不靠类名/文本猜）。 */}
+      <div
+        data-slot="page-actions"
+        className="sticky top-0 z-10 -mx-2 flex flex-wrap items-center gap-2 border-b border-border/60 bg-card px-2 py-3"
+      >
         {status?.running ? (
           <Button variant="destructive" disabled={busy} onClick={() => toggle(false)}>
             <Square aria-hidden />

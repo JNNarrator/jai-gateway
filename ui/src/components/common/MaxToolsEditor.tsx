@@ -72,7 +72,9 @@ export function MaxToolsEditor({
           aria-label={scope}
           className={
             verbose
-              ? "relative inline-flex items-center gap-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline after:absolute after:-inset-x-2 after:-inset-y-1.5 after:content-['']"
+              ? // 真实盒子 ≥24px 高（`py-1` + `-my-1` 抵消，视觉不变）；理由同 EffortLevelsEditor：
+                // 只靠伪元素外扩会被相邻元素抢走热区。
+                "relative z-10 -my-1 inline-flex items-center gap-1 py-1 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline after:absolute after:-inset-x-2 after:content-['']"
               : "relative rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground after:absolute after:-inset-2 after:content-['']"
           }
         >
@@ -83,7 +85,7 @@ export function MaxToolsEditor({
             </span>
           )}
           {!verbose && (
-            <span className="text-[10px]">{declared ? `≤${maxTools}` : "上限?"}</span>
+            <span className="text-[11px]">{declared ? `≤${maxTools}` : "上限?"}</span>
           )}
         </button>
       </DropdownMenuTrigger>
@@ -108,7 +110,7 @@ export function MaxToolsEditor({
               }
             }}
           />
-          <p className="mt-1 text-[10px] text-muted-foreground">
+          <p className="mt-1 text-[11px] text-muted-foreground">
             回车保存；留空 = 未声明（不拦，由上游裁决）。
           </p>
         </div>

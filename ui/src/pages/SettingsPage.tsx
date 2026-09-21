@@ -7,6 +7,7 @@ import { api } from "../api";
 import { toast } from "../lib/toast";
 import { goTab } from "../lib/nav";
 import { cn } from "@/lib/utils";
+import { useDirtyGuard } from "@/lib/dirty";
 import { PageHeader } from "@/components/common/PageHeader";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button } from "@/components/ui/button";
@@ -29,6 +30,15 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 
+/** 多行文本类设置的归一化：行首尾空白 / 空行 / 末尾换行不算「改动」（保存时后端也会 trim） */
+function normLines(s: string): string {
+  return s
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
 export function SettingsPage() {
   const [raw, setRaw] = useState("");
   const [saved, setSaved] = useState(false);
@@ -50,11 +60,48 @@ export function SettingsPage() {
   const [proxyBusy, setProxyBusy] = useState(false);
   const corsHasWildcard = raw.split("\n").some((s) => s.trim() === "*");
 
+  // ── 未保存改动追踪（label = 设置）────────────────────────────────────────────
+  // 本页是**页内**表单（端口 / 代理 / CORS / 日志保留各卡片自带保存按钮），
+  // 没有弹窗生命周期可借，所以用「加载完成时的快照」比对：
+  //   ① 每处 IPC 加载成功后立刻把对应字段写进快照（同时置该字段 loaded=true）；
+  //   ② 每个卡片保存成功后把快照更新为刚保存的值 → 立刻回到不脏；
+  //   ③ 只有 loaded=true 的字段参与比对 —— 否则「初始默认值 vs 已加载值」会造成假脏。
+  const snapRef = useRef({
+    port: 1314,
+    logsEnabled: true,
+    retentionDays: 30,
+    logRowCap: 50000,
+    cors: "",
+    proxyEnabled: false,
+    proxyUrl: "",
+    proxyBypass: "",
+  });
+  const [loaded, setLoaded] = useState({ settings: false, cors: false, proxy: false });
+
+  const dirty =
+    (loaded.settings &&
+      (port !== snapRef.current.port ||
+        logsEnabled !== snapRef.current.logsEnabled ||
+        retentionDays !== snapRef.current.retentionDays ||
+        logRowCap !== snapRef.current.logRowCap)) ||
+    (loaded.cors && normLines(raw) !== snapRef.current.cors) ||
+    (loaded.proxy &&
+      (proxyEnabled !== snapRef.current.proxyEnabled ||
+        proxyUrl.trim() !== snapRef.current.proxyUrl ||
+        normLines(proxyBypass) !== snapRef.current.proxyBypass));
+
+  useDirtyGuard("设置", dirty);
+
   useEffect(() => {
     api
       .corsAllowGet()
-      .then((l) => setRaw(l.join("\n")))
-      .catch(() => {});
+      .then((l) => {
+        const v = l.join("\n");
+        setRaw(v);
+        snapRef.current.cors = normLines(v);
+      })
+      .catch(() => {})
+      .finally(() => setLoaded((p) => ({ ...p, cors: true })));
     api
       .settingsGet()
       .then((s) => {
@@ -62,16 +109,26 @@ export function SettingsPage() {
         setLogsEnabled(s.logsEnabled);
         setRetentionDays(s.retentionDays);
         setLogRowCap(s.logRowCap);
+        snapRef.current.port = s.preferredPort;
+        snapRef.current.logsEnabled = s.logsEnabled;
+        snapRef.current.retentionDays = s.retentionDays;
+        snapRef.current.logRowCap = s.logRowCap;
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setLoaded((p) => ({ ...p, settings: true })));
     api
       .proxyGet()
       .then((p) => {
+        const bypass = p.bypass.join("\n");
         setProxyEnabled(p.enabled);
         setProxyUrl(p.url);
-        setProxyBypass(p.bypass.join("\n"));
+        setProxyBypass(bypass);
+        snapRef.current.proxyEnabled = p.enabled;
+        snapRef.current.proxyUrl = p.url;
+        snapRef.current.proxyBypass = normLines(bypass);
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setLoaded((p) => ({ ...p, proxy: true })));
   }, []);
 
   async function saveProxy() {
@@ -90,6 +147,10 @@ export function SettingsPage() {
       await api.proxySet({ enabled: proxyEnabled, url: proxyUrl.trim(), bypass });
       setProxyMsg("已保存：重启网关后生效（与端口约定一致）");
       setProxyMsgOk(true);
+      // 保存成功 → 快照跟进，立即回到「不脏」（否则刚保存完就被拦）
+      snapRef.current.proxyEnabled = proxyEnabled;
+      snapRef.current.proxyUrl = proxyUrl.trim();
+      snapRef.current.proxyBypass = bypass.join("\n");
     } catch (e) {
       setProxyMsg(String(e));
     } finally {
@@ -124,6 +185,7 @@ export function SettingsPage() {
     const lines = raw.split("\n").map((s) => s.trim()).filter(Boolean);
     await api.corsAllowSet(lines);
     setRaw(lines.join("\n"));
+    snapRef.current.cors = lines.join("\n");
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
   }
@@ -140,6 +202,7 @@ export function SettingsPage() {
       return; // 由 ConfirmDialog 决定是否继续
     }
     await api.settingsSetPort(n);
+    snapRef.current.port = n;
     setPortMsg("已保存：重启网关后生效（端口占用自动顺延）");
     toast("端口已保存");
   }
@@ -147,6 +210,7 @@ export function SettingsPage() {
   async function toggleLogs(on: boolean) {
     await api.settingsSetLogsEnabled(on);
     setLogsEnabled(on);
+    snapRef.current.logsEnabled = on;
     setLogMsg(on ? "日志记录已开启" : "日志记录已关闭（新请求不再落库）");
     setTimeout(() => setLogMsg(""), 2500);
   }
@@ -167,8 +231,14 @@ export function SettingsPage() {
     <div className="mx-auto max-w-2xl space-y-4">
       <PageHeader title="设置" description="端口、日志、安全策略与软件更新。" />
 
-      {/* 吸顶锚点：设置页较长（多张卡片），让端口/代理/日志/CORS/凭据/更新随时可跳 */}
-      <nav className="sticky top-0 z-10 flex flex-wrap gap-1 rounded-md border border-border/60 bg-background/95 px-1.5 py-1 backdrop-blur">
+      {/* 吸顶锚点：设置页较长（多张卡片），让端口/代理/日志/CORS/凭据/更新随时可跳。
+          data-slot=page-actions 是探针契约：本页的「常驻可达入口」就是这条锚点导航
+          （各卡片的保存按钮随卡片滚动，故不作为首屏断言对象），fold.mjs 据此断言其可见。 */}
+      <nav
+        data-slot="page-actions"
+        aria-label="设置分区导航"
+        className="sticky top-0 z-10 flex flex-wrap gap-1 rounded-md border border-border/60 bg-background/95 px-1.5 py-1 backdrop-blur"
+      >
         {([["settings-port", "端口"], ["settings-proxy", "代理"], ["settings-logs", "日志"], ["settings-cors", "跨域"], ["settings-creds", "凭据"], ["settings-data", "数据"], ["settings-update", "更新"]] as Array<[string, string]>).map(
           ([id, label]) => (
             <Button
@@ -395,6 +465,7 @@ export function SettingsPage() {
         confirmText="仍然保存"
         onConfirm={async () => {
           await api.settingsSetPort(Number(port));
+          snapRef.current.port = Number(port);
           setPortBusyWarn("");
           setPortMsg("已保存：重启网关后生效（端口占用自动顺延）");
           toast("端口已保存");
@@ -433,6 +504,8 @@ export function SettingsPage() {
               onClick={async () => {
                 try {
                   await api.settingsSetRetention(retentionDays, logRowCap);
+                  snapRef.current.retentionDays = retentionDays;
+                  snapRef.current.logRowCap = logRowCap;
                   setRetentionOpen(false);
                   toast("保留策略已更新");
                 } catch (e) {

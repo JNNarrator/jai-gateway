@@ -48,11 +48,37 @@ export function LogsPage() {
     setRows(await api.logsRecent(limit));
   }
 
+  // 自动刷新：应用切到后台（document.hidden）时**停表**，回到前台时立刻补一次再重启定时器。
+  // 否则窗口最小化/被其他应用盖住时仍在每 3s 打一次 IPC（白耗电、白写库、还刷不到人眼里）。
+  // 注意：这里只碰「定时器」，绝不碰 `auto` —— 用户手动关掉的自动刷新不能被 visibilitychange 打开。
   useEffect(() => {
     refresh().finally(() => setInitialLoading(false));
     if (!auto) return;
-    const t = setInterval(refresh, intervalMs);
-    return () => clearInterval(t);
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const start = () => {
+      if (timer === undefined) timer = setInterval(refresh, intervalMs);
+    };
+    const stop = () => {
+      if (timer !== undefined) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        // 回到可见：先立刻刷新一次（补上后台期间错过的窗口），再重启定时器
+        void refresh();
+        start();
+      }
+    };
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auto, intervalMs, limit]);
 
@@ -77,7 +103,7 @@ export function LogsPage() {
   }
 
   function exportCsv() {
-    const header = "时间,模型,状态,耗时,流式,输入,输出,错误\n";
+    const header = "时间,模型,状态,耗时,流式,输入,输出,结束原因,错误\n";
     const body = filtered
       .map((r) =>
         [
@@ -227,10 +253,16 @@ export function LogsPage() {
         <SkeletonList rows={8} itemClassName="h-8" />
       ) : (
         <>
-      {/* 表格内部滚动 + 吸顶表头：日志可上千行，避免整页被撑到数千像素、表头滚丢 */}
-      <div className="rounded-lg border">
+      {/* 表格内部滚动 + 吸顶表头：日志可上千行，避免整页被撑到数千像素、表头滚丢。
+          **踩坑记录（2026-09-21）**：原来把 `max-h + overflow-auto` 加在外层 div 上，
+          但 `Table` 基座自己还有一层 `div[data-slot=table-container].overflow-x-auto`，
+          它的 `overflow-y` 随之计算成 `auto` → 它是 thead 的**最近可滚动祖先**，
+          且自身无纵向溢出 → `sticky top-0` **完全失效**。实测滚动 300px 后
+          `th.top` 181 → -119，表头照旧滚走（这条「吸顶表头」此前被记为已解决，
+          但从未被真正验证过）。修法：把 `max-height + overflow:auto` 加到
+          **那一层**（用 arbitrary variant 指定），它才成为真正的纵向滚动容器。 */}
+      <div className="rounded-lg border [&_[data-slot=table-container]]:max-h-[calc(100dvh-18rem)] [&_[data-slot=table-container]]:overflow-auto">
         {/* 只有表格本身内部滚动（含吸顶表头），「加载更多」始终留在可视区 */}
-        <div className="max-h-[calc(100dvh-18rem)] overflow-auto">
         <Table>
           <TableHeader className="sticky top-0 z-10 bg-muted/50 backdrop-blur">
             <TableRow className="bg-muted/50 hover:bg-muted/50">
@@ -281,7 +313,6 @@ export function LogsPage() {
             ))}
           </TableBody>
         </Table>
-        </div>
         {filtered.length === 0 && (
           <EmptyState
             icon={ScrollText}

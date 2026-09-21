@@ -1,8 +1,6 @@
 // 诊断：对同步页上被判定"对比度不达标"的元素，打印原始 computed 颜色与背景层链
 import fs from "node:fs";
-import { createRequire } from "node:module";
-const require = createRequire("/Users/jiangnan/Documents/workspace/deepseek-harness/node_modules/.pnpm/playwright@1.61.1/node_modules/playwright/");
-const { chromium } = require("playwright");
+import { launchBrowser } from "./_env.mjs";
 const { fixtures } = await import(new URL("./fixtures.mjs", import.meta.url).href);
 // 读仓库内源文件（相对本脚本解析）；曾读 `.vr/` 本地镜像，改了源文件会静默用旧副本
 const mock = fs.readFileSync(new URL("./run.mjs", import.meta.url), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)[0];
@@ -10,7 +8,7 @@ const src = fs.readFileSync(new URL("./audit.mjs", import.meta.url), "utf8");
 const body = src.slice(src.indexOf("const oklabToLinear"), src.indexOf("const lum"));
 const { rgba } = new Function(body + "\n;return {rgba};")();
 
-const browser = await chromium.launch({ executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
+const browser = await launchBrowser();
 const ctx = await browser.newContext({ viewport: { width: 980, height: 640 }, locale: "zh-CN" });
 await ctx.addInitScript({ content: "window.__JAI_FIX__=" + JSON.stringify(fixtures) + ";" });
 await ctx.addInitScript({ content: "(" + mock + ")();" });

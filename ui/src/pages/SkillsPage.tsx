@@ -8,6 +8,7 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { useDirtyGuard } from "@/lib/dirty";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -346,6 +347,14 @@ function SkillDialog({
   const [description, setDescription] = useState(initial?.description ?? "");
   const [content, setContent] = useState(initial?.content ?? "");
   const [nameErr, setNameErr] = useState("");
+
+  // 未保存改动追踪：本组件只在弹窗打开时挂载（父层是 `{dialog?.mode === ... && <SkillDialog/>}`），
+  // 逐字段与「打开时的初始值」比对即可；关闭弹窗 → 卸载 → 自动注销脏源。
+  const dirty =
+    name !== (initial?.name ?? "") ||
+    description !== (initial?.description ?? "") ||
+    content !== (initial?.content ?? "");
+  useDirtyGuard("技能表单", dirty);
 
   async function submit() {
     if (!name.trim()) {
