@@ -27,7 +27,10 @@ const SHOTS = path.resolve(".vr/shots");
 const ROOT = path.resolve(".vr");
 
 // 复用 run.mjs 里的 invoke mock（避免两份实现漂移）
-const runSrc = fs.readFileSync(path.join(ROOT, "run.mjs"), "utf8");
+// 读**仓库内**那份 run.mjs（相对本脚本解析，不依赖 cwd，也不是 `.vr/` 下的本地镜像）。
+// 曾读 `.vr/run.mjs`：那是未跟踪副本，改了仓库内源文件而忘了同步时，
+// 探针会静默沿用旧 mock（2026-09-20 实测踩到：改完 mock 后 pageerror 依旧）。
+const runSrc = fs.readFileSync(new URL("./run.mjs", import.meta.url), "utf8");
 const mockSrc = runSrc.match(/function installMock\(\)[\s\S]*?\n}\n/)?.[0];
 if (!mockSrc) throw new Error("未能从 run.mjs 提取 installMock");
 

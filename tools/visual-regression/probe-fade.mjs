@@ -1,12 +1,12 @@
 // 验证顶部渐隐遮罩（item 11）：① 渐变真的渲染；② 滚动后贴在滚动区真正的裁切边（偏移 0）；
 // ③ 不拦截点击（命中测试穿透到下层元素）；④ 不占布局高度（main.scrollHeight 不变）。
 import fs from "node:fs";
-import path from "node:path";
 import { createRequire } from "node:module";
 const require = createRequire("/Users/jiangnan/Documents/workspace/deepseek-harness/node_modules/.pnpm/playwright@1.61.1/node_modules/playwright/");
 const { chromium } = require("playwright");
 const { fixtures } = await import(new URL("./fixtures.mjs", import.meta.url).href);
-const mock = fs.readFileSync(path.resolve(".vr/run.mjs"), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)[0];
+// 读仓库内源文件（相对本脚本解析）；曾读 `.vr/` 本地镜像，改了源文件会静默用旧副本
+const mock = fs.readFileSync(new URL("./run.mjs", import.meta.url), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)[0];
 
 const browser = await chromium.launch({ executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
 const ctx = await browser.newContext({ viewport: { width: 1180, height: 800 }, locale: "zh-CN" });

@@ -1,11 +1,11 @@
 // 检查模型表在窄窗口下的列可见性与表宽（验证「模态（入/出）」列降级）。
 import fs from "node:fs";
-import path from "node:path";
 import { createRequire } from "node:module";
 const require = createRequire("/Users/jiangnan/Documents/workspace/deepseek-harness/node_modules/.pnpm/playwright@1.61.1/node_modules/playwright/");
 const { chromium } = require("playwright");
 const { fixtures } = await import(new URL("./fixtures.mjs", import.meta.url).href);
-const mock = fs.readFileSync(path.resolve(".vr/run.mjs"), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)[0];
+// 读仓库内源文件（相对本脚本解析）；曾读 `.vr/` 本地镜像，改了源文件会静默用旧副本
+const mock = fs.readFileSync(new URL("./run.mjs", import.meta.url), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)[0];
 
 const size = (process.argv.find((a) => a.startsWith("--size=")) || "--size=900x600").split("=")[1];
 const [W, H] = size.split("x").map(Number);

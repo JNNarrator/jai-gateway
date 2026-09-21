@@ -1,7 +1,7 @@
-// JAI 视觉回归测试台
-//   node .vr/run.mjs --mode=walk  --size=980x640
-//   node .vr/run.mjs --mode=steps --size=980x640
-//   node .vr/run.mjs --mode=walk  --size=760x520 --tabs=logs,models
+// JAI 视觉回归测试台（在仓库根目录运行；勿从 `.vr/` 的本地副本运行）
+//   node tools/visual-regression/run.mjs --mode=walk  --size=1180x800
+//   node tools/visual-regression/run.mjs --mode=steps --size=1180x800
+//   node tools/visual-regression/run.mjs --mode=walk  --size=900x600 --tabs=logs,models
 // 产出：.vr/shots/*.png + .vr/out-<mode>-<size>.json
 import { createRequire } from "node:module";
 import fs from "node:fs";

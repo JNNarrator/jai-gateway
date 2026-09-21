@@ -63,19 +63,15 @@ node tools/visual-regression/sync-intervals.mjs --size=900x600
 - 命中区：审计的 rect 数值**不等于**有效命中区，需用 `probe-hits.mjs` 复核；
   Radix 的 `aria-hidden` 隐藏代理（1×1 `select` 等）不是可点元素，属假阳性。
 
-- **`.vr/run.mjs` 是本地镜像，改了 `tools/visual-regression/run.mjs` 必须同步过去**
-  （2026-09-20 踩到）：`audit.mjs` / `deep.mjs` / `deep2.mjs` / `fold.mjs` / `probe-*.mjs`
-  共 **12 个**探针是从 `path.resolve(".vr/run.mjs")` 读 `installMock` 的，**不是**读仓库里
-  那份（`audit.mjs` 的注释写「复用 run.mjs 里的 invoke mock」具有误导性）。
-  `.vr/` 在 `.gitignore` 中，所以这是「未跟踪副本」，改了源文件而忘了同步时，
-  探针会静默继续用**旧 mock** —— 排查方向会被彻底带偏。改动后请：
-
-  ```bash
-  cp tools/visual-regression/run.mjs       .vr/run.mjs
-  cp tools/visual-regression/fixtures.mjs  .vr/fixtures.mjs
-  ```
-
-  （长期修法是把那 12 处改成读仓库内路径，尚未做。）
+- **探针一律读仓库内源文件（已修，2026-09-21）**：此前 `audit.mjs` / `deep.mjs` / `deep2.mjs` /
+  `fold.mjs` / `probe-*.mjs` 共 **12 个**探针是从 `path.resolve(".vr/run.mjs")` 读 `installMock` 的
+  —— 即读 `.vr/` 下那份**未跟踪的本地镜像**，不是仓库里这份。`.vr/` 在 `.gitignore` 中，
+  所以改了源文件而忘了同步时，探针会**静默继续用旧 mock**（实测踩到：改完 mock 后
+  `audit` 的 pageerror 依旧，因为用的还是旧副本），排查方向会被彻底带偏。
+  现全部改为**相对本脚本解析**（`new URL("./run.mjs", import.meta.url)`），
+  与 `fixtures.mjs` 一直以来的写法一致：不依赖 cwd、也不会再被镜像漂移影响。
+  **`.vr/` 下那些同名 `.mjs` 副本已无用途，请勿运行**（它们是旧快照，且互相引用 `.vr/` 里的旧副本）。
+  输出路径（`.vr/shots/`、`.vr/*.json`）仍按 cwd 解析 —— 那是**证据产出**，不是源码。
 - **「无控制台报错」断言曾长期恒假**（2026-09-20 修）：`@tauri-apps/api` 的 `_unlisten`
   直接读 `window.__TAURI_EVENT_PLUGIN_INTERNALS__`（真实运行由 Tauri 注入），
   而 mock 只装了 `__TAURI_INTERNALS__`/`__TAURI__`。于是 `TitleBar` 的

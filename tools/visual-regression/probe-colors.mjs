@@ -1,11 +1,11 @@
 // 颜色真值探针：确认主按钮/侧栏/卡片的实际 computed 颜色，校验对比度算法的输入
 import fs from "node:fs";
-import path from "node:path";
 import { createRequire } from "node:module";
 const require = createRequire("/Users/jiangnan/Documents/workspace/deepseek-harness/node_modules/.pnpm/playwright@1.61.1/node_modules/playwright/");
 const { chromium } = require("playwright");
 const { fixtures } = await import(new URL("./fixtures.mjs", import.meta.url).href);
-const mock = fs.readFileSync(path.resolve(".vr/run.mjs"), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)[0];
+// 读仓库内源文件（相对本脚本解析）；曾读 `.vr/` 本地镜像，改了源文件会静默用旧副本
+const mock = fs.readFileSync(new URL("./run.mjs", import.meta.url), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)[0];
 
 const browser = await chromium.launch({ executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
 const ctx = await browser.newContext({ viewport: { width: 980, height: 640 }, locale: "zh-CN" });
@@ -47,7 +47,7 @@ const info = await page.evaluate(() => {
 console.log(JSON.stringify(info, null, 1));
 
 // 用探针里的真实解析函数算一遍这些颜色
-const src = fs.readFileSync(path.resolve(".vr/audit.mjs"), "utf8");
+const src = fs.readFileSync(new URL("./audit.mjs", import.meta.url), "utf8");
 const body = src.slice(src.indexOf("const oklabToLinear"), src.indexOf("const lum"));
 const { rgba } = new Function(body + "\n;return {rgba};")();
 for (const k of ["primary", "primaryFg", "bg", "fg", "card", "muted"]) {

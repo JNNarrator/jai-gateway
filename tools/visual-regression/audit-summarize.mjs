@@ -1,5 +1,5 @@
 // 汇总 audit JSON：跨步骤去重，输出对比度/字号/命中区/截断问题的可执行清单
-// node .vr/audit-summarize.mjs .vr/audit-dark-980x640.json
+// node tools/visual-regression/audit-summarize.mjs .vr/audit-dark-1180x800.json
 import fs from "node:fs";
 const file = process.argv[2];
 const j = JSON.parse(fs.readFileSync(file, "utf8"));

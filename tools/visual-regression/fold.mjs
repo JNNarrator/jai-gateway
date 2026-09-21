@@ -8,7 +8,8 @@ const { chromium } = require("playwright");
 const { fixtures } = await import(new URL("./fixtures.mjs", import.meta.url).href);
 const argv = Object.fromEntries(process.argv.slice(2).map((s) => { const m = s.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [s, true]; }));
 const [VW, VH] = (argv.size || "980x640").split("x").map(Number);
-const mockSrc = fs.readFileSync(path.resolve(".vr/run.mjs"), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)?.[0];
+// 读仓库内的 run.mjs（相对本脚本解析）；曾读 `.vr/run.mjs` 本地镜像，会静默用旧 mock
+const mockSrc = fs.readFileSync(new URL("./run.mjs", import.meta.url), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)?.[0];
 const say = console.log;
 const browser = await chromium.launch({ executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
 const ctx = await browser.newContext({ viewport: { width: VW, height: VH }, deviceScaleFactor: 1, locale: "zh-CN" });

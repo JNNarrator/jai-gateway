@@ -1,12 +1,12 @@
 // 用审计脚本自身的色彩/对比度函数，在页面内复核具体元素的 fg/bg/ratio 原始值
 import fs from "node:fs";
-import path from "node:path";
 import { createRequire } from "node:module";
 const require = createRequire("/Users/jiangnan/Documents/workspace/deepseek-harness/node_modules/.pnpm/playwright@1.61.1/node_modules/playwright/");
 const { chromium } = require("playwright");
 const { fixtures } = await import(new URL("./fixtures.mjs", import.meta.url).href);
-const mock = fs.readFileSync(path.resolve(".vr/run.mjs"), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)[0];
-const src = fs.readFileSync(path.resolve(".vr/audit.mjs"), "utf8");
+// 读仓库内源文件（相对本脚本解析）；曾读 `.vr/` 本地镜像，改了源文件会静默用旧副本
+const mock = fs.readFileSync(new URL("./run.mjs", import.meta.url), "utf8").match(/function installMock\(\)[\s\S]*?\n}\n/)[0];
+const src = fs.readFileSync(new URL("./audit.mjs", import.meta.url), "utf8");
 const HELPERS = src.slice(src.indexOf("const oklabToLinear"), src.indexOf("  const vis =")).replace(/^\s{2}/gm, "");
 
 const browser = await chromium.launch({ executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });

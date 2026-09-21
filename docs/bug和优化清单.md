@@ -728,8 +728,13 @@
     `audit.mjs` 的注释写「复用 run.mjs 里的 invoke mock（避免两份实现漂移）」，
     但实际读的是本地副本，**恰恰会漂移**：我改了仓库里那份后重跑 audit，
     pageerror 依旧 —— 因为它用的还是 9/16 的旧 mock。
-    已同步镜像并把这个「改源文件必须 `cp` 过去」的纪律写进
-    `tools/visual-regression/README.md`（长期修法是那 12 处改读仓库内路径，尚未做）。
+    **已彻底修掉**（2026-09-21）：12 处全部改为**相对本脚本解析** ——
+    `fs.readFileSync(new URL("./run.mjs", import.meta.url), "utf8")`（`audit.mjs` 读 `./audit.mjs`），
+    与 `fixtures.mjs` 一直以来的写法一致：不依赖 cwd，也不再受镜像漂移影响。
+    同时删掉了 8 个探针里因此变成死代码的 `import path from "node:path"`。
+    验证：`audit` light/dark 的 `page errors` 行**消失**（此前每次必现），
+    `fold` / `deep2` / `probe-hits` / `probe-fade` / `probe-sticky` / `probe-models-cols` /
+    `probe-colors3` / `probe-toast2` 全部正常跑出结果 —— 证明换路径后 mock 确实来自仓库内那份。
   - 教训：探针的 mock 必须与「真实注入的全局对象集合」对齐；
     缺一个全局对象就会让**断言整体失效**，而失效方式是「一直红」，最容易被当成噪音。
 
@@ -909,7 +914,11 @@
   - 顺带在抓包里确认了一个**真实的 JAI 缺口**：流式响应的 `response.completed.response.output`
     **恒为 `[]`**（`RenderState` 不累积 output items）—— 同一帧里 448 个 `response.output_text.delta`
     带着真实文本，但最终对象是空的。靠增量事件解析的客户端（Reasonix/dsh）无碍，
-    **只读最终对象的客户端会拿到一个空回合**。已登记待修。
+    **只读最终对象的客户端会拿到一个空回合**。
+    → ✅ **已于 v0.2.11 修复**（`RenderState` 新增 `completed_items`，在三处 `output_item.done`
+    累积，收尾帧改用 `completed_response(status)` 回填 `output`；新增 5 个单测）。
+    此处原写「已登记待修」系过时注记，2026-09-21 更正（本条属「观察中」的客户端问题，
+    JAI 侧无需改动；顺带发现的这个缺口已修）。
   - 抓包脚本 `/tmp/jai-capture-proxy.py`（临时文件，分析完即删；踩坑记录：转发时必须丢掉
     `Transfer-Encoding`，urllib 已自动解开 chunked，原样转会让客户端解析乱码并提前断开；
     SSE 判定要看**响应头 Content-Type**，不要在 body 上猜）。
