@@ -114,6 +114,7 @@ export function LogsPage() {
           r.isStream ? "SSE" : "",
           r.usageInput ?? "",
           r.usageOutput ?? "",
+          `"${(r.stopReason ?? "").replaceAll('"', '""')}"`,
           `"${(r.errorKind ?? "").replaceAll('"', '""')}"`,
         ].join(",")
       )

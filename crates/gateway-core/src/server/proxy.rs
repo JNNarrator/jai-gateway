@@ -301,6 +301,9 @@ fn emit_log(
     tool_calls: i64,
     error_kind: Option<String>,
     error_summary: Option<String>,
+    // 响应侧结束原因（IR 口径：`end_turn` / `max_tokens` / `tool_use` / `safety` / `other`）。
+    // 放末位是为了让既有调用点只需追加一个实参；未知（错误路径、未采集）传 `None`。
+    stop_reason: Option<&str>,
 ) {
     emit_log_with(
         RouteMode::Passthrough,
@@ -316,6 +319,7 @@ fn emit_log(
         tool_calls,
         error_kind,
         error_summary,
+        stop_reason,
     );
 }
 
@@ -335,6 +339,8 @@ fn emit_log_with(
     tool_calls: i64,
     error_kind: Option<String>,
     error_summary: Option<String>,
+    // 响应侧结束原因（见 [`emit_log`]；未知传 `None`）
+    stop_reason: Option<&str>,
 ) {
     let (ui, uo, ucr, ucw) = usage.map(extract_usage).unwrap_or((None, None, None, None));
     logs.emit(LogEvent {
@@ -345,7 +351,7 @@ fn emit_log_with(
         provider_id: provider_id.map(str::to_string),
         upstream_model_id,
         http_status: status,
-        stop_reason: None,
+        stop_reason: stop_reason.map(str::to_string),
         usage_input: ui,
         usage_output: uo,
         usage_cache_read: ucr,
@@ -408,6 +414,133 @@ fn count_tool_calls_in_body(wire: InboundWire, bytes: &[u8]) -> i64 {
                     .count() as i64
             })
             .unwrap_or(0),
+    }
+}
+
+/// 上游**原始**结束原因 → IR 口径日志字符串（与 `StopReason::as_log_str` 同词表）。
+///
+/// 各族词表只差别名与大小写，这里用一张表统一，保证 `request_logs.stop_reason`
+/// 在直通与转换两条路径上口径一致。
+fn log_stop_reason(raw: &str) -> &'static str {
+    match raw {
+        "stop" | "end_turn" | "stop_sequence" | "completed" => "end_turn",
+        "length" | "max_tokens" | "max_output_tokens" => "max_tokens",
+        "tool_calls" | "function_call" | "tool_use" => "tool_use",
+        "content_filter" | "refusal" => "safety",
+        // `incomplete` 且拿不到细分 reason：无法区分截断/安全，如实记 other
+        _ => "other",
+    }
+}
+
+/// 直通**非流式**：按入站线形状从响应体取结束原因（诊断字段；解析失败记 `None`）。
+///
+/// 该字段此前恒为 NULL —— 排查「模型为什么反复重发」时看不到是 `max_tokens` 截断。
+fn stop_reason_in_body(wire: InboundWire, bytes: &[u8]) -> Option<&'static str> {
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    let raw = match wire {
+        InboundWire::OpenAi | InboundWire::Completions => v
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)?,
+        InboundWire::Anthropic => v.get("stop_reason").and_then(Value::as_str)?,
+        InboundWire::Responses => {
+            // Responses 的终局状态在 `status`；截断/安全的细分在 `incomplete_details.reason`
+            let status = v.get("status").and_then(Value::as_str)?;
+            if status == "incomplete" {
+                v.pointer("/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("incomplete")
+            } else {
+                status
+            }
+        }
+    };
+    Some(log_stop_reason(raw))
+}
+
+/// 直通**流式**的结束原因探针（纯诊断；绝不参与转发，字节原样透传）。
+///
+/// 字节直通不解析 SSE 语义（与「直通流式 `tool_calls` 恒 0」同源约束），只做关键字级扫描。
+/// 两个坑必须绕开：
+///
+/// 1. **必须逐块扫，不能只在结束时看尾巴**：Responses 的终局帧把整个 `response`
+///    （含**全部正文**）嵌在同一帧里 —— 截断响应正文可达 30KB+，固定 16KB 窗口会把
+///    帧首的 `status` / `incomplete_details` 挤出窗口 → 恰好丢掉「被截断」这个最想看的结论。
+/// 2. **`incomplete_details.reason` 优先，`status` 只作兜底**：同一帧里 `output[*]` 的
+///    item 也带 `status`，且截断响应末尾的 item 反而是 `"completed"`；只按「最后一次
+///    `status`」判定会把截断误记成 `end_turn`（比 NULL 更坏：静默错误）。
+struct StopReasonProbe {
+    wire: InboundWire,
+    /// `incomplete_details.reason` 命中（截断/安全的唯一权威）
+    reason: Option<&'static str>,
+    /// 兜底命中：`finish_reason` / `stop_reason` / `status`
+    fallback: Option<&'static str>,
+    /// 末尾窗口：只用于「标记被 TCP 分块切开」的兜底
+    tail: Vec<u8>,
+}
+
+impl StopReasonProbe {
+    fn new(wire: InboundWire) -> Self {
+        Self {
+            wire,
+            reason: None,
+            fallback: None,
+            tail: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        self.scan(&String::from_utf8_lossy(chunk));
+        keep_tail(&mut self.tail, chunk);
+    }
+
+    /// 结束原因（IR 口径）；扫不到记 `None`。
+    fn finish(&mut self) -> Option<&'static str> {
+        // 兜底再扫一遍末尾窗口：标记被分块切开时逐块扫描会漏
+        if self.reason.is_none() || self.fallback.is_none() {
+            let tail = String::from_utf8_lossy(&self.tail).into_owned();
+            self.scan(&tail);
+        }
+        self.reason.or(self.fallback)
+    }
+
+    fn scan(&mut self, s: &str) {
+        // 权威：`incomplete_details.reason`（值域白名单，避免正文/其它对象的 reason 误命中）
+        if let Some(r) = last_json_string(s, "\"reason\":\"") {
+            if r == "max_output_tokens" || r == "content_filter" {
+                self.reason = Some(log_stop_reason(r));
+            }
+        }
+        let raw = match self.wire {
+            InboundWire::OpenAi | InboundWire::Completions => {
+                last_json_string(s, "\"finish_reason\":\"")
+            }
+            InboundWire::Anthropic => last_json_string(s, "\"stop_reason\":\""),
+            InboundWire::Responses => last_json_string(s, "\"status\":\""),
+        };
+        if let Some(raw) = raw {
+            self.fallback = Some(log_stop_reason(raw));
+        }
+    }
+}
+
+/// 取 `key`（形如 `"finish_reason":"`，自带两侧引号与冒号）之后**最后一次**出现的
+/// JSON 字符串值。内容里的同类文本会被 JSON 转义成 `\"`，不会误命中。
+fn last_json_string<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+    let start = s.rfind(key)? + key.len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// 直通流式保留的末尾窗口字节数（只用于跨块拆分的标记兜底，见 [`StopReasonProbe`]）。
+const PASSTHROUGH_TAIL_BYTES: usize = 16 * 1024;
+
+/// 维护末尾窗口：追加新块并裁掉窗口外的旧字节。
+fn keep_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
+    tail.extend_from_slice(chunk);
+    if tail.len() > PASSTHROUGH_TAIL_BYTES {
+        let cut = tail.len() - PASSTHROUGH_TAIL_BYTES;
+        tail.drain(..cut);
     }
 }
 
@@ -804,6 +937,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
                 0,
                 Some("InvalidRequest".into()),
                 Some(msg.clone()),
+                None,
             );
             return wire.error_response(
                 StatusCode::BAD_REQUEST,
@@ -895,6 +1029,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             0,
             Some("InvalidRequest".into()),
             Some(msg.clone()),
+            None,
         );
         return wire.error_response(
             StatusCode::NOT_FOUND,
@@ -967,6 +1102,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             0,
             Some(last_kind.into()),
             Some(last_summary.clone()),
+            None,
         );
         let mut b = Response::builder().status(err.status);
         b = match err.content_type {
@@ -991,6 +1127,7 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
         0,
         Some(last_kind.into()),
         Some(last_summary.clone()),
+        None,
     );
     wire.error_response(
         StatusCode::BAD_GATEWAY,
@@ -1096,6 +1233,7 @@ async fn try_candidate(
                 0,
                 Some("UpstreamAuth".into()),
                 Some(msg.to_string()),
+                None,
             );
             return Attempt::Failed {
                 kind: "UpstreamAuth",
@@ -1141,6 +1279,7 @@ async fn try_candidate(
                             0,
                             Some("InvalidRequest".into()),
                             Some(msg.clone()),
+                            None,
                         );
                         return Attempt::Delivered(wire.error_response(
                             StatusCode::BAD_REQUEST,
@@ -1174,6 +1313,7 @@ async fn try_candidate(
                                 effort.source,
                                 effort.levels.join("/")
                             )),
+                            None,
                         );
                     }
                 }
@@ -1250,6 +1390,7 @@ async fn try_candidate(
                 0,
                 Some("ProviderOther".into()),
                 Some(msg.clone()),
+                None,
             );
             return Attempt::Failed {
                 kind: "ProviderOther",
@@ -1293,6 +1434,7 @@ async fn try_candidate(
                     } else {
                         format!("{}：{snippet}", cand.provider_name)
                     }),
+                    None,
                 );
                 let mut b = Response::builder().status(up_status);
                 b = match upstream_ct {
@@ -1322,6 +1464,7 @@ async fn try_candidate(
                         "{}：「{kind}」即将切换渠道：{snippet}",
                         cand.provider_name
                     )),
+                    None,
                 );
                 return Attempt::Failed {
                     kind,
@@ -1462,6 +1605,7 @@ async fn try_converted_candidate(
             0,
             Some("InvalidRequest".into()),
             Some(msg.clone()),
+            None,
         );
         return Attempt::Delivered(wire.error_response(
             StatusCode::BAD_REQUEST,
@@ -1497,6 +1641,7 @@ async fn try_converted_candidate(
                 0,
                 Some("InvalidRequest".into()),
                 Some(msg.clone()),
+                None,
             );
             return Attempt::Delivered(wire.error_response(
                 StatusCode::BAD_REQUEST,
@@ -1522,6 +1667,7 @@ async fn try_converted_candidate(
                 0,
                 Some("CapabilityWarn".into()),
                 Some(outcome.warnings.join("；")),
+                None,
             );
         }
     }
@@ -1694,6 +1840,7 @@ async fn try_converted_candidate(
                 0,
                 Some("ProviderOther".into()),
                 Some(format!("[convert] {}：{msg}", cand.provider_name)),
+                None,
             );
             return Attempt::Failed {
                 kind: "ProviderOther",
@@ -1731,6 +1878,7 @@ async fn try_converted_candidate(
                     0,
                     Some(kind.into()),
                     Some(format!("[convert] {}：{snippet}", cand.provider_name)),
+                    None,
                 );
                 // 确定性错误：翻译为入站方言（OpenAI schema）
                 let (tname, code) = match kind {
@@ -1758,6 +1906,7 @@ async fn try_converted_candidate(
                         "[convert] {}：「{kind}」即将切换渠道：{snippet}",
                         cand.provider_name
                     )),
+                    None,
                 );
                 return Attempt::Failed {
                     kind,
@@ -1848,6 +1997,7 @@ async fn convert_plain_response(
                 0,
                 Some("ProviderOther".into()),
                 Some(format!("[convert] {msg}")),
+                None,
             );
             return Attempt::Delivered(wire.error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1874,6 +2024,7 @@ async fn convert_plain_response(
                     "[convert] Overloaded read timeout (status={})",
                     status.as_u16()
                 )),
+                None,
             );
             return Attempt::Delivered(wire.error_response(
                 wire.overloaded_status(),
@@ -1909,6 +2060,7 @@ async fn convert_plain_response(
                 0,
                 Some("ProviderOther".into()),
                 Some(format!("[convert] 解析失败: {msg}")),
+                None,
             );
             return Attempt::Delivered(wire.error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1956,6 +2108,7 @@ async fn convert_plain_response(
                 0,
                 Some("ProviderOther".into()),
                 Some(format!("[convert] {msg}")),
+                None,
             );
             return Attempt::Delivered(wire.error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1985,6 +2138,7 @@ async fn convert_plain_response(
         count_ir_tool_uses(&resp),
         None,
         None,
+        Some(resp.stop_reason.as_log_str()),
     );
 
     // 渲染为入站形状（OpenAI / Anthropic）
@@ -2146,6 +2300,10 @@ async fn convert_streaming_response(
             // IR 累计的 usage：Finish 事件携带，自然结束时透传落库（修复日志输入/输出恒空）
             let mut last_usage: Option<crate::codec::ir::Usage> = None;
             // 本回合 assistant 发起的工具调用 id 集合（落 request_logs.tool_calls）。
+            // 本回合结束原因（IR 口径，落 request_logs.stop_reason）：与 usage 同源，
+            // 取**先到的显式 finish_reason**（与 pending_finish 的裁决一致）。
+            // 早期该列恒为 NULL —— 排查「模型为什么反复重发」时看不到是 max_tokens 截断。
+            let mut last_stop_reason: Option<crate::codec::ir::StopReason> = None;
             // 用 id 去重而非数事件：部分上游（如 Gemini）每帧都带 Start，且 index 恒为 0。
             let mut tool_call_ids: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
@@ -2215,6 +2373,7 @@ async fn convert_streaming_response(
                                                 0,
                                                 Some("SseParseWarn".into()),
                                                 Some(format!("[convert] anthropic SSE 帧解析失败已跳过: {e}")),
+                                                None,
                                             );
                                             continue;
                                         }
@@ -2236,6 +2395,7 @@ async fn convert_streaming_response(
                                             0,
                                             Some("SseParseWarn".into()),
                                             Some(format!("[convert] gemini SSE 帧解析失败已跳过: {e}")),
+                                            None,
                                         );
                                         continue;
                                     }
@@ -2257,6 +2417,7 @@ async fn convert_streaming_response(
                                             0,
                                             Some("SseParseWarn".into()),
                                             Some(format!("[convert] openai SSE 帧解析失败已跳过: {e}")),
+                                            None,
                                         );
                                         continue;
                                     }
@@ -2277,6 +2438,7 @@ async fn convert_streaming_response(
                                         0,
                                         Some("SseParseWarn".into()),
                                         Some("[convert] openai_responses SSE 暂不支持流式转换".into()),
+                                        None,
                                     );
                                     continue;
                                 }
@@ -2324,6 +2486,9 @@ async fn convert_streaming_response(
                                     }
                                 }
                                 if !is_zero || last_usage.is_none() {
+                                if last_stop_reason.is_none() {
+                                    last_stop_reason = Some(stop_reason.clone());
+                                }
                                     last_usage = Some(usage.clone());
                                 }
                                 continue;
@@ -2343,6 +2508,7 @@ async fn convert_streaming_response(
                                         0,
                                         Some("InvalidRequest".into()),
                                         Some("client disconnected mid-stream".into()),
+                                        None,
                                     );
                                     drop(tx);
                                     return;
@@ -2371,6 +2537,7 @@ async fn convert_streaming_response(
                         0,
                         Some("Overloaded".into()),
                         Some(format!("[convert] {msg}")),
+                        None,
                     );
                     drop(tx);
                 }};
@@ -2408,6 +2575,8 @@ async fn convert_streaming_response(
                                 "[convert] Overloaded upstream={} idle timeout",
                                 status.as_u16()
                             )),
+                            // 上游挂死前若已见过 Finish，结束原因照记（比 NULL 有用）
+                            last_stop_reason.as_ref().map(|r| r.as_log_str()),
                         );
                         break;
                     }
@@ -2450,6 +2619,7 @@ async fn convert_streaming_response(
                             0,
                             Some("ProviderOther".into()),
                             Some(format!("[convert] {msg}")),
+                            last_stop_reason.as_ref().map(|r| r.as_log_str()),
                         );
                         drop(tx);
                         break;
@@ -2492,6 +2662,7 @@ async fn convert_streaming_response(
                             tool_call_ids.len() as i64,
                             None,
                             None,
+                            last_stop_reason.as_ref().map(|r| r.as_log_str()),
                         );
                         drop(tx);
                         break;
@@ -2540,6 +2711,7 @@ fn internal_error(
         0,
         Some("ProviderOther".into()),
         Some("internal error".into()),
+        None,
     );
     wire.error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2577,6 +2749,7 @@ async fn plain_response(
                 0,
                 Some("ProviderOther".into()),
                 Some(msg.clone()),
+                None,
             );
             return wire.error_response(StatusCode::BAD_GATEWAY, &msg, "api_error", None);
         }
@@ -2597,6 +2770,7 @@ async fn plain_response(
                     "Overloaded upstream={} read timeout",
                     status.as_u16()
                 )),
+                None,
             );
             return wire.error_response(
                 wire.overloaded_status(),
@@ -2624,6 +2798,7 @@ async fn plain_response(
         count_tool_calls_in_body(wire, &bytes),
         None,
         None,
+        stop_reason_in_body(wire, &bytes),
     );
 
     Response::builder()
@@ -2666,6 +2841,7 @@ async fn streaming_response(
                 0,
                 Some("ProviderOther".into()),
                 Some(msg.clone()),
+                None,
             );
             return wire.error_response(
                 StatusCode::BAD_GATEWAY,
@@ -2690,6 +2866,7 @@ async fn streaming_response(
                 0,
                 Some("ProviderOther".into()),
                 Some(msg.to_string()),
+                None,
             );
             return wire.error_response(
                 StatusCode::BAD_GATEWAY,
@@ -2715,6 +2892,7 @@ async fn streaming_response(
                     "Overloaded upstream={} first-byte timeout",
                     status.as_u16()
                 )),
+                None,
             );
             return wire.error_response(
                 wire.overloaded_status(),
@@ -2733,6 +2911,9 @@ async fn streaming_response(
 
     let mut scanner = UsageScanner::new();
     scanner.feed(&first_chunk);
+    // 结束原因探针（诊断字段，逐块扫描 + 末尾窗口兜底，见 StopReasonProbe）
+    let mut probe = StopReasonProbe::new(wire);
+    probe.feed(&first_chunk);
 
     if tx.send(Ok(first_chunk)).await.is_err() {
         // 客户端瞬间断开：记录后退出
@@ -2749,6 +2930,7 @@ async fn streaming_response(
             0,
             Some("InvalidRequest".into()),
             Some("client disconnected early".into()),
+            None,
         );
         return empty_resp(StatusCode::OK);
     }
@@ -2762,6 +2944,7 @@ async fn streaming_response(
         let pid = cand.provider_id.clone();
         tokio::spawn(async move {
             let t0 = Instant::now();
+            // probe 随 chunk 前进（见 StopReasonProbe），结束原因只在它内部累积
             loop {
                 let nxt = tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream_stream.next());
                 match nxt.await {
@@ -2784,11 +2967,14 @@ async fn streaming_response(
                                 "Overloaded upstream={} idle timeout",
                                 status.as_u16()
                             )),
+                            // 上游挂死前若已见过终局帧，结束原因照记（比 NULL 有用）
+                            probe.finish(),
                         );
                         break;
                     }
                     Ok(Some(Ok(chunk))) => {
                         scanner.feed(&chunk);
+                        probe.feed(&chunk);
                         if tx.send(Ok(chunk)).await.is_err() {
                             emit_log(
                                 &ctx2.logs,
@@ -2803,6 +2989,7 @@ async fn streaming_response(
                                 0,
                                 Some("InvalidRequest".into()),
                                 Some("client disconnected mid-stream".into()),
+                                None,
                             );
                             break;
                         }
@@ -2825,6 +3012,7 @@ async fn streaming_response(
                             0,
                             Some("ProviderOther".into()),
                             Some(msg),
+                            probe.finish(),
                         );
                         break;
                     }
@@ -2844,6 +3032,7 @@ async fn streaming_response(
                             0,
                             None,
                             None,
+                            probe.finish(),
                         );
                         break;
                     }
@@ -2910,6 +3099,176 @@ mod tests {
             0
         );
         assert_eq!(count_tool_calls_in_body(InboundWire::Responses, b""), 0);
+    }
+
+    /// `stop_reason` 日志列：三族原始词表都要归一到 IR 口径。
+    #[test]
+    fn log_stop_reason_maps_family_vocabularies() {
+        // OpenAI 族
+        assert_eq!(log_stop_reason("stop"), "end_turn");
+        assert_eq!(log_stop_reason("length"), "max_tokens");
+        assert_eq!(log_stop_reason("tool_calls"), "tool_use");
+        assert_eq!(log_stop_reason("content_filter"), "safety");
+        // Anthropic 族
+        assert_eq!(log_stop_reason("end_turn"), "end_turn");
+        assert_eq!(log_stop_reason("stop_sequence"), "end_turn");
+        assert_eq!(log_stop_reason("max_tokens"), "max_tokens");
+        assert_eq!(log_stop_reason("tool_use"), "tool_use");
+        assert_eq!(log_stop_reason("refusal"), "safety");
+        // Responses 族
+        assert_eq!(log_stop_reason("completed"), "end_turn");
+        assert_eq!(log_stop_reason("max_output_tokens"), "max_tokens");
+        // 认不出的如实记 other，绝不猜
+        assert_eq!(log_stop_reason("incomplete"), "other");
+        assert_eq!(log_stop_reason("weird_new_reason"), "other");
+    }
+
+    /// 直通非流式：按入站线形状取结束原因；截断必须认出来（诊断价值所在）。
+    #[test]
+    fn stop_reason_in_passthrough_bodies() {
+        let oai_cut = r#"{"choices":[{"message":{"role":"assistant","content":"x"},"finish_reason":"length"}]}"#;
+        assert_eq!(
+            stop_reason_in_body(InboundWire::OpenAi, oai_cut.as_bytes()),
+            Some("max_tokens")
+        );
+        let oai_stop = r#"{"choices":[{"finish_reason":"stop"}]}"#;
+        assert_eq!(
+            stop_reason_in_body(InboundWire::OpenAi, oai_stop.as_bytes()),
+            Some("end_turn")
+        );
+        let anthropic = r#"{"content":[],"stop_reason":"max_tokens"}"#;
+        assert_eq!(
+            stop_reason_in_body(InboundWire::Anthropic, anthropic.as_bytes()),
+            Some("max_tokens")
+        );
+        // Responses：incomplete 必须读 incomplete_details.reason 才算得出截断
+        let resp_cut =
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#;
+        assert_eq!(
+            stop_reason_in_body(InboundWire::Responses, resp_cut.as_bytes()),
+            Some("max_tokens")
+        );
+        let resp_ok = r#"{"status":"completed"}"#;
+        assert_eq!(
+            stop_reason_in_body(InboundWire::Responses, resp_ok.as_bytes()),
+            Some("end_turn")
+        );
+        // 缺字段 / 非 JSON：None（不 panic、不影响转发）
+        assert_eq!(
+            stop_reason_in_body(InboundWire::OpenAi, b"{}"),
+            None,
+            "缺 finish_reason 应记 None"
+        );
+        assert_eq!(stop_reason_in_body(InboundWire::OpenAi, b"not json"), None);
+    }
+
+    /// 测试辅助：把若干块喂给探针并取结束原因（模拟 SSE 分块到达）。
+    fn probe_of(wire: InboundWire, chunks: &[&str]) -> Option<&'static str> {
+        let mut probe = StopReasonProbe::new(wire);
+        for c in chunks {
+            probe.feed(c.as_bytes());
+        }
+        probe.finish()
+    }
+
+    /// 直通流式探针：各族末帧形状都要认出来；前导帧的 `finish_reason` 是 null 不算命中。
+    #[test]
+    fn stop_reason_probe_reads_family_terminal_frames() {
+        let oai = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_eq!(probe_of(InboundWire::OpenAi, &[oai]), Some("max_tokens"));
+        // 正文里出现的同类文本已被 JSON 转义（\"），不得误命中
+        let escaped = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"say \\\"finish_reason\\\":\\\"stop\\\"\"},",
+            "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        );
+        assert_eq!(
+            probe_of(InboundWire::OpenAi, &[escaped]),
+            Some("tool_use"),
+            "应取真正的结束字段而不是正文里的转义文本"
+        );
+        let anthropic = concat!(
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        assert_eq!(
+            probe_of(InboundWire::Anthropic, &[anthropic]),
+            Some("end_turn")
+        );
+        // 空流 / 无结束字段：None
+        assert_eq!(probe_of(InboundWire::OpenAi, &[""]), None);
+        assert_eq!(probe_of(InboundWire::OpenAi, &["data: [DONE]\n\n"]), None);
+    }
+
+    /// 坑 1 回归：Responses 终局帧把**全部正文**嵌在同一帧里，截断响应正文可达 30KB+。
+    /// 固定 16KB 窗口会把帧首的 `status`/`incomplete_details` 挤出窗口 —— 必须逐块扫描。
+    #[test]
+    fn stop_reason_probe_survives_huge_terminal_frame() {
+        let mut frame = String::from(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\
+             \"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\
+             \"output\":[{\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"",
+        );
+        frame.push_str(&"x".repeat(40 * 1024)); // 正文远大于 16KB 窗口
+        frame.push_str("\"}]}]}}\n\n");
+        // 单块喂入（真实场景下这一帧往往单独到达）
+        assert_eq!(
+            probe_of(InboundWire::Responses, &[&frame]),
+            Some("max_tokens"),
+            "帧首的 incomplete_details 不能被同帧大段正文挤出窗口"
+        );
+        // 同一帧被切成多块（标记在首块、正文跨多块）也要认出来
+        let bytes = frame.as_bytes();
+        let cut = bytes.len() / 3;
+        let parts: Vec<&str> = vec![
+            std::str::from_utf8(&bytes[..cut]).unwrap(),
+            std::str::from_utf8(&bytes[cut..]).unwrap(),
+        ];
+        assert_eq!(probe_of(InboundWire::Responses, &parts), Some("max_tokens"));
+    }
+
+    /// 坑 2 回归：同一帧里 `output[*]` 的 item 也带 `status`，且截断响应末尾的 item
+    /// 反而是 `completed`；只按「最后一次 status」判定会把截断误记成 end_turn。
+    /// `incomplete_details.reason` 必须优先。
+    #[test]
+    fn stop_reason_probe_prefers_incomplete_reason_over_item_status() {
+        let frame =
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\
+             \"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\
+             \"output\":[{\"type\":\"function_call\",\"status\":\"completed\"}]}}\n\n";
+        assert_eq!(
+            probe_of(InboundWire::Responses, &[frame]),
+            Some("max_tokens"),
+            "末尾 item 的 status=completed 不得盖掉 incomplete_details.reason"
+        );
+        // 内容安全同口径
+        let filtered = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\
+             \"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"}}}\n\n";
+        assert_eq!(
+            probe_of(InboundWire::Responses, &[filtered]),
+            Some("safety")
+        );
+        // 正常结束：没有 reason，用 status 兜底
+        let ok = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\
+             \"status\":\"completed\",\"output\":[{\"type\":\"message\",\"status\":\"completed\"}]}}\n\n";
+        assert_eq!(probe_of(InboundWire::Responses, &[ok]), Some("end_turn"));
+    }
+
+    /// 末尾窗口必须是有界滚动缓冲：超限只丢最旧字节，且保留的正是结尾。
+    #[test]
+    fn keep_tail_is_bounded_and_keeps_the_end() {
+        let mut tail = Vec::new();
+        keep_tail(&mut tail, b"abcdef");
+        assert_eq!(tail, b"abcdef");
+        // 灌入远超窗口的数据：长度封顶、内容为结尾
+        let big = vec![b'x'; PASSTHROUGH_TAIL_BYTES + 100];
+        keep_tail(&mut tail, &big);
+        assert_eq!(tail.len(), PASSTHROUGH_TAIL_BYTES);
+        keep_tail(&mut tail, b"TAIL-MARKER");
+        assert!(tail.ends_with(b"TAIL-MARKER"), "必须保留结尾而不是开头");
     }
 
     /// 转换路径按 IR 块计数（跨族请求的 tool_calls 落库口径）。

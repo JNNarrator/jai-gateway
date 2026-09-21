@@ -87,6 +87,9 @@ export interface LogRowView {
   httpStatus: number;
   durationMs: number;
   isStream: boolean;
+  /** 响应侧结束原因（IR 口径：end_turn / max_tokens / tool_use / safety / other）。
+   *  排查「模型为什么反复重发」时看这里 —— max_tokens 即输出被截断。 */
+  stopReason?: string | null;
   usageInput?: number | null;
   usageOutput?: number | null;
   errorKind?: string | null;

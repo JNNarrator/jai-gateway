@@ -858,6 +858,33 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
     })
 }
 
+/// 收尾状态 → Responses `status` + `incomplete_details.reason`（OpenAI Responses 语义）。
+///
+/// `status:"incomplete"` **必须**带 `incomplete_details.reason`：只读 `status` 的严格客户端
+/// （如 PI-Desktop 的 Responses 适配器）在缺 reason 时把 `incomplete` 映射成
+/// `stopReason:"error"` + 「Response incomplete without a provider reason」并标 **可重试**，
+/// 于是重发同一请求（最多 10 次）—— 一次 `max_output_tokens` 截断被放大成重试风暴，
+/// 每次都重新生成（配合退化复读的模型 → 会话里同一句话被拼 2/4/…/176 遍）。
+///
+/// 截断不是错误：OpenAI 语义里它是 `incomplete` + `reason:"max_output_tokens"`，
+/// 客户端据此判 `stopReason:"length"`（不重试）。
+fn finish_status(stop_reason: &StopReason) -> (&'static str, Option<&'static str>) {
+    match stop_reason {
+        StopReason::MaxTokens => ("incomplete", Some("max_output_tokens")),
+        StopReason::SafetyBlock => ("incomplete", Some("content_filter")),
+        _ => ("completed", None),
+    }
+}
+
+/// 终局事件名：**恒为 `response.completed`**（含截断）。
+///
+/// 刻意不跟 OpenAI 的 `response.incomplete` 事件名：语义（`status` + `incomplete_details`）
+/// 已按规范给全，而事件名是客户端**分支依据**，改了会伤到只认 `response.completed` 的
+/// SDK 客户端 —— 实测 `openai@6.x` 的 `ResponseStream` 只在 `response.completed` 上累积
+/// 快照，`response.incomplete` 落进 `default:` 被忽略 → 快照停在 `status:"in_progress"`、
+/// 且**丢掉 usage**（截断响应反而记不到用量）。等目标客户端都验证过再切规范事件名。
+const TERMINAL_EVENT: &str = "response.completed";
+
 /// 渲染非流式响应：CanonicalResponse → Responses response 对象。
 pub fn render_response(r: &CanonicalResponse) -> Value {
     let mut output = Vec::new();
@@ -898,15 +925,22 @@ pub fn render_response(r: &CanonicalResponse) -> Value {
         }
     }
     let usage = build_usage(&r.usage);
-    json!({
+    // 非流式与流式同口径：截断/内容安全是 `incomplete` + `incomplete_details.reason`，
+    // 不是 `completed`（早期这里 status 写死 completed，严格客户端看不到「被截断」）。
+    let (status, incomplete_reason) = finish_status(&r.stop_reason);
+    let mut v = json!({
         "id": r.id,
         "object": "response",
         "created_at": crate::store::now_ms() / 1000,
-        "status": "completed",
+        "status": status,
         "model": r.model,
         "output": output,
         "usage": usage,
-    })
+    });
+    if let Some(reason) = incomplete_reason {
+        v["incomplete_details"] = json!({ "reason": reason });
+    }
+    v
 }
 
 /// 非流式响应后处理：按工具身份映射把 function_call 还原为扩展 item
@@ -1567,9 +1601,9 @@ data: {data}
     let completed = render_response(resp);
     push(
         &mut out,
-        "response.completed",
+        TERMINAL_EVENT,
         json!({
-            "type":"response.completed",
+            "type": TERMINAL_EVENT,
             "response": completed,
         }),
     );
@@ -1988,17 +2022,20 @@ pub fn render_stream_event(e: &StreamEvent, st: &mut RenderState) -> Vec<String>
                 st.completed_items.push(item);
                 st.msg_started = false;
             }
-            let status = match stop_reason {
-                StopReason::MaxTokens | StopReason::SafetyBlock => "incomplete",
-                _ => "completed",
-            };
+            // 收尾状态 + `incomplete_details`：`incomplete` **必须**带 reason（见 finish_status）。
+            let (status, incomplete_reason) = finish_status(stop_reason);
             let usage_json = build_usage(usage);
             // 回填已收尾的 output item（早期恒为 `[]`，只读最终对象的客户端会拿到空回合）
             let mut response = st.completed_response(status);
+            if let Some(reason) = incomplete_reason {
+                response["incomplete_details"] = json!({ "reason": reason });
+            }
             response["usage"] = usage_json;
+            // 终局事件名恒为 `response.completed`（含截断），见 [`TERMINAL_EVENT`] 注释；
+            // 「被截断」这个事实由 `status` + `incomplete_details` 承载，客户端据此判 length。
             out.push(
                 json!({
-                    "type": "response.completed",
+                    "type": TERMINAL_EVENT,
                     "response": response,
                 })
                 .to_string(),
@@ -2639,6 +2676,154 @@ mod tests {
         assert!(fin[1].contains("response.output_item.done"));
         assert!(fin[1].contains("only think"));
         assert!(fin.iter().any(|s| s.contains("response.completed")));
+    }
+
+    /// 截断（`max_output_tokens`）必须是 `status:"incomplete"` + `incomplete_details.reason`。
+    ///
+    /// 回归目标（真实事故）：早期只把 `status` 写成 `"incomplete"` 且**从不输出**
+    /// `incomplete_details`（全仓库零命中）。只读 `status` 的严格客户端
+    /// （PI-Desktop 的 Responses 适配器）因此把截断映射成
+    /// `stopReason:"error"` + 「Response incomplete without a provider reason」并标可重试 →
+    /// 重发同一请求最多 10 次。JAI 日志里同一 `usage_input` 出现 10 次、每次都跑满输出上限，
+    /// 会话里同一句话被拼 2/4/…/176 遍。
+    ///
+    /// 事件名**仍是** `response.completed`（刻意，见 [`TERMINAL_EVENT`]）：只认该事件名的
+    /// SDK 客户端（`openai@6.x`）靠它累积快照，改发 `response.incomplete` 会让截断响应
+    /// 反而丢掉 usage。判「截断」靠 `status` + `incomplete_details`，两者必须给全。
+    #[test]
+    fn finish_max_tokens_emits_incomplete_with_reason() {
+        use crate::codec::ir::StreamEvent as Ev;
+        let mut st = RenderState {
+            response_id: "resp_cut".into(),
+            model: "deepseek".into(),
+            ..Default::default()
+        };
+        let _ = render_stream_event(
+            &Ev::Start {
+                model: "deepseek".into(),
+            },
+            &mut st,
+        );
+        let _ = render_stream_event(
+            &Ev::TextDelta {
+                text: "hello".into(),
+            },
+            &mut st,
+        );
+        let fin = render_stream_event(
+            &Ev::Finish {
+                stop_reason: StopReason::MaxTokens,
+                usage: Usage::default(),
+            },
+            &mut st,
+        );
+        let terminal = fin.last().expect("应有终局帧");
+        assert!(
+            terminal.contains("\"type\":\"response.completed\""),
+            "终局事件名保持 response.completed（兼容 SDK 客户端快照累积）: {terminal}"
+        );
+        assert!(
+            !terminal.contains("response.incomplete"),
+            "不得引入 response.incomplete（SDK 会忽略 → 丢 usage）: {terminal}"
+        );
+        assert!(
+            terminal.contains("\"status\":\"incomplete\""),
+            "response.status 必须是 incomplete: {terminal}"
+        );
+        assert!(
+            terminal.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"),
+            "incomplete 必须带 reason（缺 reason 会被客户端当可重试错误）: {terminal}"
+        );
+        // 内容仍然完整下发：截断不是错误，正文照旧
+        assert!(terminal.contains("hello"), "正文不得因截断而丢: {terminal}");
+    }
+
+    /// 内容安全拦截按 OpenAI 语义是 `content_filter`（同为 `incomplete`，不是 completed）。
+    #[test]
+    fn finish_safety_block_maps_to_content_filter() {
+        use crate::codec::ir::StreamEvent as Ev;
+        let mut st = RenderState {
+            response_id: "resp_safety".into(),
+            model: "deepseek".into(),
+            ..Default::default()
+        };
+        let _ = render_stream_event(
+            &Ev::Start {
+                model: "deepseek".into(),
+            },
+            &mut st,
+        );
+        let fin = render_stream_event(
+            &Ev::Finish {
+                stop_reason: StopReason::SafetyBlock,
+                usage: Usage::default(),
+            },
+            &mut st,
+        );
+        let terminal = fin.last().expect("应有终局帧");
+        assert!(terminal.contains("\"type\":\"response.completed\""));
+        assert!(terminal.contains("\"status\":\"incomplete\""));
+        assert!(terminal.contains("\"reason\":\"content_filter\""));
+        // 不得把安全拦截写成截断（两者同为 incomplete，靠 reason 区分）
+        assert!(
+            !terminal.contains("max_output_tokens"),
+            "安全拦截不得带 max_output_tokens: {terminal}"
+        );
+    }
+
+    /// 正常结束不得带 `incomplete_details`（只有 incomplete 才带）。
+    #[test]
+    fn finish_end_turn_has_no_incomplete_details() {
+        use crate::codec::ir::StreamEvent as Ev;
+        let mut st = RenderState {
+            response_id: "resp_ok".into(),
+            model: "deepseek".into(),
+            ..Default::default()
+        };
+        let _ = render_stream_event(
+            &Ev::Start {
+                model: "deepseek".into(),
+            },
+            &mut st,
+        );
+        let fin = render_stream_event(
+            &Ev::Finish {
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+            &mut st,
+        );
+        let terminal = fin.last().expect("应有终局帧");
+        assert!(terminal.contains("\"type\":\"response.completed\""));
+        assert!(terminal.contains("\"status\":\"completed\""));
+        assert!(
+            !terminal.contains("incomplete_details"),
+            "正常结束不该带 incomplete_details: {terminal}"
+        );
+    }
+
+    /// 非流式路径同口径：截断 → `status:incomplete` + reason（此前 status 写死 completed）。
+    #[test]
+    fn render_response_non_stream_marks_incomplete() {
+        let r = CanonicalResponse {
+            id: "resp_cut2".into(),
+            model: "deepseek".into(),
+            output: vec![Block::Text {
+                text: "partial".into(),
+            }],
+            stop_reason: StopReason::MaxTokens,
+            usage: Usage::default(),
+        };
+        let v = render_response(&r);
+        assert_eq!(v["status"], "incomplete");
+        assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(v["output"][0]["content"][0]["text"], "partial");
+
+        let mut ok = r.clone();
+        ok.stop_reason = StopReason::EndTurn;
+        let v2 = render_response(&ok);
+        assert_eq!(v2["status"], "completed");
+        assert!(v2.get("incomplete_details").is_none());
     }
 
     #[test]

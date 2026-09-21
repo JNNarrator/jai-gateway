@@ -206,6 +206,11 @@ pub struct LogRowView {
     /// assistant 发起的工具调用次数（转换路径按 IR 计数、直通非流式按响应体计数；
     /// 直通**流式**不采集，恒 0 —— 字节直通不解析 SSE 语义）
     pub tool_calls: i64,
+    /// 响应侧结束原因（IR 口径：`end_turn` / `max_tokens` / `tool_use` / `safety` / `other`）。
+    /// 转换路径来自 IR Finish；直通非流式按响应体、直通流式按末尾窗口尽力而为识别。
+    /// 早期该列恒为 NULL（结构体里写死 `None`）——排查「模型为什么反复重发」时看不到
+    /// 是 `max_tokens` 截断。
+    pub stop_reason: Option<String>,
     pub usage_input: Option<i64>,
     pub usage_output: Option<i64>,
     pub error_kind: Option<String>,
@@ -217,7 +222,8 @@ pub fn logs_recent(db: &super::Db, limit: i64) -> Result<Vec<LogRowView>, StoreE
     db.with(|c| {
         let mut stmt = c.prepare(
             "SELECT id,ts,inbound_family,route_mode,model_name,provider_id,http_status,\
-             duration_ms,is_stream,tool_calls,usage_input,usage_output,error_kind,error_summary \
+             duration_ms,is_stream,tool_calls,usage_input,usage_output,error_kind,error_summary,\
+             stop_reason \
              FROM request_logs ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -237,6 +243,7 @@ pub fn logs_recent(db: &super::Db, limit: i64) -> Result<Vec<LogRowView>, StoreE
                     usage_output: r.get(11)?,
                     error_kind: r.get(12)?,
                     error_summary: r.get(13)?,
+                    stop_reason: r.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

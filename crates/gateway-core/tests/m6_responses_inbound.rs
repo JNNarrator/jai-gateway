@@ -62,6 +62,17 @@ async fn spawn_openai_mock(mode: &'static str) -> u16 {
                         .body(Body::from(sse))
                         .unwrap()
                 }
+                "stream_length" => {
+                    // 输出被 max_output_tokens 截断：上游 finish_reason = "length"
+                    let sse = "data: {\"id\":\"chatcmpl_l\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"cut here\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_l\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":8}}\n\n\
+                               data: [DONE]\n\n";
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
                 "text" => Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
@@ -72,6 +83,20 @@ async fn spawn_openai_mock(mode: &'static str) -> u16 {
                                 "message":{"role":"assistant","content":"converted-from-openai"},
                                 "finish_reason":"stop"}],
                             "usage":{"prompt_tokens":6,"completion_tokens":4}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+                "text_length" => Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "id":"chatcmpl_l2","object":"chat.completion","model":"gpt-4o",
+                            "choices":[{"index":0,
+                                "message":{"role":"assistant","content":"cut here"},
+                                "finish_reason":"length"}],
+                            "usage":{"prompt_tokens":6,"completion_tokens":8}
                         })
                         .to_string(),
                     ))
@@ -397,4 +422,97 @@ async fn responses_model_not_found_shape() {
         .as_str()
         .unwrap()
         .contains("no-such-model"));
+}
+
+/// 回归（真实事故）：上游 `finish_reason:"length"`（输出被 max_output_tokens 截断）必须
+/// 带全 `status:"incomplete"` + `incomplete_details.reason:"max_output_tokens"`。
+///
+/// 背景：早期只把 `response.status` 写成 `incomplete` 且**从不输出** `incomplete_details`。
+/// 只读 `status` 的严格客户端（PI-Desktop 的 Responses 适配器）因此把截断映射成
+/// `stopReason:"error"` + 「Response incomplete without a provider reason」并标**可重试**
+/// → 重发同一请求最多 10 次；JAI 日志里同一 `usage_input` 出现 10 次、每次都跑满输出上限，
+/// 会话里同一句话被拼 2/4/…/176 遍。截断不是错误：OpenAI 语义里它是 incomplete + reason，
+/// 客户端据此判 `stopReason:"length"`（不重试）。
+///
+/// 事件名**仍是** `response.completed`（刻意，见 `responses.rs::TERMINAL_EVENT`）：
+/// `openai@6.x` 的 `ResponseStream` 只在 `response.completed` 上累积快照，改发
+/// `response.incomplete` 会让截断响应反而丢掉 usage。所以这里反向断言「不得出现
+/// response.incomplete」，把该兼容决策钉在测试里。
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_stream_length_is_incomplete_with_reason() {
+    let fx = fixture("stream_length").await;
+    let (status, text) = fx.post_responses_raw(responses_body("gpt-4o", true)).await;
+    assert_eq!(status, 200);
+    assert!(text.contains("cut here"), "正文仍要完整下发: {text}");
+    assert!(
+        text.contains("\"status\":\"incomplete\""),
+        "截断必须报 incomplete: {text}"
+    );
+    assert!(
+        text.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"),
+        "incomplete 必须带 reason（缺 reason → 客户端当可重试错误重发 10 次）: {text}"
+    );
+    assert!(
+        text.contains("\"type\":\"response.completed\"")
+            && text.contains("event: response.completed"),
+        "终局事件名保持 response.completed: {text}"
+    );
+    assert!(
+        !text.contains("response.incomplete"),
+        "不得引入 response.incomplete（openai@6.x SDK 会忽略它 → 丢 usage）: {text}"
+    );
+
+    // 落库口径：stop_reason 必须记下 max_tokens（此前该列恒 NULL，排查时看不到截断）
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200 && r.is_stream)
+        .expect("应有流式成功日志");
+    assert_eq!(row.route_mode, "converted");
+    assert_eq!(
+        row.stop_reason.as_deref(),
+        Some("max_tokens"),
+        "request_logs.stop_reason 应为 max_tokens"
+    );
+}
+
+/// 非流式同口径：截断 → `status:incomplete` + `incomplete_details.reason`，
+/// 且日志 stop_reason 落 `max_tokens`。
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_non_stream_length_is_incomplete_with_reason() {
+    let fx = fixture("text_length").await;
+    let (status, body) = fx.post_responses(responses_body("gpt-4o", false)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "incomplete", "非流式也要如实报 incomplete");
+    assert_eq!(
+        body["incomplete_details"]["reason"], "max_output_tokens",
+        "非流式也要带 reason: {body}"
+    );
+    assert_eq!(body["output"][0]["content"][0]["text"], "cut here");
+
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200 && !r.is_stream)
+        .expect("应有非流式成功日志");
+    assert_eq!(row.stop_reason.as_deref(), Some("max_tokens"));
+}
+
+/// 正常结束不得带 `incomplete_details`，日志 stop_reason 记 `end_turn`。
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_stream_stop_is_completed_end_turn() {
+    let fx = fixture("stream").await;
+    let (status, text) = fx.post_responses_raw(responses_body("gpt-4o", true)).await;
+    assert_eq!(status, 200);
+    assert!(text.contains("\"type\":\"response.completed\""));
+    assert!(
+        !text.contains("incomplete_details"),
+        "正常结束不该带 incomplete_details: {text}"
+    );
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200 && r.is_stream)
+        .expect("应有流式成功日志");
+    assert_eq!(row.stop_reason.as_deref(), Some("end_turn"));
 }

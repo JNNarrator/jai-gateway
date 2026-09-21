@@ -4,6 +4,60 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **截断（`max_output_tokens`）被误报成「可重试错误」，把一次截断放大成 10 次重试风暴**（bug 清单 11）。
+  Responses 转换路径的收尾帧只把 `response.status` 写成 `"incomplete"`，事件名恒为
+  `response.completed`，且**从不输出 `incomplete_details`**（全仓库零命中）。只读 `status` 的
+  严格客户端（PI-Desktop 的 Responses 适配器）因此把「incomplete 且无 reason」映射成
+  `stopReason:"error"` + `retriable:true`，**重发同一 prompt 最多 10 次**
+  （其 `PROVIDER_RETRY_MAX_RETRIES = 10`）。
+  - 实测证据：客户端日志 `agent.turn.failed … "Response incomplete without a provider reason",
+    retriable:true, retryAttempt:10`；JAI 日志里同一个 `usage_input` 连续出现 3–10 次、
+    每次 `usage_output` 跑满上限（8192）、每次约 40s。
+  - 后果：每次重试都让模型重新生成一遍（该渠道在长上下文 agentic 场景下会退化复读），
+    客户端又把重试结果拼进同一条消息 → 会话里同一句话被拼 2/4/…/176 遍（份数恒为偶数），
+    而 thinking 块与工具参数从不重复。
+  - 修法：新增 `finish_status()` 统一口径 —— `MaxTokens → ("incomplete","max_output_tokens")`、
+    `SafetyBlock → ("incomplete","content_filter")`，并给 `incomplete` 补上 `incomplete_details`
+    （此前该字段全仓库零命中）；非流式 `render_response` 与合成流 `render_response_sse` 同口径。
+    OpenAI 语义里截断**不是错误**：`status:"incomplete"` + `incomplete_details.reason`，
+    客户端据此判 `stopReason:"length"` 而不再重试。
+  - **终局事件名保持 `response.completed`（刻意不跟 OpenAI 的 `response.incomplete`）**：
+    实测 `openai@6.x` 的 `ResponseStream` 只在 `response.completed` 上累积快照，
+    `response.incomplete` 落进 `default:` 被忽略 → 快照停在 `status:"in_progress"` 且**丢 usage**
+    （截断响应反而记不到用量）。判「截断」靠 `status` + `incomplete_details`，事件名是客户端的
+    分支依据 —— 等目标客户端都验证过再切规范名。
+  - 责任边界：上游**确实**在复读（该中转 usage 经核验准确：同一句话重复 810 遍 ≈ 8900 tokens
+    ≈ 上限 8192），JAI 仍是 1:1 转发、不制造重复（delta 逐帧对应上游 `delta.content`；
+    缓冲破坏性 drain；无中途重试/重放）。本次修的是「放大器」这一侧。
+
+- **`request_logs.stop_reason` 恒为 NULL**（bug 清单 12）。该列在 schema 与 INSERT 里都有，
+  但 `emit_log_with` 里写死 `None`，6434 行全空 —— 排查「模型为什么反复重发」时看不到
+  `max_tokens` 截断（本次只能靠 `usage_output` 顶满上限反推）。
+  现按 IR 口径统一采集（`end_turn`/`max_tokens`/`tool_use`/`safety`/`other`）：
+  转换流式取 `Finish`（与 `pending_finish` 同裁决）、转换非流式取 `CanonicalResponse.stop_reason`、
+  直通非流式按响应体形状取、直通流式用 `StopReasonProbe` 关键字级扫描
+  （与「直通流式 `tool_calls` 恒 0」同源约束：字节直通不解析 SSE 语义，只读不写）。
+  探针的两个坑（对抗性审查发现，各配回归测试）：① Responses 终局帧把**整个 response
+  （含全部正文）**嵌在同一帧里，截断响应正文 30KB+ 会把帧首的 `status`/`incomplete_details`
+  挤出固定窗口 → 改为**逐块扫描**（末尾窗口只作跨块兜底）；② 同帧 `output[*].status`
+  在截断时反而是 `completed`，「取最后一次 `status`」会把截断静默记成 `end_turn` →
+  `incomplete_details.reason` 优先（值域白名单）+ `status` 仅兜底。上游挂死/中途断流的行
+  也带上已见到的结束原因。
+  日志页 CSV 导出新增「结束原因」列，JSON 导出与 `logs_recent` 自动带上 `stopReason`。
+  已知偏离（留作独立变更）：`output[*].status` 截断时仍为 `completed`（OpenAI 会镜像为
+  `incomplete`）—— 现有客户端一直看到 `completed`，改它需单独验证。
+
+### Tests
+- Responses 收尾口径单测 4 个（截断 → `status:"incomplete"` + `incomplete_details.reason`、
+  `SafetyBlock` → `content_filter`、正常结束不带 `incomplete_details`、非流式同口径）。
+- M6 集成测试 3 个（流式截断/非流式截断/正常结束）：既断言客户端拿到的
+  `incomplete_details.reason`（并反向断言**不得**出现 `response.incomplete`，把事件名兼容
+  决策钉在测试里），也断言 `request_logs.stop_reason` 落 `max_tokens` / `end_turn`。
+- 代理侧单测 5 个：结束原因词表映射、直通非流式取体、直通流式逐块扫描（含正文里转义
+  同类文本不得误命中）、巨型终局帧不被窗口截断、`reason` 优先于 item `status`
+  + 末尾窗口有界性测试。
+
 ## [0.2.12] - 2026-09-21
 
 ### Fixed
