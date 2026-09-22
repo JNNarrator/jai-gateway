@@ -30,6 +30,9 @@ nohup.out
 .playwright-mcp/
 .zcode/
 
+# agent 会话产物（goal/计划草稿，属本地状态，不入库）
+.pi/
+
 # 视觉回归：脚本入库，体积大的证据不入库
 .vr/shots/
 .vr/tmp/
