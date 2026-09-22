@@ -25,6 +25,8 @@ use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
 use serde_json::{json, Value};
 
+mod common;
+
 // ---------------------------------------------------------------- mock 上游
 
 /// 只有推理、正文为空，以 `finish_reason:"length"` 收尾（真机形状）
@@ -198,8 +200,7 @@ impl Fixture {
     }
 
     async fn recent_logs(&self, n: i64) -> Vec<gateway_core::store::logs::LogRowView> {
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        gateway_core::store::logs::logs_recent(&self.db, n).unwrap()
+        common::logs_settled(&self.db, n, std::time::Duration::from_secs(5)).await
     }
 }
 

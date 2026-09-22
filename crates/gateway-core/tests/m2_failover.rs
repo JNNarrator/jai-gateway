@@ -55,6 +55,8 @@ async fn spawn_mock(status: u16, tag: &'static str) -> u16 {
 
 use axum::response::Response;
 
+mod common;
+
 // ---------------------------------------------------------------- 夹具
 
 /// 起一个完整 JAI 网关（临时文件 DB + mock keyring + 两个 openai_compat 渠道），
@@ -166,8 +168,7 @@ impl Fixture {
 
     /// 等待后台日志管道落库后取最近 N 条
     async fn recent_logs(&self, n: i64) -> Vec<gateway_core::store::logs::LogRowView> {
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        gateway_core::store::logs::logs_recent(&self.db, n).unwrap()
+        common::logs_settled(&self.db, n, std::time::Duration::from_secs(5)).await
     }
 }
 

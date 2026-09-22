@@ -1051,6 +1051,25 @@
     删除动作本身已有幂等语义与防误删白名单（`backup_timestamp` 只认时间戳形态）。
   - 注意：清理会真的删远端文件，属于破坏性动作，须先在真机上跑一遍保留份数与白名单判据。
 
+- [x] 15. **集成测试用固定 `sleep(700ms)` 等异步日志落库 → Windows runner 上偶发假失败**（2026-09-22 v0.3.1 发版时撞上）
+  - 现象：tag `v0.3.1` 的 `CI`（main push）在 **windows-latest** 上红：
+    `m3_anthropic.rs:244` `called Option::unwrap() on a None value`
+    （`logs_recent(...).find(|r| r.http_status == 200).unwrap()`）。同一份代码 30 分钟前
+    在 Windows 上是绿的，macOS job 同轮也绿 ⇒ 与产品行为无关的时序抖动。
+  - 根因：日志落库是**异步**的（后台线程 + 批量写入），而测试写死
+    `sleep(700ms)` 后立刻查库；负载高/机器慢时 700ms 不够 ⇒ 查到空集 ⇒ `unwrap()` panic。
+    全仓共 5 处同一写法（`m2_failover` / `m3_anthropic` / `m4_conversion` /
+    `m6_responses_inbound` / `output_truncation_diagnostic`），每处都是一颗定时炸弹。
+  - 已解决：新增 `crates/gateway-core/tests/common/mod.rs::logs_settled(db, limit, timeout)` ——
+    有界轮询到「行数连续两次相同」即认为本批写完（正常约 100ms 返回，比原来还快），
+    超时**不 panic**（把当前快照交给调用方，让真正的断言判断对错；只有一条都没有才报错，
+    那说明日志管道根本没启动）。5 处固定 sleep 全部替换。
+  - 验证：5 个受影响的测试文件全绿，且更快（m6 由约 2s → 0.71s）；`fmt`/`clippy -D warnings`
+    干净。**注意**：`v0.3.1` tag 指向的提交仍带这颗炸弹（产物不受影响，纯测试代码），
+    修复在 tag 之后的提交上。
+  - 教训（与 §4.2「探针自身不可信」同源）：**测试里的固定等待等于把失败概率留给负载**；
+    异步写入一律用有界轮询 + 明确的超时语义，不用 `sleep` 赌时间。
+
 ## 3. 视觉回归（默认窗口 1180×800，最小 900×600）
 
 > v0.2.0 起默认窗口 980×640 → 1180×800（最小 760×520 → 900×600），见 §2 第 12 条。

@@ -17,6 +17,8 @@ use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
 use serde_json::{json, Value};
 
+mod common;
+
 // ---------------------------------------------------------------- mock 上游
 
 /// Anthropic mock：按模式返回固定响应。
@@ -407,8 +409,8 @@ async fn openai_to_gemini_stream() {
 
     // 转换流式路径：结束时透传 IR 累计的 usage 落日志
     // （gemini mock 流式 Finish 携带 promptTokenCount=3 / candidatesTokenCount=2）
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await; // 等后台日志管道落库
-    let rows = gateway_core::store::logs::logs_recent(&fx.db, 5).unwrap();
+    // 有界轮询等落库（不用固定 sleep，见 `common::logs_settled`）
+    let rows = common::logs_settled(&fx.db, 5, std::time::Duration::from_secs(5)).await;
     let row = rows
         .iter()
         .find(|r| r.is_stream && r.provider_id.is_some())

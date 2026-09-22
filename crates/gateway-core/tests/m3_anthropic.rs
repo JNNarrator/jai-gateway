@@ -16,6 +16,8 @@ use gateway_core::server::{self, GatewayCtx};
 use gateway_core::store::{self, Db};
 use serde_json::{json, Value};
 
+mod common;
+
 // ---------------------------------------------------------------- mock 上游
 
 /// Anthropic 风格 mock：记录收到的认证头，返回固定状态/内容。
@@ -238,9 +240,8 @@ async fn anthropic_passthrough_success() {
         "应携带 anthropic-version 默认值"
     );
 
-    // 日志族
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    let rows = gateway_core::store::logs::logs_recent(&fx.db, 20).unwrap();
+    // 日志族（有界轮询等落库，不用固定 sleep —— 见 `common::logs_settled`）
+    let rows = common::logs_settled(&fx.db, 20, std::time::Duration::from_secs(5)).await;
     let ok = rows.iter().find(|r| r.http_status == 200).unwrap();
     assert_eq!(ok.inbound_family, "anthropic");
     assert_eq!(ok.provider_id.as_deref(), Some("p-claude"));

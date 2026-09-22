@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **集成测试不再用固定 `sleep` 等异步日志落库**（v0.3.1 发版时撞上）：tag `v0.3.1` 的
+  `CI`（main push）在 **windows-latest** 上红在 `m3_anthropic.rs:244`
+  （`logs_recent(...).find(...).unwrap()` 拿到 `None`），而同一份代码 30 分钟前在 Windows
+  上是绿的、同轮 macOS job 也绿 ⇒ 与产品无关的时序抖动。根因：日志落库是异步的
+  （后台线程 + 批量写入），测试写死 `sleep(700ms)` 后立刻查库，慢机器/高负载下不够。
+  全仓共 5 处同一写法（`m2_failover` / `m3_anthropic` / `m4_conversion` /
+  `m6_responses_inbound` / `output_truncation_diagnostic`）。现新增
+  `tests/common/mod.rs::logs_settled(db, limit, timeout)`：有界轮询到「行数连续两次相同」
+  即认为本批写完（正常约 100ms 返回，比原来更快），**超时不 panic**（把当前快照交给调用方，
+  让真正的断言判断对错；只有一条都没有才报错 —— 那说明日志管道没启动）。5 处全部替换；
+  m6 用例耗时由约 2s → 0.71s。注：`v0.3.1` tag 指向的提交仍带这处抖动（纯测试代码，
+  产物不受影响），修复落在 tag 之后的提交。
+
 ## [0.3.1] - 2026-09-22
 
 ### Fixed
