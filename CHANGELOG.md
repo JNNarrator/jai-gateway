@@ -3,6 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-09-22
+
 ### Fixed
 - **「零可见输出的截断轮」被记成干净的 200**（转换路径 + 直通路径都补上）：上游以
   `finish_reason:"length"` 收尾、整轮只有 reasoning 增量而**正文为空、无工具调用**时，
