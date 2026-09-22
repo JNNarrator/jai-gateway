@@ -18,11 +18,25 @@ JAI 收到 Anthropic `/v1/messages` 后会按模型路由到真实上游（OpenA
 
 1. 打开 zcode 的模型/Provider 设置，添加自定义 Provider：
    - 名称：`JAI`
-   - 类型/协议：`anthropic`
-   - Base URL：`http://127.0.0.1:1314`
+   - 协议（zcode 内部叫 `api.type`）：三选一，见下表
+   - Base URL：按所选协议填 —— **三条线规则不一样**，见下表
    - API Key：JAI 网关页显示的 `sk-jai-xxxx`
 2. 添加要使用的模型，模型名与 JAI「模型」页一致。
 3. 选择该 Provider 与模型后开始对话。
+
+### Base URL 怎么填（三条线规则不一样）
+
+zcode 用 AI SDK 起请求，**不同协议线的 URL 拼法不同**（`adapters/src/model/model-execution.ts`）：
+
+| `api.type` | zcode 的拼法 | 填给 JAI 的 Base URL | 最终打到 |
+| --- | --- | --- | --- |
+| `anthropic-messages` | 缺 `/v1` 自动补，再追加 `/messages` | `http://127.0.0.1:1314` | `/v1/messages` |
+| `openai-responses` | **原样**追加 `/responses` | `http://127.0.0.1:1314/v1` | `/v1/responses` |
+| `openai-chat-completions` | **原样**追加 `/chat/completions` | `http://127.0.0.1:1314/v1` | `/v1/chat/completions` |
+
+- `anthropic-messages` 线填 `http://127.0.0.1:1314` 或 `http://127.0.0.1:1314/v1` **都对**
+  （zcode 会归一：已以 `/v1` 结尾就不动）；
+- 另两条线**必须显式带 `/v1`**，否则会打到 `http://127.0.0.1:1314/responses` → JAI 无此路由 → 404。
 
 ## 模型名怎么填（多供应商必须区分时的唯一注意点）
 
@@ -51,6 +65,23 @@ JAI 支持 **`供应商名/模型名`** 限定键（`server/proxy.rs` 的 `split
 
 zcode 把上游 400 统一包装成 **`Provider rejected the model request.`** —— 看到这句，
 去 JAI **日志页**看该行的 `error_summary`（那里是上游原文），不要从模型名上找原因。
+
+### 两条线各自发的形态（zcode 源码口径）
+
+zcode 的推理档位不是硬编码字段，而是**按模型规则表做 JSON merge-patch** 注入请求体
+（`config/provider/zcode-builtin.json` 的 `reasoningLevel.map` + `packages/model-option-map`）。
+所以不同协议线注入的字段名不同，JAI 三条都认：
+
+| 协议线 | zcode 注入 | JAI 入站读取 |
+| --- | --- | --- |
+| `openai-responses` | `reasoning:{"effort": …}`（关闭时 `"none"`） | → `reasoning_effort` |
+| `openai-chat-completions` | `reasoning_effort`（部分模型另带 `thinking` / `enable_thinking`） | → `reasoning_effort` |
+| `anthropic-messages` | `thinking:{"type":"adaptive"}` + `output_config:{"effort": …}`；关闭时 `thinking:{"type":"disabled"}` | → `reasoning_effort` |
+
+**2026-09-22 修复前**：`output_config` 在 JAI 里**没有任何引用**（连「未建模已丢弃」的
+`CapabilityWarn` 都不产生）→ 走 Anthropic 线的跨族转换时，用户选的档位**静默丢失**。
+现在 `output_config.effort` 会读成 `reasoning_effort`，`thinking.type:"disabled"` 归一为 `none`；
+只有 `enabled` / `adaptive` 而不带档位时**不臆断**成具体档位（保持不干预）。
 
 ### 声明方式（JAI 0.2.6+）
 
@@ -110,9 +141,11 @@ JAI「技能」页点击 **复制技能包**，会把启用中的技能导出为
    - `404 InvalidRequest`「模型 X 不存在或其渠道未启用」→ 模型名写法（反斜杠 / 供应商名不一致 / 模型未启用）；
    - `400 InvalidRequest` + `[convert] 上游名：{...}` → **上游拒绝的参数**（如本次的 `reasoning_effort` 值域），按上文声明档位。
    - `403/502 UpstreamAuth` → 上游 API Key 失效（供应商页「测试连接」可复现）。
-2. **zcode 侧**：`~/.zcode/v2/provider_config.json` 里该 provider 的 `api.type`（`openai-responses` /
-   `openai-chat-completions` / anthropic）决定走 JAI 的哪条入站线，`baseUrl` 是否指向
-   `http://127.0.0.1:1314/v1`、`apiKey` 是否与 JAI 网关页一致。
+2. **zcode 侧**：`~/.zcode/v2/provider_config.json` 里该 provider 的 `api.type` 三选一 ——
+   `anthropic-messages` / `openai-chat-completions` / `openai-responses`。
+   注意枚举值就是 **`anthropic-messages`**，不是 `anthropic`：`anthropic` 是 zcode 内部由
+   `api.type` 映射出的 AI SDK provider kind（`toAiSdkProviderConfig`），两者别混。
+   它决定走 JAI 的哪条入站线；`baseUrl` 按上面「Base URL 怎么填」的表核对；`apiKey` 与 JAI 网关页一致。
 3. **zcode 的模型元数据**：`config.json` 里该 provider 的模型若没有 `reasoning` 字段，
    zcode 会按「无推理」发 `effort=none`（这就是本次触发条件）；补上档位声明或让 JAI 侧声明值域都可解。
 
@@ -121,4 +154,13 @@ JAI「技能」页点击 **复制技能包**，会把启用中的技能导出为
 - **✅ 2026-09-01 真机实测通过**：zcode 真实会话经 JAI 收到正常回复，实测走 **OpenAI Responses 入站**（`/v1/responses`，非本指南初稿预想的 Anthropic 线），流式/非流式均 200。以实测为准：zcode Provider 的配置形态决定协议线，两条线（Responses / Anthropic）网关均已支持并经真实流量验证。
 - **✅ 2026-09-18 真机实测通过（推理档位值域）**：上游直连复验 —— 不带 `reasoning_effort` → 200，
   带 `reasoning_effort:"low"` → 200；即修复后 JAI 会发出的两种形态（丢弃 / 收敛）上游都接受。
+- **✅ 2026-09-22 源码对账修复（zcode 开源后）**：结合 `zai-org/ZCode` 源码修掉三处适配缺陷 ——
+  ① **多段 `system` → Anthropic 上游**不再被判 400（按 IR 契约 `\n\n` 合并，与 openai /
+  responses / gemini 三个 encoder 对齐）。注意这条的触发面**不在 zcode 的 Anthropic 线本身**：
+  该 encoder 只在**上游族是 anthropic** 时被调用，而 Anthropic 入站 × Anthropic 上游是同族
+  直通（不过 encoder）；真正会踩的是「**别的入站族** × Anthropic 上游」—— 例如客户端在
+  chat-completions 线发了两条 `system` 消息；
+  ② 入站 **`thinking` 内容块**不再丢弃（跨族到 thinking 上游要靠这段文本重建
+  `reasoning_content`，丢掉会让上游在后续轮次校验 400）；
+  ③ **`output_config.effort` / `thinking.type`** 接入推理档位归一（见上文「两条线各自发的形态」）。
 - 如 zcode 后续版本调整协议形态，接入方式同步更新本指南。

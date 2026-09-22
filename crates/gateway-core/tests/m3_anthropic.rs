@@ -50,12 +50,17 @@ async fn spawn_anthropic_mock(
                     "content":[{"type":"text","text":"from-anthropic-mock"}],
                     "stop_reason":"end_turn","usage":{"input_tokens":11,"output_tokens":7}})
                 };
-                Response::builder()
+                let mut b = Response::builder()
                     .status(status)
                     .header("content-type", "application/json")
-                    .header("x-mock-tag", "anthropic")
-                    .body(Body::from(payload.to_string()))
-                    .unwrap()
+                    .header("x-mock-tag", "anthropic");
+                if status == 429 {
+                    // 限速提示 + 报障关联键：验证网关把白名单内的上游头回传给客户端
+                    b = b
+                        .header("retry-after", "7")
+                        .header("x-request-id", "mock-req-1");
+                }
+                b.body(Body::from(payload.to_string())).unwrap()
             },
         ),
     );
@@ -265,6 +270,40 @@ async fn anthropic_error_schema_on_ratelimit() {
     // 网关层按入站 Anthropic 方言渲染：type:error 形状（带 429 原状态）。
     assert_eq!(status, 429, "RateLimit 应在 Anthropic 线保留 429");
     assert_eq!(body["type"], "error", "Anthropic 错误形状最外层 type:error");
+}
+
+/// 2026-09-22（PI-Desktop 源码对账）：上游 429 的 `Retry-After` 必须回传给客户端。
+///
+/// 此前「全部渠道失败」的收尾只重建 status + content-type + body，上游响应头全丢
+/// （`grep -rn retry-after` 在整个 crate 里 0 命中）⇒ 客户端只能按自己的指数退避重试，
+/// 与上游的限速窗口错拍。PI-Desktop 的 `provider-retry` 会解析 `retry-after-ms` /
+/// `retry-after` 秒 / `retry-after` HTTP-date 三种形态，缺了它只能空转。
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_retry_after_is_forwarded_to_client() {
+    let fx = fixture(429).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/v1/messages", fx.port))
+        .bearer_auth(&fx.key)
+        .json(&messages_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 429);
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("7"),
+        "上游 Retry-After 应原样回传（客户端退避的唯一依据）"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("mock-req-1"),
+        "向上游报障的关联键也应回传"
+    );
 }
 
 /// Overloaded → HTTP 529 保留（验收 4 的 529 特例）

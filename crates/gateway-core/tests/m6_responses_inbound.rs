@@ -117,6 +117,35 @@ async fn spawn_openai_mock(mode: &'static str) -> u16 {
                         .to_string(),
                     ))
                     .unwrap(),
+                "stream_length_clipped_with_text" => {
+                    // P2 形状：有正文，但 completion_tokens 恰好等于客户端声明的
+                    // max_output_tokens（responses_body 声明 1024）→ 预算被真正用尽，
+                    // 用户拿到的是被掐短的答案。
+                    let sse = "data: {\"id\":\"chatcmpl_c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The fix is to move the let binding\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":280726,\"completion_tokens\":1024}}\n\n\
+                               data: [DONE]\n\n";
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
+                "stream_length_reasoning_only" => {
+                    // 真机形状（2026-09-22 基元律动/deepseek-flash，460k 上下文，
+                    // completion_tokens=16/96/165/250）：整轮输出预算被**推理**吃光 ——
+                    // 只有 reasoning_content 增量，正文一个字都没有，上游以
+                    // finish_reason="length" 收尾。客户端侧表现为
+                    // `EMPTY_MODEL_RESPONSE`「模型没有产生任何输出」。
+                    let sse = "data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Hmm, no obvious shadow at the function top level.\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Wait - line 1478 is my new code.\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":460817,\"completion_tokens\":165}}\n\n\
+                               data: [DONE]\n\n";
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
                 _ => Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
@@ -474,6 +503,99 @@ async fn responses_stream_length_is_incomplete_with_reason() {
         Some("max_tokens"),
         "request_logs.stop_reason 应为 max_tokens"
     );
+    // 有可见正文的截断是**正常**截断，不得被标成异常（否则日志被噪音淹没）
+    assert_eq!(
+        row.error_kind, None,
+        "有正文的 length 截断不该带 error_kind"
+    );
+}
+
+/// P0 回归：**零可见输出的截断轮**必须在 `request_logs` 里被标出来。
+///
+/// 真机形状（2026-09-22 基元律动/deepseek-flash，460k 上下文，completion_tokens
+/// 只有 16/96/165/250）：上游 `finish_reason:"length"`，整轮只有 reasoning_content，
+/// 正文为空、无工具调用。客户端（PI-Desktop）据此判 silent turn → 追加
+/// `<no_output_recovery>` 重跑一次 → 仍静默 → `EMPTY_MODEL_RESPONSE`，用户看到的是
+/// 一句无从下手的「模型没有产生任何输出」。
+///
+/// 网关侧本来就能分辨这件事（`finish_reason=length` + 可见输出为 0），此前却把它记成
+/// `error_kind=NULL` 的干净 200，于是 JAI 自己的日志页与统计里完全看不出异常 ——
+/// 本次排查只能靠手工比对 `request_logs` 才发现。
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_stream_length_without_visible_output_is_flagged() {
+    let fx = fixture("stream_length_reasoning_only").await;
+    let (status, text) = fx.post_responses_raw(responses_body("gpt-4o", true)).await;
+    assert_eq!(status, 200);
+
+    // 线上形状**不变**：仍是 incomplete + reason（截断不是错误，见
+    // responses.rs::finish_status 的注释 —— 标成错误会把一次截断放大成重试风暴）
+    assert!(text.contains("\"status\":\"incomplete\""), "{text}");
+    assert!(
+        text.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"),
+        "{text}"
+    );
+    // 本用例的上游整轮只有推理、没有正文 —— 这正是「客户端认为什么都没说」的成因
+    assert!(
+        !text.contains("output_text.delta"),
+        "本用例上游只有推理、不应有正文增量: {text}"
+    );
+    assert!(
+        text.contains("response.reasoning_summary_text.delta"),
+        "推理增量应当照常下发: {text}"
+    );
+
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200 && r.is_stream)
+        .expect("应有流式成功日志");
+    assert_eq!(row.stop_reason.as_deref(), Some("max_tokens"));
+    assert_eq!(
+        row.error_kind.as_deref(),
+        Some("OutputTruncatedEmpty"),
+        "零可见输出的截断轮必须被标记（否则日志/统计里与正常 200 无法区分）"
+    );
+    let summary = row.error_summary.as_deref().unwrap_or_default();
+    assert!(
+        summary.contains("没有任何可见输出"),
+        "摘要要说清「没有可见输出」: {summary}"
+    );
+    assert!(
+        summary.contains("max_output_tokens=1024"),
+        "摘要要带上本轮生效的输出预算: {summary}"
+    );
+}
+
+/// P2（转换路径，PI-Desktop 实际走的那条）：有正文且撞上预算上限 → `OutputBudgetClipped`。
+///
+/// 转换路径与直通路径共用 `truncation_diagnostic`，但**接线**是各自的（转换路径取
+/// `req.params.max_output_tokens` 与 IR 的 `usage.output_tokens`）—— 这里钉住接线。
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_stream_budget_clipped_with_text_is_flagged() {
+    let fx = fixture("stream_length_clipped_with_text").await;
+    let (status, text) = fx.post_responses_raw(responses_body("gpt-4o", true)).await;
+    assert_eq!(status, 200);
+    // 线上形状不变：仍是有正文的 incomplete
+    assert!(
+        text.contains("The fix is to move the let binding"),
+        "{text}"
+    );
+    assert!(text.contains("\"status\":\"incomplete\""), "{text}");
+
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200 && r.is_stream)
+        .expect("应有流式成功日志");
+    assert_eq!(row.route_mode, "converted");
+    assert_eq!(row.stop_reason.as_deref(), Some("max_tokens"));
+    assert_eq!(
+        row.error_kind.as_deref(),
+        Some("OutputBudgetClipped"),
+        "转换路径也要标出「被预算掐短」"
+    );
+    let summary = row.error_summary.as_deref().unwrap_or_default();
+    assert!(summary.contains("max_output_tokens=1024"), "{summary}");
 }
 
 /// 非流式同口径：截断 → `status:incomplete` + `incomplete_details.reason`，

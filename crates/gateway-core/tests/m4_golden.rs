@@ -5,7 +5,7 @@
 //! 完整的 decode(encode(ir))==ir 往返在 M5 集成层补全；本文件验证：
 //! 1. OpenAI 解码出的 IR 与 Anthropic/Gemini 编码后的语义一致（工具/文本/采样参数）
 //! 2. 多轮含 tool_result 的请求通过两族编码不丢消息
-//! 3. system 多段在 Anthropic 编码时报错（护栏），Gemini 编码合并
+//! 3. system 多段在所有出站族都按 IR 契约合并（`\n\n` 连接）
 
 use gateway_core::codec::anthropic as acodec;
 use gateway_core::codec::gemini as gcodec;
@@ -87,8 +87,14 @@ fn golden_ir_survives_gemini_encode() {
 }
 
 #[test]
-fn multi_system_anthropic_rejects_gemini_merges() {
-    let mut ir = CanonicalRequest {
+fn multi_system_segments_merge_in_every_outbound_family() {
+    // 2026-09-22：四个 encoder 统一按 IR 契约「多条 system 按序合并，以 \n\n 连接」
+    // （ir.rs 的 CanonicalRequest.system 注释）。Anthropic 此前是唯一对 >1 段直接 Err
+    // 的族 → 把上游完全能跑的请求在网关侧判成 400「system 段数为 N」。
+    // 多段 system 的常规来源是 openai 入站：每条 role=system 消息（以及 system 的
+    // 多段 content 数组）都会各成一段。HTTP 级回归用例见
+    // tests/m5_anthropic_inbound.rs 的 openai_chat_multi_system_merges_for_anthropic_upstream。
+    let ir = CanonicalRequest {
         model: "m".into(),
         system: vec!["sys1".into(), "sys2".into()],
         messages: vec![CanonMessage::text(Role::User, "x")],
@@ -98,13 +104,29 @@ fn multi_system_anthropic_rejects_gemini_merges() {
         stream: false,
         extensions: Default::default(),
     };
-    // Anthropic：多条 system 报错（护栏）
-    assert!(acodec::encode_request(&ir).is_err());
 
-    // Gemini：合并为一段
-    ir.system = vec!["sys1".into(), "sys2".into()];
-    let enc = gcodec::encode_request(&ir).unwrap();
-    assert_eq!(enc["systemInstruction"]["parts"][0]["text"], "sys1\n\nsys2");
+    let a = acodec::encode_request(&ir).unwrap();
+    assert_eq!(a["system"], "sys1\n\nsys2");
+
+    let g = gcodec::encode_request(&ir).unwrap();
+    assert_eq!(g["systemInstruction"]["parts"][0]["text"], "sys1\n\nsys2");
+
+    let o = openai::encode_request(&ir).unwrap();
+    assert_eq!(o["messages"][0]["role"], "system");
+    assert_eq!(o["messages"][0]["content"], "sys1\n\nsys2");
+
+    let r = gateway_core::codec::responses::encode_request(&ir).unwrap();
+    assert_eq!(r["instructions"], "sys1\n\nsys2");
+
+    // 单段保持原样、无 system 时不下发该字段
+    let mut one = ir.clone();
+    one.system = vec!["only".into()];
+    assert_eq!(acodec::encode_request(&one).unwrap()["system"], "only");
+    one.system = vec![];
+    assert!(acodec::encode_request(&one)
+        .unwrap()
+        .get("system")
+        .is_none());
 }
 
 #[test]

@@ -3,6 +3,171 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+### Fixed
+- **「零可见输出的截断轮」被记成干净的 200**（转换路径 + 直通路径都补上）：上游以
+  `finish_reason:"length"` 收尾、整轮只有 reasoning 增量而**正文为空、无工具调用**时，
+  收尾日志把 `error_kind` / `error_summary` 写死 `None` ⇒ 日志页与统计里它与一次正常 200
+  完全无法区分。而客户端（PI-Desktop 的 agent 循环）会把这轮判为 silent turn、追加
+  `<no_output_recovery>` 提示重跑一次，仍静默则报 `EMPTY_MODEL_RESPONSE` —— 用户只看到一句
+  无从下手的「模型没有产生任何输出」。**真机 2026-09-22**：基元律动/deepseek-flash，460k 上下文，
+  四条这样的轮次（completion_tokens 16/96/165/250）全被记成成功，排查只能靠手工比对
+  `request_logs` 才发现。现新增 `empty_truncation_diagnostic`：`stop_reason ∈
+  {max_tokens, safety}` 且整轮零可见输出（正文或工具调用；**推理不算可见**）时落
+  `error_kind = "OutputTruncatedEmpty"` + 可操作摘要（带本轮生效的输出预算与实际产出 token）。
+  - **转换路径**：`convert_streaming_response` 逐事件跟踪可见输出；「上游回整包 JSON →
+    补成 SSE」的 `deliver_synthesized_stream` 同口径。
+  - **直通路径**：新增 `VisibleOutputProbe` —— 字节级转发没有 IR，但可以按 `data:` 行切分后
+    复用各族已有的 `parse_stream_event` 判定「这一轮有没有产出用户看得见的东西」。刻意不用
+    关键字扫描（分不清 `"content":""` 与 `"content":"x"`，也分不清 `"tool_calls":null` 与
+    真正的工具调用），且**只读不写**：客户端收到的字节与上游发出的逐字节一致（有用例钉住）。
+  - **HTTP 状态码与线上形状都不变**（截断不是错误，见 `responses.rs::finish_status` 的注释：
+    标成错误会把一次截断放大成重试风暴）；**有正文 / 有工具调用的截断一律不标**，避免噪音。
+    两个方向都有反向用例，并已用「探针瞎了」「诊断关掉」两种变异验证过不是空洞通过。
+- **直通流式的 `request_logs.tool_calls` 此前恒 0**：`streaming_response` 落库时写死 `0`
+  （注释理由是「字节直通不解析 SSE 语义」），于是「模型到底有没有发起工具调用」在直通行上
+  看不出来，只能去翻转换路径的行。现由 `PassthroughStreamProbe` 按 IR 口径（工具调用 id
+  **去重**）计数，与非流式直通的 `count_tool_calls_in_body` 对齐；`client disconnected` /
+  上游断流 / 空闲超时几条收尾日志也一并填上探针的实时计数。探针因此必须**全程**解析
+  （不能像只判可见输出那样见到正文就提前收工 —— 工具调用可能出现在正文之后），
+  每帧一次小对象 JSON 解析，与转换路径同量级；病态输入（无换行的超限巨块）放弃观测，
+  该列可能偏低（已写进 `LogRowView::tool_calls` 的文档）。
+- **「被预算掐短」单独一档**（P2）：有可见输出、但**确实撞上预算上限**
+  （`output_tokens >= max_output_tokens`）时落 `error_kind = "OutputBudgetClipped"`
+  —— 用户拿到的是被掐短的答案，不像零输出那样让客户端整轮报废，所以与
+  `OutputTruncatedEmpty` 分档（同一条日志行、同一份判定函数 `truncation_diagnostic`，
+  不新增行类型、不动响应头、不改状态码）。
+  **刻意要求「撞上预算」而不是「只要 `length` + 有正文」**：后者会把客户端**故意**设小预算
+  的场景也标成异常（`max_tokens=100` 拿到 100 token 正文是照做，不是故障），而 agent 客户端
+  在窗口边缘会把预算压到几十 token ⇒ 每一轮都命中、日志被噪音淹没。真机频率佐证：全库
+  7995 行里 `stop_reason=max_tokens` 只有 11 行（0.14%）。已知保守缺口（宁可漏判）：
+  客户端未声明预算时不触发；上游在声明预算**之前**就自行截断时不触发。
+- **零可见输出的截断「不编进 Responses 协议」（P3 决策记录，未实现）**：这种轮次对 agent
+  客户端等于丢一轮，但**刻意只走日志、不走协议**。理由：① 对现有客户端零收益（PI-Desktop
+  的 Responses 解析器只读 `status` / `incomplete_details` / `output` / `usage`，加字段不改变
+  用户看到的东西，要兑现必须同时改客户端，是跨仓库协同）；② 客户端用已有信息就能解决
+  （它已经有 `stopReason:"length"` + 空正文，可在本地给出「预算被推理耗尽」）；
+  ③ 改响应体形状有实测过的风险（`openai@6.x` 只在 `response.completed` 上累积快照是实测结论，
+  未知字段态度未验证；`metadata` 是用户传入原样回显的字段，网关写会冲突；`status` /
+  `incomplete_details.reason` 的组合绝不能动，否则复现「一次截断被放大成重试风暴」）。
+  详见 `codec::responses` 里 `TERMINAL_EVENT` 上方的决策记录。
+- **刻意不接管 `models.max_output_tokens`**（决策记录）：这一列是模型元数据，不是网关要替
+  客户端执行的策略。曾试过两条路，都撤掉了：
+  - 在 `/v1/models` 里发布成 `maxOutputTokens` —— 客户端会直接采纳为自己的输出上限
+    （PI-Desktop 就读走），而输出预算是客户端上下文规划的一部分；网关替它决定等于从远端
+    插手 agent 循环，本次真机故障（预算被压到几十个 token → 整轮耗在推理上 → 正文一个字
+    不出）正是这条链路的产物。
+  - 请求侧缺省时按该列兜底 —— 会让任何省略 `max_output_tokens` 的客户端被静默封顶，同样是
+    把网关的判断塞进客户端（对 Anthropic 上游那类「缺字段即 400」的场景，正确做法是让
+    上游的错误如实冒泡，而不是网关替客户端编一个值）。
+  两条都不做：网关只做转发与诊断，不发明预算。`/v1/models` 仍只发布原本就有的
+  `contextWindow`（语义未变）。诊断摘要里的输出预算取自**客户端自己声明的值**
+  （`PeekRequest` 只读，不改写）。
+- **多段 `system` → Anthropic 上游会被整体判 400**：`anthropic::encode_request` 对
+  `req.system.len() > 1` 直接 `Err` → `proxy.rs` 把它变成 400「system 段数为 N，跨族转换仅
+  支持单条合并 system」。**触发拓扑**：该 encoder 只在**上游族是 anthropic** 时被调用，
+  而 Anthropic 入站 × Anthropic 上游是同族直通（不过 encoder），所以真正伤到的是
+  「**别的入站族** × Anthropic 上游」—— `openai::decode_request` 对每条 `role=system`
+  消息（以及 system 的多段 content 数组）各 push 一段 `system`，于是「客户端发了两条
+  system」就把上游完全能跑的请求在网关侧判死。现按 IR 契约（`ir.rs` 的
+  `CanonicalRequest.system` 注释）改为 `\n\n` 合并，与 openai / responses / gemini 三个
+  encoder 对齐。
+- **Anthropic 入站的 `thinking` 内容块被丢弃**：`decode_request` 对 `type:"thinking"` 只打
+  WARN 后丢块 —— 而 `openai.rs` / `responses.rs` 两个入站族早已产出 `Block::Thinking`
+  （正是 `responses.rs` 里 76cb5093 实测「跨族出站缺 `reasoning_content` → thinking 上游 400」
+  那次修复）。三个入站族口径现已一致；`redacted_thinking` 的 `data` 原样存入 signature 位。
+- **`output_config` 在代码库里没有任何引用**：zcode 的 `anthropic-messages` 内置规则表以
+  `{"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}` 的形态注入档位，
+  而该字段连「未建模已丢弃」的 `CapabilityWarn` 都不产生 → 跨族时用户选的档位**静默丢失**。
+  现 `output_config.effort` 读成 `reasoning_effort`，`thinking.type:"disabled"` 归一为 `none`；
+  `enabled` / `adaptive` 不带档位时**不臆断**成具体档位（保持不干预）。
+  值域归一仍只在出站族为 Native（openai 系）时生效，直通 / 跨族两条路径语义一致。
+  （源码对账依据：`zai-org/ZCode` 的 `packages/model-option-map` + `config/provider/zcode-builtin.json`）
+
+### 第二轮：PI-Desktop 源码对账（2026-09-22）
+
+- **跨族 + Responses 上游 + 流式 = 静默空轮**：`convert_streaming_response` 的
+  `openai_responses` 分支**没有解析器**，把每个 `data:` 行直接 `continue` 丢弃 ⇒
+  `pending_finish` 永不置位、`render_frame` 永不调用，客户端只拿到
+  「HTTP 200 + text/event-stream + **零帧**」（agent 客户端等于丢一轮且不报错）。
+  非流式路径反而是好的（`convert_plain_response` 有 `responses::parse_response`），所以症状极隐蔽。
+  现补 `responses::parse_stream_event`（按官方 SSE 形状解析成 IR StreamEvent，`stop_reason` /
+  usage 与 `parse_response` 同一套口径）。
+- **上游忽略 `stream: true` 时客户端拿到空流**：分发原先只看 `req.stream`，
+  于是「客户端要流式、上游回整包 JSON」的请求被喂进 SSE 解析器。现改为**按上游实际
+  content-type 决定转换器**（`ct_is_sse`），并把 `req.stream` 传给
+  `convert_plain_response(as_stream)`：整包解析后用**同一套渲染器**补成入站 SSE，
+  收尾口径（Anthropic `message_stop` / 其余 `[DONE]`）与流式路径的自然结束分支一致。
+- **上游错误响应头被全部丢弃（`Retry-After` 退避提示丢失）**：全渠道失败与确定性错误的收尾
+  只重建 status + content-type + body（`grep -rn retry-after` 在整个 crate 里 0 命中）⇒
+  客户端只能按自己的指数退避重试，与上游限速窗口错拍（对已限速的上游**重试放大**）。
+  现按白名单回传 `retry-after` / `retry-after-ms` / `x-request-id`。
+- **客户端历史里的推理此前完全没读**：`openai::decode_request` 的 assistant 分支不看
+  `reasoning_content`（该区 `grep reasoning` 0 命中）⇒ 跨族到 thinking 上游时历史推理丢失。
+  现读入为 `Block::Thinking`，并把**实际命中的线上字段名**记进 `signature`。
+- **只认一种推理字段名**：线上有三种拼写（`reasoning_content` / `reasoning_text` /
+  `reasoning`，与 PI-Desktop 的 `COMPLETIONS_REASONING_SIGNATURES` 同一份清单）。
+  编码侧现在**原样回传命中的那个名字** —— 换名字会被严格中继当成「没有回传推理」而 400。
+  `signature` 做白名单校验：Anthropic 入站填的是加密签名串，不会被误当成字段名。
+- **显式空串推理被丢弃**：客户端**显式发过** `reasoning_content: ""` 时保留「字段存在」
+  这一事实（官方 DeepSeek 接受 `""`），但不发明模型没产生过的内容（客户端没发过就仍不发）。
+- **`role: "developer"` 在两条 OpenAI 系入站都被处理错**：
+  chat-completions 侧落到 `other` 分支被**整条丢弃**（客户端用 developer 传 system prompt 时
+  指令静默消失，只剩一条 CapabilityWarn）；responses 侧被折成 **User 消息**（指令语义降级成
+  用户轮次）。现两者都归一到 system 段 / `instructions`。
+
+### 第三轮：推理回放兼容 —— **自适应**方案（2026-09-22）
+
+**问题**：DeepSeek 系 thinking 模型要求**每个回放的 assistant 消息都带推理字段**，否则 400；
+官方 `deepseek.com` 接受空串 `""`，但部分第三方中继**拒绝空串、要求非空值**（PI-Desktop
+`#296` 记录的 OpenCode 系）。而客户端**本来就会**裁掉历史推理：PI-Desktop 只保留最近 3 轮
+思考（`MAX_RETAINED_REASONING_TURNS = 3`）、跨模型回放主动删、上下文压缩后、纯工具调用轮、
+模型那轮确实没思考。于是跨族转换（入站 Anthropic/Responses × 上游 `openai_compat`）出站时
+很多 assistant 轮次**没有推理字段** → 严格中继 400。
+
+**为什么不做「渠道开关」**：上一轮把这条留成了「需要 0013 迁移 + 渠道级显式开关」的产品决策。
+但上游可能很多、且随时新增，靠人配配不完、靠猜模型名会漏（PI-Desktop 自己的注释就承认
+「聚合器和自定义网关匹配不上」）。改成**三层、逐层收紧的自适应**，**零迁移、零签名变更**：
+
+1. **推断**（`codec::replay::infer_from_channel`，零额外往返）：渠道的模型名 / base_url /
+   供应商名带 `deepseek` 字样时，直接按「需要非空回放」处理。保守，不外推「thinking 模型都算」。
+2. **学习**（`Registry` + 上游真实报错）：没猜中的上游，第一次被它 400 后**识别报错 → 记下该
+   渠道 → 用兼容原地重试同一请求**，客户端只看到成功。**只有重试成功才保留学习结果**。
+3. **遗忘 / 抑制**：已开启的渠道若再次被同类错误拒绝 ⇒ 这个开关对它无效 → 记 `Some(false)`，
+   之后不再干预 —— 既避免反复塞占位把本来能跑的配置改坏，也**不抖动**
+   （只在未学习时判断一次，落到 `Some(_)` 后不再改变）。
+
+标记是**供应商级**的（兼容性是中转端点的属性），落库用现成的 `meta` KV 表
+（`store::meta_get/meta_set/meta_delete`）⇒ **不需要新迁移**。规划层通过 `req.extensions`
+（`__jai_reasoning_replay`，与既有 `__jai_validate_output` / `__jai_tool_identities` 同一套机制）
+告诉 `openai` 编码器，所以四个 `encode_request` 的签名**一个都没改**。
+
+- **跨族转换路径**：`openai::encode_request` 在该轮历史确无推理时补
+  `reasoning_content: "[reasoning not retained for this turn]"`（占位符默认关闭，
+  只有推断或学习命中才出现 —— 网关不发明模型没产生过的内容）。
+- **同族直通路径**：字节转发不经编码器，所以在原始 JSON 上做手术
+  （`codec::replay::inject_placeholders`）：只给**三个已知拼写都没有**的 assistant 消息补
+  `reasoning_content`，客户端带过的推理与 user / tool 消息一字不动；解析失败或一条都不缺则
+  保持原字节。
+
+**回归证明**：`tests/reasoning_replay_passthrough.rs`（直通路径）+ `tests/m5_anthropic_inbound.rs`
+的 `adaptive_reasoning_replay_learns_and_retries_transparently`（跨族路径）都验证「**旧行为
+把上游 400 原样交给客户端 / 新行为学习后原地重试，客户端只看到 200**」；另有 8 个单测覆盖
+推断边界、报错识别的窄匹配、三态持久化与「不抖动」。日志对此有 `CapabilityWarn`
+（「上游要求回放推理（HTTP 400）→ 已记下该渠道…正在重试同一请求」）。
+
+**已知边界**：占位符是**中性的英文串**，不是协议常量；上游若因其它原因（非「缺推理字段」）
+报 4xx，`is_replay_rejection` 的窄匹配不会误判，网关不干预。
+
+### Docs
+- `docs/zcode接入.md`：`api.type` 枚举值更正为 `anthropic-messages`（`anthropic` 是 zcode 内部
+  映射出的 AI SDK provider kind，两者不同）；新增「Base URL 怎么填」——三条协议线的 URL 拼法不同
+  （`anthropic-messages` 自动补 `/v1`，另两条**必须显式带 `/v1`**，否则打到 `/responses` 直接 404）；
+  新增「两条线各自发的形态」对照表。
+- `docs/design/protocol-ir.md`：§10 补「入站方向」档位映射表；§11-3 由「thinking/signature 跨族
+  仅占位存储不转换」改为「已实现」（文档此前落后于 openai / responses 侧代码）；
+  §11 新增「Responses 上游流式」条目（由「暂不支持」改为已支持 + 补流兜底）；
+  §11-8「严格中继要求非空推理回放」由「未做（需渠道级开关 + 0013 迁移）」改为「已实现（自适应方案）」，
+  并指向新增的 `codec::replay` 模块。
 
 ## [0.2.13] - 2026-09-21
 

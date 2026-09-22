@@ -191,6 +191,9 @@ pub struct GatewayCtx {
     pub rate: Arc<super::ratelimit::AuthRateLimiter>,
     pub version: String,
     pub started_at_ms: u64,
+    /// 推理回放兼容的**自适应**标记表（`codec::replay`）：推断 + 学习 + 遗忘。
+    /// 持久化在 `meta` 表，这里只是写穿缓存。
+    pub replay: Arc<crate::codec::replay::Registry>,
 }
 
 impl GatewayCtx {
@@ -206,6 +209,7 @@ impl GatewayCtx {
             rate: Arc::new(super::ratelimit::AuthRateLimiter::new()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at_ms: store::now_ms() as u64,
+            replay: Arc::new(crate::codec::replay::Registry::new()),
         }
     }
 }
@@ -544,6 +548,195 @@ fn keep_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
     }
 }
 
+/// **截断诊断**：`stop_reason` 属截断类时，判断这一轮的截断有没有真的伤到用户。
+///
+/// 两档，同一份判定、同一条日志行（不新增行类型、不动响应头、不改 HTTP 状态码）：
+///
+/// - **`OutputTruncatedEmpty`（零可见输出）**：整轮没有产出任何可见内容（正文为空、且没有
+///   工具调用），而 reasoning/thinking 有内容。这种轮次对客户端等于「模型什么都没说」——
+///   PI-Desktop 的 agent 循环会把它判为 silent turn、追加 `<no_output_recovery>` 提示重跑
+///   一次，仍静默则报 `EMPTY_MODEL_RESPONSE`，用户看到的是一句无从下手的「模型没有产生任何
+///   输出」。而网关侧**本来就能分辨**：上游明确给了 `finish_reason:"length"`，且可见输出是 0。
+///   此前这条信息只落在 `stop_reason` 一个字段上，`error_kind` 恒为 NULL ⇒ 日志与统计里它
+///   与一次正常 200 完全无法区分（2026-09-22 真机：基元律动/deepseek-flash，460k 上下文，
+///   output=16/96/165/250，四条全被记成成功，只能靠手工比对 `request_logs` 才看出来）。
+///
+/// - **`OutputBudgetClipped`（被预算掐短）**：有可见输出，但**确实撞上了预算上限**
+///   （`output_tokens >= output_budget`）。用户拿到的是被掐短的答案 —— 不像零输出那样让
+///   客户端整轮报废，所以严重度更低，但同样值得知道「是哪一轮、被什么掐的」。
+///
+/// 为什么第二档要求「撞上预算」而不是「只要 `length` + 有正文」：后者会把客户端**故意**
+/// 设小预算的场景也标成异常（`max_tokens=100` 拿到 100 token 正文是照做，不是故障），
+/// 而 agent 客户端在窗口边缘会把预算压到几十 token ⇒ 每一轮都命中，日志被噪音淹没。
+/// 真机频率佐证：全库 7995 行里 `stop_reason=max_tokens` 只有 11 行（0.14%）。
+///
+/// 已知的保守缺口（宁可漏判，绝不误判）：`output_budget` 未知时第二档不触发；上游若在
+/// **客户端声明的预算之前**就自行截断（`output_tokens < output_budget`），也不触发。
+///
+/// 返回 `(error_kind, summary)`；不适用时返回 `None`。**不改 HTTP 状态码** —— 上游确实
+/// 返回了 200，协议上没错，这里只补可观测性（与 `SseParseWarn` / `CapabilityWarn` 同一档）。
+///
+/// `stop_reason` 取 IR 的**日志名**口径（见 [`log_stop_reason`]）：转换路径给
+/// `StopReason::as_log_str()`，直通路径给 [`StopReasonProbe`] 的扫描结果，两条路径因此
+/// 共用同一份判定。
+fn truncation_diagnostic(
+    stop_reason: Option<&str>,
+    saw_visible_output: bool,
+    output_budget: Option<u32>,
+    output_tokens: u64,
+) -> Option<(&'static str, String)> {
+    let budget = match output_budget {
+        Some(b) => format!("本轮 max_output_tokens={b}"),
+        None => "本轮请求未声明 max_output_tokens".to_string(),
+    };
+
+    match stop_reason {
+        // ---- 安全拦截：只有「零可见输出」才是异常（有正文说明拦截没生效到正文上）----
+        Some("safety") if !saw_visible_output => Some((
+            "OutputTruncatedEmpty",
+            format!(
+                "上游以 finish_reason=content_filter 拦截，且本轮没有任何可见输出（正文为空、\
+                 无工具调用）——客户端会判为「模型什么都没说」。{budget}。\
+                 处理：检查内容策略，或换用不触发拦截的输入。"
+            ),
+        )),
+
+        // ---- 长度截断：分「零输出」与「被掐短」两档 ----
+        Some("max_tokens") if !saw_visible_output => Some((
+            "OutputTruncatedEmpty",
+            format!(
+                "上游以 finish_reason=length 截断（输出预算耗尽），但本轮没有任何可见输出\
+                 （正文为空、无工具调用）——客户端会判为「模型什么都没说」。{budget}，\
+                 实际产出 {output_tokens} token（可能全耗在推理里）。\
+                 处理：压缩上下文后重试，或提高该模型的输出预算。"
+            ),
+        )),
+
+        Some("max_tokens") if saw_visible_output => {
+            // 只有「确实撞上上限」才算被掐短，见上方文档注释
+            let budget_n = output_budget?;
+            if output_tokens < u64::from(budget_n) {
+                return None;
+            }
+            Some((
+                "OutputBudgetClipped",
+                format!(
+                    "上游以 finish_reason=length 截断，且本轮有可见输出——用户拿到的是被掐短\
+                     的答案。{budget}，实际产出 {output_tokens} token，说明预算被真正用尽。\
+                     处理：提高该模型的输出预算，或让客户端在贴近窗口时先压缩上下文。"
+                ),
+            ))
+        }
+
+        _ => None,
+    }
+}
+
+/// 直通流式的**观测探针**：既回答「这一轮有没有产出用户看得见的东西」，也数出工具调用。
+///
+/// 直通是**字节级转发**（验收：上游收到的 body SHA-256 == 客户端发出值），探针只**看**
+/// 不参与转发，一个字节都不改写。它补的是两件此前直通流式拿不到的信息：
+/// 1. **可见输出**：收尾日志要能分辨「零可见输出的截断轮」与「被预算掐短」。转换路径已由
+///    [`truncation_diagnostic`] 覆盖，直通路径此前没有任何可见输出信息，于是同样形状的
+///    轮次在那里仍是 `error_kind=NULL` 的干净 200。
+/// 2. **工具调用计数**：`request_logs.tool_calls` 在直通流式下此前硬编码 0（「字节直通不
+///    解析 SSE 语义」），于是「模型到底有没有发起工具调用」在直通行上看不出来，只能去翻
+///    转换路径的行。非流式直通早有 `count_tool_calls_in_body`，现在流式对齐。
+///
+/// 实现取「按 `data:` 行切分 + 复用各族已有的 `parse_stream_event`」，而不是关键字扫描：
+/// 关键字扫描分不清 `"content":""`（空增量）与 `"content":"x"`，也分不清
+/// `"tool_calls":null` 与真正的工具调用 —— 而误判的代价是把正常轮次标成异常、把工具调用
+/// 数错。真机上游（tokenrhythm）**每帧都带 `"content":""`**，正是关键字扫描会翻车的地方。
+///
+/// 代价与边界：
+/// - 必须**全程**解析，不能像「只判可见输出」那样见到正文就提前收工 —— 工具调用可能出现在
+///   正文之后，提前退出会漏数。每帧一次小对象 JSON 解析，与转换路径同量级。
+/// - 解析失败一律当「没看到」（宁可漏判，绝不误判）；行缓冲超限（无换行的巨块）即放弃观测
+///   并停止累积，绝不让观测拖累转发（此时 `tool_calls` 可能偏低）。
+struct PassthroughStreamProbe {
+    wire: InboundWire,
+    /// 未成行的残留字节（按 `\n` 切帧）
+    buf: Vec<u8>,
+    /// 已确认产出过可见内容（正文或工具调用）
+    seen_visible: bool,
+    /// 本回合 assistant 发起的工具调用 id（**按 id 去重**，与转换路径同一口径：
+    /// 部分上游每帧都带 Start 且 index 恒为 0，按 id 去重才不会重复计数）
+    tool_call_ids: std::collections::HashSet<String>,
+    /// 已放弃观测（病态输入）
+    given_up: bool,
+}
+
+impl PassthroughStreamProbe {
+    fn new(wire: InboundWire) -> Self {
+        Self {
+            wire,
+            buf: Vec::new(),
+            seen_visible: false,
+            tool_call_ids: std::collections::HashSet::new(),
+            given_up: false,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.given_up {
+            return;
+        }
+        self.buf.extend_from_slice(chunk);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let line = line.strip_suffix(b"\r").unwrap_or(&line);
+            if !line.starts_with(b"data:") {
+                continue;
+            }
+            let payload = trim_ascii(&line[5..]);
+            if payload.is_empty() || payload == b"[DONE]" {
+                continue;
+            }
+            self.observe(payload);
+        }
+        if self.buf.len() > MAX_SSE_LINE_BYTES {
+            self.given_up = true;
+            self.buf.clear();
+        }
+    }
+
+    /// 观察一帧 `data:` 载荷：累计工具调用 id，并判定是否产出可见内容。
+    ///
+    /// **推理/thinking 不算可见输出** —— 客户端看不到推理，只有推理的一轮对用户等于
+    /// 「什么都没说」（真机故障形状，见 [`truncation_diagnostic`]）。
+    fn observe(&mut self, payload: &[u8]) {
+        use crate::codec::ir::StreamEvent as Ev;
+        let parsed = match self.wire {
+            InboundWire::OpenAi | InboundWire::Completions => {
+                crate::codec::openai::parse_stream_event(payload)
+            }
+            InboundWire::Anthropic => crate::codec::anthropic::parse_stream_event(payload),
+            InboundWire::Responses => crate::codec::responses::parse_stream_event(payload),
+        };
+        let events = match parsed {
+            Ok(events) => events,
+            Err(_) => return,
+        };
+        for ev in &events {
+            match ev {
+                Ev::TextDelta { text } => {
+                    if !text.trim().is_empty() {
+                        self.seen_visible = true;
+                    }
+                }
+                Ev::ToolCallStart { id, .. } => {
+                    self.seen_visible = true;
+                    if !id.is_empty() {
+                        self.tool_call_ids.insert(id.clone());
+                    }
+                }
+                Ev::ToolCallArgsDelta { .. } => self.seen_visible = true,
+                _ => {}
+            }
+        }
+    }
+}
+
 fn empty_resp(status: StatusCode) -> Response {
     (status, Json(json!({}))).into_response()
 }
@@ -805,6 +998,13 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
                         legacy.map(|v| v != 0),
                     );
                     // 仅追加字段，旧客户端不受影响：contextWindow / supportsMultimodal 语义未变。
+                    //
+                    // 刻意**不**发布 `models.max_output_tokens`：那一列在本仓库里是「模型元数据」，
+                    // 不是网关要替客户端执行的策略。发布它等于让客户端把它当自己的输出上限
+                    // （PI-Desktop 就会读走并采纳），而网关一旦替客户端决定输出预算，就等于
+                    // 从上游远端插手了 agent 的上下文规划 —— 本次真机故障（预算被压到几十个
+                    // token → 模型把整轮耗在推理上 → 正文一个字不出）正是这条链路的产物。
+                    // 网关只做转发与诊断，不发明预算。
                     json!({
                         "id": format!("{owner}/{id}"),
                         "object": "model",
@@ -853,9 +1053,16 @@ enum Attempt {
 }
 
 /// 可直接回传的上游错误响应（保留原始状态码与方言形状）。
+/// 上游错误响应里值得回传给客户端的头（白名单，见 [`FORWARD_ERROR_HEADERS`]）。
+///
+/// 只在错误路径上用；正常响应走各自的转换/直通渲染，不经过这里。
+const FORWARD_ERROR_HEADERS: [&str; 3] = ["retry-after", "retry-after-ms", "x-request-id"];
+
 struct UpstreamError {
     status: StatusCode,
     content_type: Option<HeaderValue>,
+    /// 白名单内的上游响应头（目前是退避头 + 报障关联键）
+    headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
 }
 
@@ -1051,7 +1258,10 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             continue;
         }
         if cand.family != wire.family() {
-            match try_converted_candidate(&ctx, wire, &peeked, cand, &body, started).await {
+            // 推理回放兼容的**自适应**一环在 `try_converted_candidate` 的错误分类处
+            // （400 走 `Stop` 直接交付，不会冒泡到这里），这里只做常规分类处理。
+            let attempt = try_converted_candidate(&ctx, wire, &peeked, cand, &body, started).await;
+            match attempt {
                 Attempt::Delivered(resp) => return resp,
                 Attempt::Failed {
                     kind,
@@ -1109,6 +1319,11 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             Some(ct) => b.header(header::CONTENT_TYPE, ct),
             None => b.header(header::CONTENT_TYPE, "application/json"),
         };
+        // 回传退避头：上游 429/503 的 Retry-After 是客户端退避的唯一依据，
+        // 此前这里只重建 status + content-type，头全丢 → 客户端退避与上游错拍。
+        for (name, value) in &err.headers {
+            b = b.header(name, value);
+        }
         return b
             .body(Body::from(err.body))
             .unwrap_or_else(|_| empty_resp(err.status));
@@ -1190,6 +1405,7 @@ fn rewrite_body_model(body: &Bytes, new_model: &str) -> Bytes {
 /// 两级都没声明 → `None`，调用方短路，行为与旧版一致（网关不发明限制）。
 fn channel_policy_of(
     cand: &store::RouteCandidate,
+    reasoning_replay: bool,
 ) -> Option<crate::codec::capability::ChannelPolicy> {
     let policy = crate::codec::capability::ChannelPolicy {
         effort: crate::codec::capability::EffortPolicy::new(
@@ -1200,6 +1416,7 @@ fn channel_policy_of(
             .max_tools
             .and_then(|n| usize::try_from(n).ok())
             .filter(|n| *n > 0),
+        reasoning_replay,
     };
     (!policy.is_empty()).then_some(policy)
 }
@@ -1214,6 +1431,9 @@ async fn try_candidate(
     inbound_headers: &HeaderMap,
     started: Instant,
 ) -> Attempt {
+    // 原始入站字节：推理回放兼容需要**用原始请求重试一次**（重试时 `replay` 标记已学到，
+    // 重新走一遍这里的注入逻辑），所以必须在 `body` 被改写结果遮蔽前留一份。
+    let raw_body = body;
     // ---- 取上游密钥 ----
     let secret = match cand.api_key.as_deref() {
         Some(k) => k.to_string(),
@@ -1254,9 +1474,13 @@ async fn try_candidate(
     // 真机故障即此两例：`reasoning_effort:"none"` 被原样透传给只认 low..max 的上游
     // → 400 UNSUPPORTED_FIELD；140 个工具被网关自己的 128 硬默认拦掉 → 400
     // tools_limit_exceeded（上游实际接受）。未声明的渠道整段短路（保持原始字节）。
+    // 推理回放（自适应，见 `codec::replay`）：同族直通不做编解码，`openai` 编码器插不上
+    // 手，所以这里在**已确认需要**（推断命中或学习命中）时直接改 JSON —— 未命中时
+    // policy 为 `None`，整段短路，字节原样（与旧版一致，网关不发明字段）。
+    let replay_needed = crate::codec::replay::enabled_for(&ctx.replay, &ctx.db, cand);
     let body = match (
         crate::codec::Family::from_db_str(&cand.family),
-        channel_policy_of(cand),
+        channel_policy_of(cand, replay_needed),
     ) {
         (Some(family), Some(policy)) => {
             // 工具数上限：声明了就拦（与跨族路径同一语义、同一错误码）
@@ -1318,7 +1542,7 @@ async fn try_candidate(
                     }
                 }
             }
-            match policy.effort.as_ref() {
+            let body = match policy.effort.as_ref() {
                 Some(effort) => {
                     match crate::effort::normalize_body(&body, family, &effort.levels) {
                         Some(next) => Bytes::from(next),
@@ -1326,6 +1550,15 @@ async fn try_candidate(
                     }
                 }
                 None => body,
+            };
+            // 推理回放：给缺推理字段的 assistant 消息补上非空占位（只在已确认需要时）。
+            if policy.reasoning_replay {
+                match crate::codec::replay::inject_placeholders(&body) {
+                    Some(next) => Bytes::from(next),
+                    None => body,
+                }
+            } else {
+                body
             }
         }
         _ => body,
@@ -1406,6 +1639,17 @@ async fn try_candidate(
     if !up_status.is_success() {
         // 先取头再消费 body（bytes() 会拿走 Response 的所有权）
         let upstream_ct = resp.headers().get(header::CONTENT_TYPE).cloned();
+        // 错误响应头白名单：退避依据（PI-Desktop / zcode 都会解析 retry-after /
+        // retry-after-ms，缺了它们客户端只能按自己的指数退避重试 → 对已限速的上游
+        // 重试放大）+ 向上游报障的关联键。其余上游头一律不回传。
+        let upstream_headers: Vec<(HeaderName, HeaderValue)> = FORWARD_ERROR_HEADERS
+            .iter()
+            .filter_map(|name| {
+                resp.headers()
+                    .get(*name)
+                    .map(|v| (HeaderName::from_static(name), v.clone()))
+            })
+            .collect();
         let mut bytes = resp.bytes().await.unwrap_or_default();
         if bytes.len() > MAX_ERROR_BODY {
             bytes.truncate(MAX_ERROR_BODY);
@@ -1413,6 +1657,51 @@ async fn try_candidate(
         let hint = String::from_utf8_lossy(&bytes).into_owned();
         let snippet: String = hint.chars().take(240).collect();
 
+        // 推理回放兼容的**自适应**一环（`codec::replay`）：直通路径同样要能「识别报错 →
+        // 记下该渠道 → 用兼容原地重试一次」。400 会落到下面的 `Stop` 分支**直接交付**
+        // （不冒泡到 `dispatch` 的 `Failed`），所以钩子必须在这里。
+        if crate::codec::replay::is_replay_rejection(up_status.as_u16(), &snippet)
+            && crate::codec::replay::should_retry_after_rejection(&ctx.replay, &ctx.db, cand)
+        {
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                cand.upstream_model_id.clone(),
+                up_status.as_u16() as i64,
+                ms_since(started),
+                peeked.stream,
+                None,
+                0,
+                Some("CapabilityWarn".into()),
+                Some(format!(
+                    "{}：上游要求回放推理（HTTP {}）→ 已记下该渠道并要求非空推理回放，正在重试同一请求",
+                    cand.provider_name,
+                    up_status.as_u16()
+                )),
+                None,
+            );
+            let retried = Box::pin(try_candidate(
+                ctx,
+                wire,
+                peeked,
+                cand,
+                raw_body,
+                inbound_headers,
+                started,
+            ))
+            .await;
+            // 重试仍以同一状态码被拒 ⇒ 这个开关对它无效 → 抑制，避免下次再试
+            if let Attempt::Delivered(r) = &retried {
+                if r.status() == up_status {
+                    ctx.replay.suppress(&ctx.db, &cand.provider_id);
+                }
+            }
+            return retried;
+        }
+
+        // 错误分类：可转移 → 下一渠道；确定性错误 → 原样返回
         // 错误分类：可转移 → 下一渠道；确定性错误 → 原样返回
         match router::classify_status(up_status.as_u16(), &snippet) {
             AttemptVerdict::Stop { kind } => {
@@ -1441,6 +1730,10 @@ async fn try_candidate(
                     Some(ct) => b.header(header::CONTENT_TYPE, ct),
                     None => b.header(header::CONTENT_TYPE, "application/json"),
                 };
+                // 确定性错误也带上退避头（上游 429 被归类为 Stop 时客户端同样需要）
+                for (name, value) in &upstream_headers {
+                    b = b.header(name, value);
+                }
                 return Attempt::Delivered(
                     b.body(Body::from(bytes))
                         .unwrap_or_else(|_| empty_resp(up_status)),
@@ -1476,6 +1769,7 @@ async fn try_candidate(
                     last_http: Some(UpstreamError {
                         status: up_status,
                         content_type: upstream_ct,
+                        headers: upstream_headers,
                         body: bytes,
                     }),
                 };
@@ -1535,6 +1829,9 @@ async fn try_converted_candidate(
     body: &Bytes,
     started: Instant,
 ) -> Attempt {
+    // 原始入站字节：推理回放兼容需要**用原始请求重试一次**（重试会重新解码 + 重新
+    // 规划，此时 `replay` 标记已学到），所以必须在 `body` 被编码结果遮蔽前留一份。
+    let raw_body = body;
     // 1) 解码入站（按入站线分发）
     let mut req = match wire {
         InboundWire::OpenAi => match crate::codec::openai::decode_request(body) {
@@ -1619,7 +1916,12 @@ async fn try_converted_candidate(
     // 取代原 response_format 硬编码 400 与 extension_warn_note 汇总，拒绝语义与错误码保持
     if let Some(family) = crate::codec::Family::from_db_str(&cand.family) {
         // 渠道声明的推理档位值域（0011）：未声明时 policy 为 None，行为与旧版一致
-        let policy = channel_policy_of(cand);
+        // 渠道声明的推理档位值域（0011）+ 推理回放兼容（自适应，codec::replay）：
+        // 两者都未命中时 policy 为 None，行为与旧版一致（网关不发明限制）。
+        let policy = channel_policy_of(
+            cand,
+            crate::codec::replay::enabled_for(&ctx.replay, &ctx.db, cand),
+        );
         let plan = crate::codec::capability::plan_compatibility_with(
             &req,
             crate::codec::capability::caps_of(family),
@@ -1861,6 +2163,48 @@ async fn try_converted_candidate(
         let hint = String::from_utf8_lossy(&bytes).into_owned();
         let snippet: String = hint.chars().take(240).collect();
 
+        // 推理回放兼容的**自适应**一环（`codec::replay`）：确定性错误里识别「要求回放推理」
+        // 的 4xx。400 会落到下面的 `Stop` 分支**直接交付**（不冒泡到 `dispatch` 的 `Failed`，
+        // 那里收不到），所以钩子必须在这里。首次遇到 → 学习 + 用兼容**原地重试一次**
+        // （重试时规划层会给出非空推理占位），客户端只看到成功；重试仍被同类错误拒绝
+        // ⇒ 抑制该开关，之后不再重试（不抖动，也不会把本来能跑的配置永久改坏）。
+        // 直通路径（同族字节转发）不经 `openai` 编码器，对应处理在 `try_candidate` 里。
+        if crate::codec::replay::is_replay_rejection(up_status.as_u16(), &snippet)
+            && crate::codec::replay::should_retry_after_rejection(&ctx.replay, &ctx.db, cand)
+        {
+            emit_log_with(
+                RouteMode::Converted,
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                cand.upstream_model_id.clone(),
+                up_status.as_u16() as i64,
+                ms_since(started),
+                req.stream,
+                None,
+                0,
+                Some("CapabilityWarn".into()),
+                Some(format!(
+                    "[convert] {}：上游要求回放推理（HTTP {}）→ 已记下该渠道并要求非空推理回放，正在重试同一请求",
+                    cand.provider_name,
+                    up_status.as_u16()
+                )),
+                None,
+            );
+            let retried = Box::pin(try_converted_candidate(
+                ctx, wire, peeked, cand, raw_body, started,
+            ))
+            .await;
+            // 重试仍以同一状态码被拒 ⇒ 这个开关对它无效 → 抑制，避免下次再试
+            if let Attempt::Delivered(r) = &retried {
+                if r.status() == up_status {
+                    ctx.replay.suppress(&ctx.db, &cand.provider_id);
+                }
+            }
+            return retried;
+        }
+
         match router::classify_status(up_status.as_u16(), &snippet) {
             AttemptVerdict::Stop { kind } => {
                 provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
@@ -1932,7 +2276,7 @@ async fn try_converted_candidate(
         .map(|v| v.starts_with("text/event-stream"))
         .unwrap_or(false);
 
-    if ct_is_sse || req.stream {
+    if ct_is_sse {
         convert_streaming_response(
             ctx.clone(),
             wire,
@@ -1942,6 +2286,9 @@ async fn try_converted_candidate(
             up_status,
             started,
             crate::codec::capability::tool_identities_of(&req),
+            // 本轮生效的输出预算（请求侧声明，或 1.5) 按模型配置兜底后的值）。
+            // 只给「零可见输出的截断轮」诊断落日志用，不参与编码。
+            req.params.max_output_tokens,
         )
         .await
     } else {
@@ -1961,6 +2308,9 @@ async fn try_converted_candidate(
             started,
             validate_output,
             crate::codec::capability::tool_identities_of(&req),
+            req.params.max_output_tokens,
+            // 客户端要流式、上游却回整包 JSON → 由 convert_plain_response 补成 SSE
+            req.stream,
         )
         .await
     }
@@ -1978,6 +2328,11 @@ async fn convert_plain_response(
     started: Instant,
     validate_output: bool,
     tool_identities: Vec<crate::codec::capability::ToolIdentity>,
+    // 本轮生效的输出预算；只用于「零可见输出的截断轮」诊断（见
+    // `empty_truncation_diagnostic`）。
+    output_budget: Option<u32>,
+    // 客户端要流式但上游没按 SSE 回时，把整包响应补成入站 SSE（见函数内注释）。
+    as_stream: bool,
 ) -> Attempt {
     let bytes = match tokio::time::timeout(NONSTREAM_READ_TIMEOUT, resp.bytes()).await {
         Ok(Ok(b)) => b,
@@ -2119,6 +2474,26 @@ async fn convert_plain_response(
         }
     }
 
+    // 客户端要流式、上游却回了整包 JSON（忽略了 stream=true）：不能当 SSE 解析
+    // ——整包里没有 `data:` 行，一帧都发不出去，客户端只会看到
+    // 「200 + text/event-stream + 零帧」的静默空轮。改为把整包响应补成入站 SSE。
+    //
+    // 必须放在下面那条非流式 `emit_log_with` **之前**：deliver_synthesized_stream 自己
+    // 会按 `stream=true` 落一条日志，否则同一请求会留下两条（一条 stream=false 的假象）。
+    if as_stream {
+        return deliver_synthesized_stream(
+            ctx,
+            wire,
+            peeked,
+            cand,
+            status,
+            started,
+            tool_identities,
+            output_budget,
+            &resp,
+        );
+    }
+
     let usage = &resp.usage;
     let uval = json!({
         "prompt_tokens": usage.input_tokens,
@@ -2141,7 +2516,6 @@ async fn convert_plain_response(
         Some(resp.stop_reason.as_log_str()),
     );
 
-    // 渲染为入站形状（OpenAI / Anthropic）
     let rendered = match wire {
         InboundWire::OpenAi | InboundWire::Completions => {
             crate::codec::openai::render_response(&resp).to_string()
@@ -2161,6 +2535,205 @@ async fn convert_plain_response(
         .unwrap_or_else(|_| Attempt::Delivered(empty_resp(status)))
 }
 
+/// 入站线的 SSE 渲染器（三种入站形状各一份状态）。
+///
+/// 从 [`convert_streaming_response`] 提到模块级，好让「上游整包 JSON → 补成 SSE」的
+/// [`deliver_synthesized_stream`] 走**同一套**渲染口径，不复制第二份事件映射。
+enum SseRenderer {
+    OpenAi(crate::codec::openai::RenderState),
+    Anthropic(crate::codec::anthropic::AnthropicRenderState),
+    Responses(crate::codec::responses::RenderState),
+}
+
+/// 按入站线构造渲染器（含 Responses 侧还原扩展工具 item 用的身份表）。
+fn new_sse_renderer(
+    wire: InboundWire,
+    model: &str,
+    started: Instant,
+    tool_identities: Vec<crate::codec::capability::ToolIdentity>,
+) -> SseRenderer {
+    let stamp = started.elapsed().as_millis();
+    match wire {
+        InboundWire::OpenAi | InboundWire::Completions => {
+            SseRenderer::OpenAi(crate::codec::openai::RenderState {
+                id: format!("chatcmpl-jai-{stamp}"),
+                model: model.to_string(),
+                started: false,
+            })
+        }
+        InboundWire::Anthropic => {
+            SseRenderer::Anthropic(crate::codec::anthropic::AnthropicRenderState {
+                message_id: format!("msg_jai_{stamp}"),
+                model: model.to_string(),
+                active_block: None,
+                text_started: false,
+                active_tool_index: None,
+                next_block_index: 0,
+                finished: false,
+            })
+        }
+        InboundWire::Responses => SseRenderer::Responses(crate::codec::responses::RenderState {
+            response_id: format!("resp_jai_{stamp}"),
+            model: model.to_string(),
+            started: false,
+            output_index: 0,
+            msg_started: false,
+            active_tool_item_id: String::new(),
+            active_tool_call_id: String::new(),
+            active_tool_name: String::new(),
+            active_tool_args: String::new(),
+            current_text: String::new(),
+            reasoning_started: false,
+            current_reasoning: String::new(),
+            tool_identities,
+            active_tool_type: String::new(),
+            completed_items: Vec::new(),
+        }),
+    }
+}
+
+/// 渲染单个 IR 事件 → SSE 输出帧（一个 IR 事件可能展开多个 SSE 事件）。
+fn render_frame(renderer: &mut SseRenderer, ev: &crate::codec::ir::StreamEvent) -> Vec<String> {
+    match renderer {
+        SseRenderer::OpenAi(st) => crate::codec::openai::render_stream_event(ev, st)
+            .map(|line| format!("data: {line}\n\n"))
+            .into_iter()
+            .collect(),
+        SseRenderer::Anthropic(st) => crate::codec::anthropic::render_stream_event(ev, st)
+            .into_iter()
+            .map(|(evt, data)| format!("event: {evt}\ndata: {data}\n\n"))
+            .collect(),
+        SseRenderer::Responses(st) => crate::codec::responses::render_stream_event(ev, st)
+            .into_iter()
+            .map(|payload| {
+                let event = serde_json::from_str::<Value>(&payload)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| "response.output_text.delta".to_string());
+                format!("event: {event}\ndata: {payload}\n\n")
+            })
+            .collect(),
+    }
+}
+
+/// 上游忽略了 `stream: true`、回了整包 JSON 时，把 [`crate::codec::ir::CanonicalResponse`]
+/// **补成入站 SSE**。
+///
+/// 为什么需要：转换路径原先按「`ct_is_sse || req.stream`」选转换器，于是「客户端要流式、
+/// 上游却回 JSON」的请求被喂进 SSE 解析器 —— 整包里没有 `data:` 行，一帧都发不出去，
+/// 客户端只看到「200 + text/event-stream + 零帧」的**静默空轮**（对 agent 客户端等于丢一轮，
+/// 且不报错）。收尾口径与 [`convert_streaming_response`] 的自然结束分支保持一致。
+#[allow(clippy::too_many_arguments)] // 与 convert_streaming_response（9 参）同族，保持平铺
+fn deliver_synthesized_stream(
+    ctx: GatewayCtx,
+    wire: InboundWire,
+    peeked: PeekRequest,
+    cand: store::RouteCandidate,
+    status: StatusCode,
+    started: Instant,
+    tool_identities: Vec<crate::codec::capability::ToolIdentity>,
+    // 见 `convert_plain_response` 的同名参数。
+    output_budget: Option<u32>,
+    resp: &crate::codec::ir::CanonicalResponse,
+) -> Attempt {
+    use crate::codec::ir::{Block, StreamEvent};
+
+    let mut renderer = new_sse_renderer(wire, &peeked.model, started, tool_identities);
+
+    // Start（渲染侧重置状态）→ 内容增量 → Finish
+    let mut events: Vec<StreamEvent> = vec![StreamEvent::Start {
+        model: resp.model.clone(),
+    }];
+    let mut tool_index = 0usize;
+    for b in &resp.output {
+        match b {
+            Block::Text { text } => events.push(StreamEvent::TextDelta { text: text.clone() }),
+            Block::Thinking { text, .. } => {
+                events.push(StreamEvent::ThinkingDelta { text: text.clone() })
+            }
+            Block::ToolUse { id, name, input } => {
+                events.push(StreamEvent::ToolCallStart {
+                    index: tool_index,
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+                events.push(StreamEvent::ToolCallArgsDelta {
+                    index: tool_index,
+                    args_fragment: serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
+                });
+                events.push(StreamEvent::ToolCallEnd { index: tool_index });
+                tool_index += 1;
+            }
+            _ => {}
+        }
+    }
+    events.push(StreamEvent::Finish {
+        stop_reason: resp.stop_reason.clone(),
+        usage: resp.usage.clone(),
+    });
+
+    let mut body = String::new();
+    for ev in &events {
+        for frame in render_frame(&mut renderer, ev) {
+            body.push_str(&frame);
+        }
+    }
+    // 与流式路径的自然结束一致：Anthropic 补 message_stop，其余补 [DONE]
+    if wire == InboundWire::Anthropic {
+        body.push_str(&format!(
+            "event: message_stop\ndata: {}\n\n",
+            crate::codec::anthropic::render_message_stop()
+        ));
+    } else {
+        body.push_str("data: [DONE]\n\n");
+    }
+
+    let usage = &resp.usage;
+    let uval = json!({
+        "prompt_tokens": usage.input_tokens,
+        "completion_tokens": usage.output_tokens,
+    });
+    // 「零可见输出」判定：整包响应里没有任何正文、也没有工具调用（thinking 不算可见）。
+    let saw_visible_output = resp.output.iter().any(|b| match b {
+        Block::Text { text } => !text.trim().is_empty(),
+        Block::ToolUse { .. } => true,
+        _ => false,
+    });
+    let (diag_kind, diag_summary) = truncation_diagnostic(
+        Some(resp.stop_reason.as_log_str()),
+        saw_visible_output,
+        output_budget,
+        usage.output_tokens,
+    )
+    .map(|(k, s)| (Some(k.to_string()), Some(s)))
+    .unwrap_or((None, None));
+    emit_log_with(
+        RouteMode::Converted,
+        &ctx.logs,
+        wire.log_family(),
+        Some(&peeked),
+        Some(&cand.provider_id),
+        cand.upstream_model_id.clone(),
+        status.as_u16() as i64,
+        ms_since(started),
+        true,
+        Some(&uval),
+        count_ir_tool_uses(resp),
+        diag_kind,
+        diag_summary,
+        Some(resp.stop_reason.as_log_str()),
+    );
+
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-jai-mode", HeaderValue::from_static("converted"))
+        .body(Body::from(body))
+        .map(Attempt::Delivered)
+        .unwrap_or_else(|_| Attempt::Delivered(empty_resp(status)))
+}
+
 /// 转换路径：流式。逐 SSE 事件 parse → IR StreamEvent → render 回入站 SSE。
 #[allow(clippy::too_many_arguments)] // 与 convert_plain_response（9 参）同族，保持平铺
 async fn convert_streaming_response(
@@ -2172,6 +2745,8 @@ async fn convert_streaming_response(
     status: StatusCode,
     started: Instant,
     tool_identities: Vec<crate::codec::capability::ToolIdentity>,
+    // 见 `convert_plain_response` 的同名参数。
+    output_budget: Option<u32>,
 ) -> Attempt {
     let mut upstream_stream = resp.bytes_stream();
 
@@ -2206,72 +2781,8 @@ async fn convert_streaming_response(
         }
     };
 
-    // 按入站线选择渲染器
-    enum SseRenderer {
-        OpenAi(crate::codec::openai::RenderState),
-        Anthropic(crate::codec::anthropic::AnthropicRenderState),
-        Responses(crate::codec::responses::RenderState),
-    }
-    let mut renderer = match wire {
-        InboundWire::OpenAi | InboundWire::Completions => {
-            SseRenderer::OpenAi(crate::codec::openai::RenderState {
-                id: format!("chatcmpl-jai-{}", started.elapsed().as_millis()),
-                model: peeked.model.clone(),
-                started: false,
-            })
-        }
-        InboundWire::Anthropic => {
-            SseRenderer::Anthropic(crate::codec::anthropic::AnthropicRenderState {
-                message_id: format!("msg_jai_{}", started.elapsed().as_millis()),
-                model: peeked.model.clone(),
-                active_block: None,
-                text_started: false,
-                active_tool_index: None,
-                next_block_index: 0,
-                finished: false,
-            })
-        }
-        InboundWire::Responses => SseRenderer::Responses(crate::codec::responses::RenderState {
-            response_id: format!("resp_jai_{}", started.elapsed().as_millis()),
-            model: peeked.model.clone(),
-            started: false,
-            output_index: 0,
-            msg_started: false,
-            active_tool_item_id: String::new(),
-            active_tool_call_id: String::new(),
-            active_tool_name: String::new(),
-            active_tool_args: String::new(),
-            current_text: String::new(),
-            reasoning_started: false,
-            current_reasoning: String::new(),
-            tool_identities,
-            active_tool_type: String::new(),
-            completed_items: Vec::new(),
-        }),
-    };
-    // 渲染单个 IR 事件 → SSE 输出帧（一个 IR 事件可能展开多个 SSE 事件）
-    fn render_frame(renderer: &mut SseRenderer, ev: &crate::codec::ir::StreamEvent) -> Vec<String> {
-        match renderer {
-            SseRenderer::OpenAi(st) => crate::codec::openai::render_stream_event(ev, st)
-                .map(|line| format!("data: {line}\n\n"))
-                .into_iter()
-                .collect(),
-            SseRenderer::Anthropic(st) => crate::codec::anthropic::render_stream_event(ev, st)
-                .into_iter()
-                .map(|(evt, data)| format!("event: {evt}\ndata: {data}\n\n"))
-                .collect(),
-            SseRenderer::Responses(st) => crate::codec::responses::render_stream_event(ev, st)
-                .into_iter()
-                .map(|payload| {
-                    let event = serde_json::from_str::<Value>(&payload)
-                        .ok()
-                        .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
-                        .unwrap_or_else(|| "response.output_text.delta".to_string());
-                    format!("event: {event}\ndata: {payload}\n\n")
-                })
-                .collect(),
-        }
-    }
+    // 渲染器：按入站线构造（定义已提到模块级，供 deliver_synthesized_stream 复用同一口径）
+    let mut renderer = new_sse_renderer(wire, &peeked.model, started, tool_identities);
 
     // SSE 事件 ⊆ 格式转换：上游原始帧 → IR → 入站帧
     let upstream_family = cand.family.clone();
@@ -2307,6 +2818,11 @@ async fn convert_streaming_response(
             // 用 id 去重而非数事件：部分上游（如 Gemini）每帧都带 Start，且 index 恒为 0。
             let mut tool_call_ids: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // 本轮是否产出过**可见**输出（正文或工具调用）。thinking/reasoning **不算** ——
+            // 客户端看不到推理，只有推理的一轮对用户等于「什么都没说」。收尾时与
+            // `last_stop_reason` 一起判定「零可见输出的截断轮」（见
+            // `empty_truncation_diagnostic`）。
+            let mut saw_visible_output = false;
             // 挂起的 Finish：上游常把 stop_reason 与 usage 拆成两帧（先 finish_reason 帧、
             // 后 usage 末帧），且 usage 帧可能带非空 choices。若逐帧渲染，客户端会先收到一个
             // usage 全 0 的收尾帧，第二帧再渲染就是重复的 completed/message_stop。故挂起
@@ -2423,24 +2939,27 @@ async fn convert_streaming_response(
                                     }
                                 },
                                 "openai_responses" => {
-                                    // Responses 上游的 SSE 尚未支持流式转换；
-                                    // 若上游返回 SSE，暂时按无法解析处理。
-                                    emit_log_with(RouteMode::Converted,
-                                        &ctx2.logs,
-                                        wire2.log_family(),
-                                        Some(&peeked2),
-                                        Some(&pid),
-                                        None,
-                                        200,
-                                        t0.elapsed().as_millis() as i64,
-                                        true,
-                                        None,
-                                        0,
-                                        Some("SseParseWarn".into()),
-                                        Some("[convert] openai_responses SSE 暂不支持流式转换".into()),
-                                        None,
-                                    );
-                                    continue;
+                                    match crate::codec::responses::parse_stream_event(payload) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            emit_log_with(RouteMode::Converted,
+                                                &ctx2.logs,
+                                                wire2.log_family(),
+                                                Some(&peeked2),
+                                                Some(&pid),
+                                                None,
+                                                200,
+                                                t0.elapsed().as_millis() as i64,
+                                                true,
+                                                None,
+                                                0,
+                                                Some("SseParseWarn".into()),
+                                                Some(format!("[convert] openai_responses SSE 帧解析失败已跳过: {e}")),
+                                                None,
+                                            );
+                                            continue;
+                                        }
+                                    }
                                 }
                                 _ => continue,
                             };
@@ -2454,6 +2973,19 @@ async fn convert_streaming_response(
                             }
                         }
                         for ev in events {
+                            // 可见输出判定（只记一次 true，之后不再逐事件匹配）
+                            if !saw_visible_output {
+                                match &ev {
+                                    crate::codec::ir::StreamEvent::TextDelta { text } => {
+                                        saw_visible_output = !text.trim().is_empty();
+                                    }
+                                    crate::codec::ir::StreamEvent::ToolCallStart { .. }
+                                    | crate::codec::ir::StreamEvent::ToolCallArgsDelta { .. } => {
+                                        saw_visible_output = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
                             if let crate::codec::ir::StreamEvent::ToolCallStart { id, .. } = &ev {
                                 if !id.is_empty() {
                                     tool_call_ids.insert(id.clone());
@@ -2639,6 +3171,16 @@ async fn convert_streaming_response(
                         } else {
                             let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
                         }
+                        // 截断诊断（零可见输出 / 被预算掐短）：必须在 `last_usage` 被
+                        // `usage_json` 的 map 取走之前算。
+                        let (diag_kind, diag_summary) = truncation_diagnostic(
+                            last_stop_reason.as_ref().map(|r| r.as_log_str()),
+                            saw_visible_output,
+                            output_budget,
+                            last_usage.as_ref().map(|u| u.output_tokens).unwrap_or(0),
+                        )
+                        .map(|(k, s)| (Some(k.to_string()), Some(s)))
+                        .unwrap_or((None, None));
                         // 结束时透传 IR 累计的 usage（此前硬编码 None 导致日志输入/输出恒空）
                         let usage_json = last_usage.map(|u| {
                             json!({
@@ -2660,8 +3202,8 @@ async fn convert_streaming_response(
                             true,
                             usage_json.as_ref(),
                             tool_call_ids.len() as i64,
-                            None,
-                            None,
+                            diag_kind,
+                            diag_summary,
                             last_stop_reason.as_ref().map(|r| r.as_log_str()),
                         );
                         drop(tx);
@@ -2903,10 +3445,9 @@ async fn streaming_response(
         }
     };
 
-    // 通过管道把剩余流喂给客户端；usage 扫描伴随进行。
-    // 注意：直通流式的 `tool_calls` 落库为 0 —— 字节直通不解析 SSE 语义，
-    // 仅 UsageScanner 做关键字级扫描；诊断「模型有没有发起工具调用」请看
-    // 转换路径（跨族）的行，或本行同时看 is_stream=1 + route_mode=passthrough。
+    // 通过管道把剩余流喂给客户端；usage 扫描 + 观测探针伴随进行。
+    // `tool_calls` 自本版起由 PassthroughStreamProbe 按 IR 口径（工具调用 id 去重）计数，
+    // 与非流式直通的 count_tool_calls_in_body 对齐 —— 此前该列在直通流式下恒 0。
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
     let mut scanner = UsageScanner::new();
@@ -2914,6 +3455,10 @@ async fn streaming_response(
     // 结束原因探针（诊断字段，逐块扫描 + 末尾窗口兜底，见 StopReasonProbe）
     let mut probe = StopReasonProbe::new(wire);
     probe.feed(&first_chunk);
+    // 观测探针（诊断字段，只读不改写字节，见 PassthroughStreamProbe）：
+    // 可见输出 + 工具调用计数
+    let mut passthrough = PassthroughStreamProbe::new(wire);
+    passthrough.feed(&first_chunk);
 
     if tx.send(Ok(first_chunk)).await.is_err() {
         // 客户端瞬间断开：记录后退出
@@ -2927,7 +3472,7 @@ async fn streaming_response(
             ms_since(started),
             true,
             scanner.finish().as_ref(),
-            0,
+            passthrough.tool_call_ids.len() as i64,
             Some("InvalidRequest".into()),
             Some("client disconnected early".into()),
             None,
@@ -2961,7 +3506,7 @@ async fn streaming_response(
                             ms_since(t0),
                             true,
                             scanner.finish().as_ref(),
-                            0,
+                            passthrough.tool_call_ids.len() as i64,
                             Some("Overloaded".into()),
                             Some(format!(
                                 "Overloaded upstream={} idle timeout",
@@ -2975,6 +3520,7 @@ async fn streaming_response(
                     Ok(Some(Ok(chunk))) => {
                         scanner.feed(&chunk);
                         probe.feed(&chunk);
+                        passthrough.feed(&chunk);
                         if tx.send(Ok(chunk)).await.is_err() {
                             emit_log(
                                 &ctx2.logs,
@@ -2986,7 +3532,7 @@ async fn streaming_response(
                                 ms_since(t0),
                                 true,
                                 scanner.finish().as_ref(),
-                                0,
+                                passthrough.tool_call_ids.len() as i64,
                                 Some("InvalidRequest".into()),
                                 Some("client disconnected mid-stream".into()),
                                 None,
@@ -3009,7 +3555,7 @@ async fn streaming_response(
                             ms_since(t0),
                             true,
                             scanner.finish().as_ref(),
-                            0,
+                            passthrough.tool_call_ids.len() as i64,
                             Some("ProviderOther".into()),
                             Some(msg),
                             probe.finish(),
@@ -3019,6 +3565,23 @@ async fn streaming_response(
                     Ok(None) => {
                         // 正常结束
                         drop(tx);
+                        // 「零可见输出的截断轮」诊断的直通半边：字节转发没有 IR，但探针
+                        // 能回答「这一轮有没有产出用户看得见的东西」。
+                        let usage_v = scanner.finish();
+                        let out_tokens = usage_v
+                            .as_ref()
+                            .and_then(|u| u.get("completion_tokens"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let stop = probe.finish();
+                        let (diag_kind, diag_summary) = truncation_diagnostic(
+                            stop,
+                            passthrough.seen_visible,
+                            peeked2.max_output_tokens,
+                            out_tokens,
+                        )
+                        .map(|(k, s)| (Some(k.to_string()), Some(s)))
+                        .unwrap_or((None, None));
                         emit_log(
                             &ctx2.logs,
                             wire2.log_family(),
@@ -3028,11 +3591,11 @@ async fn streaming_response(
                             status.as_u16() as i64,
                             ms_since(t0),
                             true,
-                            scanner.finish().as_ref(),
-                            0,
-                            None,
-                            None,
-                            probe.finish(),
+                            usage_v.as_ref(),
+                            passthrough.tool_call_ids.len() as i64,
+                            diag_kind,
+                            diag_summary,
+                            stop,
                         );
                         break;
                     }
@@ -3398,6 +3961,66 @@ mod tests {
             beta["contextWindow"], 128000,
             "context_window 为 NULL 时应给保守默认 128k"
         );
+    }
+
+    /// P0 回归：**零可见输出的截断轮**必须被标出来。
+    ///
+    /// 真机形状（2026-09-22 基元律动/deepseek-flash，460k 上下文）：上游
+    /// `finish_reason:"length"`，completion_tokens 只有 16/96/165/250，正文为空、
+    /// 无工具调用，推理有内容。此前 `error_kind` 恒 NULL ⇒ 与正常 200 无法区分，
+    /// 客户端侧只看到一句 `EMPTY_MODEL_RESPONSE`。
+    #[test]
+    fn truncation_diagnostic_flags_reasoning_only_truncation() {
+        let (kind, summary) = truncation_diagnostic(Some("max_tokens"), false, Some(16), 16)
+            .expect("零可见输出的 length 截断必须被标记");
+        assert_eq!(kind, "OutputTruncatedEmpty");
+        assert!(summary.contains("max_output_tokens=16"), "{summary}");
+        assert!(summary.contains("没有任何可见输出"), "{summary}");
+
+        // 非截断类结束原因 → 不标记（模型正常说完了 / 正常发起了工具调用）
+        assert!(truncation_diagnostic(Some("end_turn"), false, None, 0).is_none());
+        assert!(truncation_diagnostic(Some("tool_use"), false, None, 0).is_none());
+        // 结束原因未知（上游没给 finish_reason）→ 不标记，避免误伤
+        assert!(truncation_diagnostic(None, false, Some(4096), 0).is_none());
+
+        // 零输出的安全拦截：同样标记，但原因措辞不同
+        let (kind, summary) = truncation_diagnostic(Some("safety"), false, None, 0)
+            .expect("零输出的安全拦截也应标记");
+        assert_eq!(kind, "OutputTruncatedEmpty");
+        assert!(summary.contains("content_filter"), "{summary}");
+        assert!(summary.contains("未声明 max_output_tokens"), "{summary}");
+    }
+
+    /// P2：**被预算掐短**（有可见输出、且确实撞上上限）单独一档；没撞上限不标。
+    ///
+    /// 真机形状（2026-09-22 10:44，基元律动/deepseek-flash，280k 上下文）：客户端声明
+    /// `max_output_tokens=8192`（PI-Desktop 的模型配置值），上游 `finish_reason:"length"`，
+    /// `completion_tokens` 恰好 8192 —— 预算被真正用尽，用户拿到的是被掐短的答案。
+    #[test]
+    fn truncation_diagnostic_flags_budget_clipped_with_text() {
+        let (kind, summary) = truncation_diagnostic(Some("max_tokens"), true, Some(8192), 8192)
+            .expect("有正文且撞上预算上限必须被标记");
+        assert_eq!(kind, "OutputBudgetClipped");
+        assert!(summary.contains("max_output_tokens=8192"), "{summary}");
+        assert!(summary.contains("有可见输出"), "{summary}");
+
+        // 产出略超声明预算（上游计费口径差异）同样算撞上
+        assert_eq!(
+            truncation_diagnostic(Some("max_tokens"), true, Some(100), 105).map(|(k, _)| k),
+            Some("OutputBudgetClipped")
+        );
+
+        // **没撞上限**（上游在声明预算之前就自行截断）→ 不标：这一档刻意只认「确实用尽」，
+        // 否则客户端故意设小预算的正常场景会被标成异常，窗口边缘每一轮都命中
+        assert!(
+            truncation_diagnostic(Some("max_tokens"), true, Some(8192), 3000).is_none(),
+            "没撞上上限的截断不该被标成「被预算掐短」"
+        );
+        // 预算未知（客户端未声明）→ 不标：网关不发明预算，也就无从判断「撞上了」
+        assert!(truncation_diagnostic(Some("max_tokens"), true, None, 3000).is_none());
+
+        // 有正文的安全拦截不标（拦截没生效到正文上，用户读到了内容）
+        assert!(truncation_diagnostic(Some("safety"), true, Some(8192), 8192).is_none());
     }
 
     #[tokio::test]

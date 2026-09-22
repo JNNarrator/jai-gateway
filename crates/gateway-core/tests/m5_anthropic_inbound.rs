@@ -41,6 +41,26 @@ async fn spawn_openai_mock(mode: &'static str) -> (u16, Arc<Mutex<Option<String>
                     .unwrap();
             }
 
+            // 2026-09-22 新增：把上游实际收到的 body 原样捕获，供「多段 system 合并 /
+            // output_config → reasoning_effort / thinking 历史 → reasoning_content」断言用。
+            if mode == "capture" {
+                *captured2.lock().unwrap() = Some(body.to_string());
+                return Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "id":"chatcmpl_cap","object":"chat.completion","model":"gpt-4o",
+                            "choices":[{"index":0,
+                                "message":{"role":"assistant","content":"captured"},
+                                "finish_reason":"stop"}],
+                            "usage":{"prompt_tokens":1,"completion_tokens":1}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+            }
+
             let payload: Value = if mode == "tool_long" {
                 // 第二轮：如果上游收到 role=tool，捕获 tool_call_id 并返回普通文本
                 if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
@@ -167,6 +187,110 @@ async fn spawn_gemini_mock(mode: &'static str) -> u16 {
     addr.port()
 }
 
+/// Anthropic 上游 mock：`capture` 模式把收到的 body 原样存入捕获槽（供「多段 system
+/// 合并」断言），并回一个最小的 Anthropic message 形状让回程转换能收尾。
+async fn spawn_anthropic_mock(mode: &'static str) -> (u16, Arc<Mutex<Option<String>>>) {
+    let captured = Arc::new(Mutex::new(None));
+    let captured2 = captured.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |axum::Json(body): axum::Json<Value>| async move {
+            if mode == "capture" {
+                *captured2.lock().unwrap() = Some(body.to_string());
+            }
+            Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "id":"msg_cap","type":"message","role":"assistant",
+                        "model":"claude-sonnet-4",
+                        "content":[{"type":"text","text":"from-anthropic"}],
+                        "stop_reason":"end_turn",
+                        "usage":{"input_tokens":3,"output_tokens":2}
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr.port(), captured)
+}
+
+/// Responses 上游 mock：`/responses`。
+///
+/// `stream` 模式回**真实的 Responses SSE 形状**（`response.created` /
+/// `response.output_text.delta` / `response.completed` + `[DONE]`）；
+/// `json` 模式**故意忽略 `stream: true`** 回整包 JSON，用来验证网关侧的补流兜底。
+async fn spawn_responses_mock(mode: &'static str) -> u16 {
+    let app = Router::new().route(
+        "/responses",
+        post(move |axum::Json(body): axum::Json<Value>| async move {
+            let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+            if mode == "stream" && wants_stream {
+                let mut sse = String::new();
+                let created = json!({
+                    "type":"response.created","sequence_number":0,
+                    "response":{"id":"resp_1","model":"gpt-5"}
+                });
+                sse.push_str(&format!("event: response.created\ndata: {created}\n\n"));
+                let delta = json!({
+                    "type":"response.output_text.delta","sequence_number":1,
+                    "output_index":0,"content_index":0,"delta":"from-responses"
+                });
+                sse.push_str(&format!(
+                    "event: response.output_text.delta\ndata: {delta}\n\n"
+                ));
+                let completed = json!({
+                    "type":"response.completed","sequence_number":2,
+                    "response":{
+                        "id":"resp_1","model":"gpt-5","status":"completed",
+                        "output":[{"type":"message","role":"assistant",
+                            "content":[{"type":"output_text","text":"from-responses"}]}],
+                        "usage":{"input_tokens":7,"output_tokens":3}
+                    }
+                });
+                sse.push_str(&format!("event: response.completed\ndata: {completed}\n\n"));
+                sse.push_str("data: [DONE]\n\n");
+                return Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap();
+            }
+            // 忽略 stream=true：回整包 JSON（content-type 仍是 application/json）
+            Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "id":"resp_1","object":"response","model":"gpt-5","status":"completed",
+                        "output":[{"type":"message","role":"assistant",
+                            "content":[{"type":"output_text","text":"from-responses"}]}],
+                        "usage":{"input_tokens":7,"output_tokens":3}
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.port()
+}
+
 // ---------------------------------------------------------------- 夹具
 
 struct Fixture {
@@ -213,9 +337,86 @@ impl Fixture {
     }
 }
 
+/// 「要求回放推理」的严格中继 mock（`openai_compat`），用于验证**自适应**闭环。
+///
+/// - 第 1 次请求：回 **400** + 「reasoning_content is required ...」，并记下该次的 body；
+/// - 第 2 次起：若 assistant 消息都带**非空** `reasoning_content` → 200，否则继续 400。
+///
+/// 捕获槽里存**最后一次**收到的 body，供断言「重试那次确实补上了非空推理」。
+async fn spawn_replay_mock() -> (u16, Arc<Mutex<Option<String>>>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let seen = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(Mutex::new(None));
+    let captured2 = captured.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(body): axum::Json<Value>| async move {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            *captured2.lock().unwrap() = Some(body.to_string());
+            // 第 1 次一律拒（模拟「网关还不知道这个渠道要非空推理」）
+            let assistants: Vec<&Value> = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(|ms| {
+                    ms.iter()
+                        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let all_have_nonempty_reasoning = !assistants.is_empty()
+                && assistants.iter().all(|m| {
+                    m.get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false)
+                });
+            if n == 0 || !all_have_nonempty_reasoning {
+                return Response::builder()
+                    .status(400)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"error":{"message":"reasoning_content is required for assistant messages"}})
+                            .to_string(),
+                    ))
+                    .unwrap();
+            }
+            Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "id":"chatcmpl_rp","object":"chat.completion","model":"test-model-1",
+                        "choices":[{"index":0,
+                            "message":{"role":"assistant","content":"replay ok"},
+                            "finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":5,"completion_tokens":2}
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr.port(), captured)
+}
+
 async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
     let (up_port, tool_capture) = if family == "openai_compat" {
         let (p, c) = spawn_openai_mock(upstream_mode).await;
+        (p, Some(c))
+    } else if family == "anthropic" {
+        let (p, c) = spawn_anthropic_mock(upstream_mode).await;
+        (p, Some(c))
+    } else if family == "openai_responses" {
+        (spawn_responses_mock(upstream_mode).await, None)
+    } else if family == "replay" {
+        let (p, c) = spawn_replay_mock().await;
         (p, Some(c))
     } else {
         (spawn_gemini_mock(upstream_mode).await, None)
@@ -240,6 +441,16 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
 
     let (pid, pname, model_name, secret, base_suffix) = if family == "openai_compat" {
         ("p-oai", "openai-mock", "gpt-4o", "sk-oai", "/v1")
+    } else if family == "anthropic" {
+        // JAI 对 anthropic 上游固定拼 `/v1/messages`，所以 base_url 只给到 host:port。
+        ("p-ant", "anthropic-mock", "claude-sonnet-4", "sk-ant", "")
+    } else if family == "openai_responses" {
+        // JAI 对 openai_responses 上游固定拼 `/responses`，base_url 只给到 host:port。
+        ("p-resp", "responses-mock", "gpt-5", "sk-resp", "")
+    } else if family == "replay" {
+        // 中性名字：模型名 / base_url / 供应商名都不含 deepseek ⇒ 推断不命中，
+        // 只能靠「学习」这条路把推理回放打开（见 codec::replay 与本文件末尾的用例）。
+        ("p-rp", "replay-mock", "test-model-1", "sk-rp", "/v1")
     } else {
         ("p-gem", "gemini-mock", "gemini-2.0-flash", "sk-gem", "")
     };
@@ -251,7 +462,13 @@ async fn fixture(family: &'static str, upstream_mode: &'static str) -> Fixture {
                 id: pid.into(),
                 name: pname.into(),
                 base_url: format!("http://127.0.0.1:{up_port}{base_suffix}"),
-                family: family.into(),
+                // `replay` 只是「选哪个 mock + 用哪套中性名字」的测试开关，
+                // 落库的上游族仍是 openai_compat（否则撞 family CHECK 约束）。
+                family: if family == "replay" {
+                    "openai_compat".into()
+                } else {
+                    family.into()
+                },
                 enabled: true,
                 priority: 1,
                 weight: 1,
@@ -453,5 +670,215 @@ async fn anthropic_inbound_to_openai_long_tool_id_roundtrip() {
         captured.as_deref(),
         Some(expected.as_str()),
         "上游应收到原始长 id，而不是网关短 id"
+    );
+}
+
+/// 2026-09-22：结合 zcode 开源源码对账后修的 Anthropic 入站适配缺陷，一条请求全覆盖。
+///
+/// 1. **`output_config.effort` 接进档位链路** —— zcode 的 anthropic-messages 内置规则表以
+///    `{"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}` 注入，此前该字段
+///    在 JAI 里零引用（连 CapabilityWarn 都不产生），跨族时用户选的档位静默丢失；
+/// 2. **入站 `thinking` 内容块不再丢弃** —— 跨族到 thinking 上游要靠它重建
+///    `reasoning_content`，否则上游后续轮次校验 400。
+///
+/// 请求里另带两段 system（prompt cache 断点的常见形态）：这里只顺带守住 **openai encoder**
+/// 的合并口径；「多段 system × Anthropic 上游」那条链路由本文件末尾的
+/// `openai_chat_multi_system_merges_for_anthropic_upstream` 覆盖。
+#[tokio::test(flavor = "multi_thread")]
+async fn anthropic_inbound_output_config_and_thinking_reach_upstream() {
+    let fx = fixture("openai_compat", "capture").await;
+    let body = json!({
+        "model":"gpt-4o","max_tokens":1024,
+        "thinking":{"type":"adaptive"},
+        "output_config":{"effort":"high"},
+        "system":[
+            {"type":"text","text":"seg-one","cache_control":{"type":"ephemeral"}},
+            {"type":"text","text":"seg-two"}
+        ],
+        "messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"prior reasoning","signature":"sig"},
+                {"type":"text","text":"prior answer"}
+            ]},
+            {"role":"user","content":"again"}
+        ]
+    });
+    let (status, resp) = fx.post_messages(body).await;
+    assert_eq!(status, 200, "多段 system 不应再被判 400：{resp}");
+
+    let raw = fx
+        .tool_capture
+        .as_ref()
+        .expect("capture fixture 应提供捕获槽")
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("capture 模式应捕获上游 body");
+    let up: Value = serde_json::from_str(&raw).unwrap();
+    let msgs = up["messages"].as_array().expect("上游应有 messages");
+
+    // 1) 多段 system 合并为单条（\n\n 连接）
+    assert_eq!(msgs[0]["role"], "system");
+    assert_eq!(
+        msgs[0]["content"], "seg-one\n\nseg-two",
+        "多段 system 应按 IR 契约以 \\n\\n 合并"
+    );
+
+    // 2) output_config.effort → 上游 reasoning_effort（该渠道未声明值域 ⇒ 原样透传）
+    assert_eq!(up["reasoning_effort"], "high");
+
+    // 3) 入站 thinking 块 → 上游 assistant 消息的 reasoning_content
+    let assistant = msgs
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("应有 assistant 消息");
+    assert_eq!(
+        assistant["reasoning_content"], "prior reasoning",
+        "入站 thinking 块应跨族重建为 reasoning_content"
+    );
+    assert_eq!(assistant["content"], "prior answer");
+}
+
+/// 2026-09-22：`system` 多段 → Anthropic 上游不再被判 400。
+///
+/// **触发拓扑**（此前我把这条归错到了「Anthropic 入站 × OpenAI 上游」，其实不是）：
+/// `anthropic::encode_request` 只在**上游族是 anthropic** 时被调用。Anthropic 入站走
+/// anthropic 上游是**同族直通**（字节转发，压根不过 encoder），所以旧行为真正伤到的是
+/// 「**别的入站族** × Anthropic 上游」——例如 OpenAI chat 入站：`openai::decode_request`
+/// 对每条 `role=system` 消息（以及 system 的多段 content 数组）各 push 一段 `system`，
+/// 于是「客户端发了两条 system」在旧代码下直接 400「system 段数为 2」，
+/// 而 openai / responses / gemini 三个 encoder 都会 `join("\n\n")` 正常合并。
+#[tokio::test(flavor = "multi_thread")]
+async fn openai_chat_multi_system_merges_for_anthropic_upstream() {
+    let fx = fixture("anthropic", "capture").await;
+    let body = json!({
+        "model":"claude-sonnet-4",
+        "messages":[
+            {"role":"system","content":"sys-one"},
+            {"role":"system","content":"sys-two"},
+            {"role":"user","content":"hello"}
+        ]
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", fx.port))
+        .bearer_auth(&fx.key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 200, "多段 system 不应再被判 400：{text}");
+
+    let raw = fx
+        .tool_capture
+        .as_ref()
+        .expect("capture fixture 应提供捕获槽")
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("capture 模式应捕获上游 body");
+    let up: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        up["system"], "sys-one\n\nsys-two",
+        "多段 system 应按 IR 契约以 \\n\\n 合并后发给 Anthropic 上游"
+    );
+}
+
+/// 2026-09-22（PI-Desktop 源码对账）：**跨族 + Responses 上游 + 流式**此前是**静默空轮**。
+///
+/// `convert_streaming_response` 的 `openai_responses` 分支没有解析器，把每个 `data:` 行
+/// 直接 `continue` 丢弃 ⇒ `pending_finish` 永不置位、`render_frame` 永不调用，
+/// 客户端只拿到「HTTP 200 + text/event-stream + 零帧」。非流式路径反而是好的
+/// （`convert_plain_response` 有 `responses::parse_response`），所以症状很隐蔽。
+/// 现在按 Responses SSE 形状解析成 IR StreamEvent 再渲染回 Anthropic SSE。
+#[tokio::test(flavor = "multi_thread")]
+async fn anthropic_inbound_streams_from_responses_upstream() {
+    let fx = fixture("openai_responses", "stream").await;
+    let (status, raw) = fx
+        .post_messages_raw(json!({
+            "model":"gpt-5","max_tokens":64,"stream":true,
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .await;
+    assert_eq!(status, 200, "body={raw}");
+    assert!(
+        raw.contains("from-responses"),
+        "应收到 Responses 上游的文本增量，实际 SSE: {raw}"
+    );
+    assert!(
+        raw.contains("message_stop"),
+        "Anthropic 入站应以 message_stop 收尾，实际 SSE: {raw}"
+    );
+}
+
+/// 2026-09-22：上游**忽略 `stream: true`** 回整包 JSON 时，也要给客户端一个像样的流。
+///
+/// 旧行为：按 `req.stream` 选了 SSE 解析器，整包里没有 `data:` 行 ⇒ 零帧 + 200。
+/// 新行为：`convert_plain_response(as_stream=true)` 整包解析后用同一套渲染器补成 SSE。
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_client_gets_synthesized_sse_when_upstream_ignores_stream() {
+    let fx = fixture("openai_responses", "json").await;
+    let (status, raw) = fx
+        .post_messages_raw(json!({
+            "model":"gpt-5","max_tokens":64,"stream":true,
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .await;
+    assert_eq!(status, 200, "body={raw}");
+    assert!(
+        raw.contains("from-responses"),
+        "上游不流式时也应由网关补出内容帧，实际 SSE: {raw}"
+    );
+}
+
+/// 2026-09-22（PI-Desktop 源码对账）：**自适应**推理回放闭环的端到端验证。
+///
+/// 拓扑：Anthropic 入站 → JAI → 严格中继（`openai_compat`，要求非空推理回放）。
+/// 该渠道的模型名 / base_url / 供应商名**都不含 deepseek** ⇒ 推断不命中，
+/// 所以第一次请求网关并不知道要补推理 → 上游 400「reasoning_content is required」。
+/// 期望：网关**识别 → 记下该渠道 → 用兼容原地重试**，客户端只看到 200。
+#[tokio::test(flavor = "multi_thread")]
+async fn adaptive_reasoning_replay_learns_and_retries_transparently() {
+    let fx = fixture("replay", "capture").await;
+    // 历史里那条 assistant 消息**没有** thinking → 不补就是缺字段
+    let (status, body) = fx
+        .post_messages(json!({
+            "model":"test-model-1","max_tokens":64,
+            "messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"previous answer"},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "网关应学习并重试，客户端不该看到上游那个 400：{body}"
+    );
+    assert_eq!(body["content"][0]["text"], "replay ok");
+
+    // 重试那次上游确实收到了**非空** reasoning_content（占位）
+    let raw = fx
+        .tool_capture
+        .as_ref()
+        .expect("replay fixture 应提供捕获槽")
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("应捕获到上游 body");
+    let up: Value = serde_json::from_str(&raw).unwrap();
+    let assistant = up["messages"]
+        .as_array()
+        .expect("应有 messages")
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("应有 assistant 消息");
+    let rc = assistant["reasoning_content"].as_str().unwrap_or_default();
+    assert!(
+        !rc.is_empty(),
+        "重试那次应补上非空推理占位，实际: {assistant:?}"
     );
 }

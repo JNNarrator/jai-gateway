@@ -12,6 +12,14 @@ use serde_json::{json, Value};
 pub struct PeekRequest {
     pub model: String,
     pub stream: bool,
+    /// 客户端声明的输出预算（`max_tokens` / `max_completion_tokens` / Responses 的
+    /// `max_output_tokens`）。
+    ///
+    /// 网关**不**改写它（既不兜底、也不按模型配置归一）：输出预算是客户端自己规划上下文的
+    /// 一部分，替它决定等于从远端插手 agent 循环。这里只是读出来给诊断用 —— 直通流式的
+    /// 「零可见输出的截断轮」诊断要说清「这一轮允许多少输出」，否则运维看不出预算已经被
+    /// 压到几十个 token（真机 2026-09-22：基元律动/deepseek-flash，completion_tokens=16）。
+    pub max_output_tokens: Option<u32>,
 }
 
 pub fn peek(body: &[u8]) -> Result<PeekRequest, String> {
@@ -27,6 +35,14 @@ pub fn peek(body: &[u8]) -> Result<PeekRequest, String> {
     Ok(PeekRequest {
         model,
         stream: v.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        // 三种入站线的字段名都收：OpenAI/Anthropic 用 `max_tokens`、OpenAI 新式与
+        // o 系用 `max_completion_tokens`、Responses 用 `max_output_tokens`。
+        max_output_tokens: v
+            .get("max_tokens")
+            .or_else(|| v.get("max_completion_tokens"))
+            .or_else(|| v.get("max_output_tokens"))
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
     })
 }
 
@@ -307,7 +323,10 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
             let role = m.get("role").and_then(Value::as_str).unwrap_or_default();
             let content = m.get("content");
             match role {
-                "system" => match content.and_then(Value::as_str) {
+                // `developer` 是 OpenAI 新版给 system 的继任角色（o 系 / gpt-5 系用它
+                // 承载指令）。此前它落到下面的 `other` 分支被**整条丢弃** ⇒ 客户端用
+                // developer 传 system prompt 时指令静默消失。两者归一到 system。
+                "system" | "developer" => match content.and_then(Value::as_str) {
                     Some(s) => system.push(s.to_string()),
                     // 多段 system（content 为数组）仅取文本部分
                     None => {
@@ -328,6 +347,25 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                 }
                 "assistant" => {
                     let mut blocks = content_blocks(content)?;
+                    // 历史里回传的推理（三种线上拼写都要认）：跨族转换要把它带下去，
+                    // 否则 thinking 上游在后续轮次校验缺 reasoning_content → 400。
+                    // 放在最前，与 DeepSeek 流式的「reasoning 先于 content」顺序一致。
+                    for field in REASONING_FIELDS {
+                        let Some(rc) = m.get(field).and_then(Value::as_str) else {
+                            continue;
+                        };
+                        // 空串也保留：客户端**显式发过**这个字段就说明它期望该字段存在
+                        // （官方 DeepSeek 接受 `""`；严格中继另有要求，见下方 encoder 注释）。
+                        // 只认「字段存在」，不臆断内容。
+                        blocks.insert(
+                            0,
+                            Block::Thinking {
+                                signature: Some(field.to_string()),
+                                text: rc.to_string(),
+                            },
+                        );
+                        break;
+                    }
                     // tool_calls → ToolUse 块
                     if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
                         for tc in tcs {
@@ -498,6 +536,22 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
         stream: v.get("stream").and_then(Value::as_bool).unwrap_or(false),
         extensions,
     })
+}
+
+/// OpenAI 兼容线上「推理内容」字段的三种已知拼写。
+///
+/// DeepSeek 系用 `reasoning_content`；部分中继 / 自建网关用 `reasoning_text` 或
+/// `reasoning`（PI-Desktop 的 `COMPLETIONS_REASONING_SIGNATURES` 是同一份清单）。
+/// IR 的 `Block::Thinking.signature` 就用来记**实际命中的名字**，编码侧原样回传
+/// 同一个名字 —— 否则换名字回传会被严格中继当成「没有回传推理」而 400。
+pub(crate) const REASONING_FIELDS: [&str; 3] = ["reasoning_content", "reasoning_text", "reasoning"];
+
+/// `Block::Thinking.signature` → 已知的线上字段名；不是白名单内的名字则 `None`。
+///
+/// 必须白名单校验：Anthropic 入站的 thinking 块也会填 `signature`，那是加密签名串。
+fn normalize_reasoning_field(signature: Option<&str>) -> Option<&'static str> {
+    let sig = signature?;
+    REASONING_FIELDS.iter().find(|f| **f == sig).copied()
 }
 
 /// 解析 content 字段为块列表（文本字符串 | 内容块数组）。
@@ -685,6 +739,14 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
         "messages": [],
     });
 
+    // 渠道是否需要「非空推理回放」（`crate::codec::replay`）：由规划层经 extensions 传入。
+    // 走 extensions 而非函数签名，四个 encoder 的签名保持不变。
+    let replay_required = req
+        .extensions
+        .get(crate::codec::replay::EXT_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     // message 数组（system 作为第一条 system 消息还原，§4-C）
     let mut messages: Vec<Value> = Vec::new();
     if !req.system.is_empty() {
@@ -800,10 +862,24 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
                 let mut content = String::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
                 let mut reasoning = String::new();
+                // 回传时用的线上字段名：默认 reasoning_content，被 Block::Thinking.signature
+                // 命中已知拼写时改写（见 normalize_reasoning_field）。
+                let mut reasoning_field: &str = REASONING_FIELDS[0];
+                // 客户端/上游**显式带过**具名字段的推理时置位：此时即使文本为空也要把
+                // 字段发出去（保留「该字段存在」这一事实，不擅自补内容）。
+                let mut reasoning_named = false;
                 for b in &m.blocks {
                     match b {
                         Block::Text { text } => content.push_str(text),
-                        Block::Thinking { text, .. } => reasoning.push_str(text),
+                        Block::Thinking { text, signature } => {
+                            // signature 记的是上游用的线上字段名；不是已知名字
+                            // （例如 Anthropic 入站填的是加密签名串）时退回默认。
+                            if let Some(known) = normalize_reasoning_field(signature.as_deref()) {
+                                reasoning_field = known;
+                                reasoning_named = true;
+                            }
+                            reasoning.push_str(text);
+                        }
                         Block::ToolUse { id, name, input } => {
                             tool_calls.push(json!({
                                 "id": id,
@@ -822,8 +898,18 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
                     "role":"assistant",
                     "content": if content.is_empty() { Value::Null } else { Value::String(content) },
                 });
-                if !reasoning.is_empty() {
-                    msg["reasoning_content"] = Value::String(reasoning);
+                // 有具名字段的推理时即使为空也发（保 presence）；无具名来源且文本为空
+                // 则默认完全不发该字段 —— 不发明模型没产生过的内容。
+                //
+                // 例外：渠道声明/学习到「要求非空推理回放」（`crate::codec::replay`，
+                // 由规划层经 extensions 传入）时，没有推理的轮次也要**补一个非空占位** ——
+                // 严格中继会拒绝缺字段与空串，这是唯一能让它接受历史的办法。
+                // 该标记默认关闭，且只在被上游 400 验证过（或模型名明确指向 DeepSeek）时打开。
+                if !reasoning.is_empty() || reasoning_named {
+                    msg[reasoning_field] = Value::String(reasoning);
+                } else if replay_required {
+                    msg[reasoning_field] =
+                        Value::String(crate::codec::replay::PLACEHOLDER.to_string());
                 }
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = Value::Array(tool_calls);
@@ -925,12 +1011,19 @@ pub fn parse_response(body: &[u8]) -> Result<crate::codec::ir::CanonicalResponse
             if let Some(msg) = c.get("message") {
                 // thinking 模型（如 deepseek 系列）：reasoning_content 必须原样回传，
                 // 否则上游在后续轮次校验失败（400）。
-                if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+                // 线上字段名有三种拼写：DeepSeek 系 `reasoning_content`、部分中继的
+                // `reasoning_text` / `reasoning`。把**实际命中的名字**记进 `signature`，
+                // 编码侧据此原样回传同一个名字（口径同 PI-Desktop 的 thinkingSignature）。
+                for field in REASONING_FIELDS {
+                    let Some(rc) = msg.get(field).and_then(Value::as_str) else {
+                        continue;
+                    };
                     if !rc.is_empty() {
                         output.push(Block::Thinking {
-                            signature: None,
+                            signature: Some(field.to_string()),
                             text: rc.to_string(),
                         });
+                        break;
                     }
                 }
                 if let Some(content) = msg.get("content").and_then(Value::as_str) {
@@ -2001,5 +2094,97 @@ mod tests {
             "url 优先于 base64"
         );
         assert_eq!(msgs[1]["content"], "plain");
+    }
+
+    /// 2026-09-22（PI-Desktop 源码对账）：客户端历史里的推理必须**双向**保真。
+    ///
+    /// 三个缺口一起守：
+    /// 1. 入站历史里的 `reasoning_content` 此前**完全没读**（`grep reasoning` 在
+    ///    request 解码区 0 命中）⇒ 跨族到 thinking 上游时历史推理丢失 → 上游 400；
+    /// 2. 线上字段名有三种拼写（`reasoning_content` / `reasoning_text` / `reasoning`），
+    ///    必须**原样回传命中的那个名字**，换名字会被严格中继当成没回传；
+    /// 3. 客户端**显式发过**该字段时（哪怕是空串）要保留「字段存在」这一事实
+    ///    （官方 DeepSeek 接受 `""`），但不发明模型没产生过的内容。
+    #[test]
+    fn client_history_reasoning_replays_with_original_field_name() {
+        // 1) reasoning_content：读出 + 同名回传
+        let req = super::decode_request(
+            br#"{"model":"deepseek-v4-flash","messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","reasoning_content":"prior think","content":"ok"}
+            ]}"#,
+        )
+        .unwrap();
+        let asst = &req.messages[1];
+        assert!(matches!(
+            &asst.blocks[0],
+            Block::Thinking { text, signature }
+                if text == "prior think" && signature.as_deref() == Some("reasoning_content")
+        ));
+        let body = super::encode_request(&req).unwrap();
+        assert_eq!(body["messages"][1]["reasoning_content"], "prior think");
+
+        // 2) 换拼写：`reasoning_text` 进、`reasoning_text` 出（不能改叫 reasoning_content）
+        let req2 = super::decode_request(
+            br#"{"model":"m","messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","reasoning_text":"alt think","content":"ok"}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &req2.messages[1].blocks[0],
+            Block::Thinking { signature, .. } if signature.as_deref() == Some("reasoning_text")
+        ));
+        let body2 = super::encode_request(&req2).unwrap();
+        assert_eq!(body2["messages"][1]["reasoning_text"], "alt think");
+        assert!(
+            body2["messages"][1].get("reasoning_content").is_none(),
+            "不能把客户端用的字段名换掉"
+        );
+
+        // 3) 显式空串：保 presence（官方 DeepSeek 接受 ""）
+        let req3 = super::decode_request(
+            br#"{"model":"m","messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","reasoning_content":"","content":"ok"}
+            ]}"#,
+        )
+        .unwrap();
+        let body3 = super::encode_request(&req3).unwrap();
+        assert_eq!(
+            body3["messages"][1]["reasoning_content"], "",
+            "客户端显式发过的字段应保留存在性"
+        );
+
+        // 4) 客户端没发过 → 不发明（保持既有行为）
+        let req4 = super::decode_request(
+            br#"{"model":"m","messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"ok"}
+            ]}"#,
+        )
+        .unwrap();
+        let body4 = super::encode_request(&req4).unwrap();
+        assert!(body4["messages"][1].get("reasoning_content").is_none());
+    }
+
+    /// 2026-09-22：`developer` 角色此前落到 `other` 分支被**整条丢弃**
+    /// ⇒ 客户端用 developer 传 system prompt 时指令静默消失（只剩一条 CapabilityWarn）。
+    #[test]
+    fn developer_role_maps_to_system_not_dropped() {
+        let req = super::decode_request(
+            br#"{"model":"gpt-5","messages":[
+                {"role":"developer","content":"be terse"},
+                {"role":"user","content":"hi"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.system,
+            vec!["be terse".to_string()],
+            "developer 应归一到 system 段，而不是被丢弃"
+        );
+        assert_eq!(req.messages.len(), 1, "developer 不该再产生一条用户消息");
     }
 }

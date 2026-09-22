@@ -203,8 +203,10 @@ pub struct LogRowView {
     pub http_status: i64,
     pub duration_ms: i64,
     pub is_stream: bool,
-    /// assistant 发起的工具调用次数（转换路径按 IR 计数、直通非流式按响应体计数；
-    /// 直通**流式**不采集，恒 0 —— 字节直通不解析 SSE 语义）
+    /// assistant 发起的工具调用次数（**按 id 去重**）。三条路径口径一致：转换路径按 IR
+    /// 计数、直通非流式按响应体计数、直通**流式**自本版起由 `PassthroughStreamProbe` 计数
+    /// （此前恒 0 —— 「字节直通不解析 SSE 语义」）。观测失败的病态输入（无换行的超限巨块）
+    /// 下可能偏低。
     pub tool_calls: i64,
     /// 响应侧结束原因（IR 口径：`end_turn` / `max_tokens` / `tool_use` / `safety` / `other`）。
     /// 转换路径来自 IR Finish；直通非流式按响应体、直通流式按末尾窗口尽力而为识别。

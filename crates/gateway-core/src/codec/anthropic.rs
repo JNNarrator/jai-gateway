@@ -164,20 +164,21 @@ fn render_leaf_block(b: &Block) -> Option<Value> {
 /// 编码请求：IR → Anthropic Messages body。
 /// `max_output_tokens` 由调用方保证（请求侧缺省时用模型配置值）。
 pub fn encode_request(req: &CanonicalRequest) -> Result<Value, String> {
-    if req.system.len() > 1 {
-        return Err(format!(
-            "system 段数为 {}，跨族转换仅支持单条合并 system",
-            req.system.len()
-        ));
-    }
-
     let mut body = json!({
         "model": req.model,
         "messages": [],
     });
 
-    if let Some(sys) = req.system.first() {
-        body["system"] = Value::String(sys.clone());
+    // 多条 system 按序合并为单条（IR 契约见 ir.rs 的 CanonicalRequest.system 注释；
+    // 与 openai / responses / gemini 三个 encoder 同一口径）。
+    // 此前这里对 >1 段直接 Err → 400「system 段数为 N」。注意触发拓扑：本函数只在
+    // **上游族是 anthropic** 时被调用，而 Anthropic 入站 × Anthropic 上游是同族直通
+    // （不过 encoder），所以旧行为真正伤到的是「**别的入站族** × Anthropic 上游」——
+    // 例如 openai::decode_request 对每条 role=system 消息（以及 system 的多段 content
+    // 数组）各 push 一段 system，于是「客户端发了两条 system」就把上游完全能跑的请求
+    // 在网关侧判死（回归用例见 tests/m5_anthropic_inbound.rs）。
+    if !req.system.is_empty() {
+        body["system"] = Value::String(req.system.join("\n\n"));
     }
     if let Some(m) = req.params.max_output_tokens {
         body["max_tokens"] = json!(m);
@@ -748,7 +749,7 @@ mod tests {
 
 // Claude Code 入站（Anthropic Messages 请求）→ IR；IR → Anthropic 响应/SSE。
 // roadmap M5：
-// - 入站 thinking 字段：Lenient 丢弃 + WARN（Thinking 块仅存储不转换）
+// - 入站 thinking 块：保留为 IR Thinking 块（跨族才能重建 reasoning_content）
 // - tool id 反解：客户端回传的上游 tool_use id 应能关联（M4 已合成 _k{n}，本层识别）
 // - message_start 的 input_tokens 前置填 0、message_delta 终局补齐
 
@@ -798,6 +799,37 @@ fn decode_anthropic_content_block(p: &Value) -> Option<Block> {
     }
 }
 
+/// Anthropic 入站的推理档位推导（2026-09-22）。
+///
+/// Anthropic Messages 有两个与推理相关的面：
+/// - `output_config.effort`：显式档位。ZCode 的 anthropic-messages 内置规则表就以
+///   `{"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}` 的形态注入；
+/// - `thinking.type`：`disabled` = 明确的「关闭推理」（归一为 `none`）；`enabled` /
+///   `adaptive` 只表示「开」，不含档位信息 —— **不臆断**成某个具体档位。
+///
+/// 无线索 → `None`（与既有行为一致：不干预，交给上游默认）。值**原样透传、不做大小写
+/// 归一**，与 openai / responses 入站解码器保持同一口径；值域归一由 capability 规划层
+/// 按渠道声明执行（见 `crate::effort`）—— `none` 落到未声明值域的渠道时仍会被透传，
+/// 与 Responses 入站既有语义一致（声明值域即可收敛/丢弃，见 docs/zcode接入.md）。
+fn decode_anthropic_reasoning_effort(v: &Value) -> Option<String> {
+    if let Some(effort) = v
+        .get("output_config")
+        .and_then(|c| c.get("effort"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(effort.to_string());
+    }
+    match v
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("disabled") => Some("none".to_string()),
+        _ => None,
+    }
+}
+
 /// 解码 Anthropic Messages 请求 → CanonicalRequest。
 pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
     let v: Value = serde_json::from_slice(body).map_err(|e| format!("请求体不是合法 JSON: {e}"))?;
@@ -830,9 +862,7 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
     if let Some(arr) = v.get("messages").and_then(Value::as_array) {
         for m in arr {
             let role = m.get("role").and_then(Value::as_str).unwrap_or_default();
-            // 入站 thinking：仅当 content 中有 thinking 块时 WARN（下面 content 处理捕获）
             let mut blocks: Vec<Block> = Vec::new();
-            let mut saw_thinking = false;
             if let Some(content) = m.get("content") {
                 match content {
                     Value::String(s) => blocks.push(Block::Text { text: s.clone() }),
@@ -904,9 +934,38 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                     });
                                 }
                                 Some("thinking") => {
-                                    saw_thinking = true;
-                                    // 仅存储不转换（protocol-ir §10-3）；块丢弃
-                                    let _ = p;
+                                    // 保留为 Thinking 块（与 openai / responses 入站同一口径）：
+                                    // 跨族时 openai 系上游要用这段文本重建 reasoning_content，
+                                    // 丢掉它会让 thinking 上游在后续轮次校验 400。
+                                    let text = p
+                                        .get("thinking")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
+                                    let signature = p
+                                        .get("signature")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string);
+                                    if !text.is_empty() || signature.is_some() {
+                                        blocks.push(Block::Thinking {
+                                            signature,
+                                            text: text.to_string(),
+                                        });
+                                    }
+                                }
+                                Some("redacted_thinking") => {
+                                    // 加密块无明文：原样存进 signature 位。同族直通不受影响；
+                                    // 跨族无文本可渲染 → 无害丢弃。
+                                    if let Some(data) = p
+                                        .get("data")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                    {
+                                        blocks.push(Block::Thinking {
+                                            signature: Some(data.to_string()),
+                                            text: String::new(),
+                                        });
+                                    }
                                 }
                                 _ => {}
                             }
@@ -914,9 +973,6 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                     }
                     _ => {}
                 }
-            }
-            if saw_thinking {
-                eprintln!("[anthropic-in] 入站 thinking 块已 Lenient 丢弃 + WARN（仅存储不转换）");
             }
             if !blocks.is_empty() {
                 let r = match role {
@@ -989,7 +1045,7 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
         frequency_penalty: None,
         presence_penalty: None,
         seed: None,
-        reasoning_effort: None, // Anthropic 入站无 effort 概念（thinking 为内容块）
+        reasoning_effort: decode_anthropic_reasoning_effort(&v),
     };
 
     // 未建模字段（§7 Lenient；stream 已建模不收集）
@@ -1354,16 +1410,62 @@ mod m5_tests {
     }
 
     #[test]
-    fn decode_anthropic_thinking_lenient() {
+    fn decode_anthropic_thinking_block_is_preserved() {
+        // 2026-09-22：入站 thinking 块不再丢弃 —— 与 openai / responses 入站对齐。
+        // 跨族（→ openai 系 thinking 上游）要靠文本重建 reasoning_content，
+        // 丢掉它会让上游在后续轮次校验 400（同 responses.rs 里 76cb5093 的实测结论）。
         let body = br#"{
             "model":"m","messages":[{"role":"assistant","content":[
-                {"type":"thinking","thinking":"hidden"},
+                {"type":"thinking","thinking":"hidden","signature":"sig-1"},
                 {"type":"text","text":"visible"}
             ]}]
         }"#;
         let req = decode_request(body).unwrap();
-        assert_eq!(req.messages[0].blocks.len(), 1, "thinking 块应被丢弃");
-        assert_eq!(req.messages[0].blocks[0].as_text(), Some("visible"));
+        assert_eq!(req.messages[0].blocks.len(), 2, "thinking 块应保留");
+        assert!(matches!(
+            &req.messages[0].blocks[0],
+            Block::Thinking { text, signature }
+                if text == "hidden" && signature.as_deref() == Some("sig-1")
+        ));
+        assert_eq!(req.messages[0].blocks[1].as_text(), Some("visible"));
+    }
+
+    /// ZCode 的 anthropic-messages 内置规则表注入形态
+    /// （`config/provider/zcode-builtin.json` 的 `reasoningLevel.map`）：
+    /// `{"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`。
+    #[test]
+    fn decode_anthropic_reasoning_effort_from_output_config() {
+        let body = br#"{"model":"m","max_tokens":64,"messages":[],
+            "thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}"#;
+        assert_eq!(
+            decode_request(body)
+                .unwrap()
+                .params
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+
+        // 只有「关闭」语义（无 output_config）→ 归一为 none，再交给渠道值域声明处理
+        let off = br#"{"model":"m","max_tokens":64,"messages":[],
+            "thinking":{"type":"disabled"}}"#;
+        assert_eq!(
+            decode_request(off)
+                .unwrap()
+                .params
+                .reasoning_effort
+                .as_deref(),
+            Some("none")
+        );
+
+        // 只声明「开」、不带档位 → 不臆断具体档位
+        let on = br#"{"model":"m","max_tokens":64,"messages":[],
+            "thinking":{"type":"enabled","budget_tokens":8000}}"#;
+        assert!(decode_request(on)
+            .unwrap()
+            .params
+            .reasoning_effort
+            .is_none());
     }
 
     #[test]

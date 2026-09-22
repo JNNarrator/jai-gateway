@@ -41,6 +41,8 @@ pub enum FormatDegradation {
 /// 出站协议族的能力声明。
 #[derive(Debug)]
 pub struct Capabilities {
+    /// 该能力表对应的出站协议族（规划层据此决定哪些「渠道策略」对该族有意义）
+    pub family: Family,
     /// 支持的请求参数名（文档性声明；SampleParams 各字段由 encoder 负责映射）
     pub parameters: HashSet<&'static str>,
     /// 支持的工具声明类型（IR `ToolSpec` 目前只有 function）
@@ -86,6 +88,7 @@ const EXTENDED_TOOLS_DEGRADED: &[(&str, &str)] = &[
 ];
 
 static OPENAI_COMPAT_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
+    family: Family::OpenAiCompat,
     parameters: set(&[
         "stream",
         "temperature",
@@ -111,6 +114,7 @@ static OPENAI_COMPAT_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilitie
 });
 
 static OPENAI_RESPONSES_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
+    family: Family::OpenAiResponses,
     parameters: set(&[
         "stream",
         "temperature",
@@ -133,6 +137,7 @@ static OPENAI_RESPONSES_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabili
 });
 
 static ANTHROPIC_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
+    family: Family::Anthropic,
     parameters: set(&["max_output_tokens", "temperature", "top_p", "top_k", "stop"]),
     tools: set(&["function"]),
     tools_degraded: EXTENDED_TOOLS_DEGRADED,
@@ -150,6 +155,7 @@ static ANTHROPIC_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
 });
 
 static GEMINI_CAPS: LazyLock<Capabilities> = LazyLock::new(|| Capabilities {
+    family: Family::Gemini,
     parameters: set(&[
         "max_output_tokens",
         "temperature",
@@ -259,12 +265,16 @@ pub struct ChannelPolicy {
     pub effort: Option<EffortPolicy>,
     /// 工具声明数上限（0012）：None = 未声明 ⇒ 不拦，由上游裁决
     pub max_tools: Option<usize>,
+    /// 该渠道是否需要「非空推理回放」（`crate::codec::replay`）：
+    /// 推断命中或学习命中时为 true。仅在目标族是 openai_compat 时落地
+    /// （推理字段只存在于 chat-completions 线上）。
+    pub reasoning_replay: bool,
 }
 
 impl ChannelPolicy {
-    /// 两项都没声明 → None（调用方可借此整段短路，保持零干预快路径）。
+    /// 三项都没声明 → None（调用方可借此整段短路，保持零干预快路径）。
     pub fn is_empty(&self) -> bool {
-        self.effort.is_none() && self.max_tools.is_none()
+        self.effort.is_none() && self.max_tools.is_none() && !self.reasoning_replay
     }
 }
 
@@ -294,6 +304,8 @@ pub struct CompatibilityPlan<'a> {
     pub tool_identities: Option<Vec<Value>>,
     /// 推理档位改写动作（0011；`Keep` = 不动）
     pub reasoning_rewrite: EffortRewrite,
+    /// 该渠道需要「非空推理回放」（`crate::codec::replay`）：resolve 时写入 extensions
+    pub reasoning_replay: bool,
 }
 
 /// 规划应用产物：拒绝错误 / WARN 汇总 / 请求改写已完成。
@@ -334,6 +346,7 @@ pub fn plan_compatibility_with<'a>(
         output_contract: None,
         tool_identities: None,
         reasoning_rewrite: EffortRewrite::Keep,
+        reasoning_replay: policy.is_some_and(|p| p.reasoning_replay),
     };
 
     plan_response_format(req, caps, &mut plan);
@@ -835,6 +848,15 @@ impl<'a> CompatibilityPlan<'a> {
                 .insert(TOOL_IDENTITIES_KEY.into(), Value::Array(identities));
         }
 
+        // 6) 推理回放兼容（自适应，`crate::codec::replay`）：把「该渠道要求非空推理」
+        //    告诉 openai encoder。走 extensions 而不是改 encoder 签名 —— 与 5) 同一套机制。
+        //    只在目标族是 openai_compat 时落地：推理字段只存在于 chat-completions 线上，
+        //    对 anthropic / gemini 出站塞这个标记没有意义。
+        if self.reasoning_replay && self.capabilities.family == Family::OpenAiCompat {
+            req.extensions
+                .insert(crate::codec::replay::EXT_KEY.into(), json!(true));
+        }
+
         PlanOutcome {
             rejection: None,
             warnings,
@@ -1056,6 +1078,7 @@ mod tests {
     fn json_object_degrade_to_provider_format_for_chat_compat_target() {
         // anthropic 无 json_object 成员；若未来某族 degraded=JsonObject，应覆写 extensions。
         let caps = Capabilities {
+            family: Family::OpenAiCompat,
             parameters: set(&[]),
             tools: set(&["function"]),
             tools_degraded: &[],
@@ -1129,6 +1152,7 @@ mod tests {
         let policy = ChannelPolicy {
             effort: None,
             max_tools: Some(128),
+            reasoning_replay: false,
         };
         let mut rejected_req = req.clone();
         let plan =
@@ -1142,6 +1166,7 @@ mod tests {
         let wide = ChannelPolicy {
             effort: None,
             max_tools: Some(300),
+            reasoning_replay: false,
         };
         let mut ok_req = req.clone();
         let plan = plan_compatibility_with(&ok_req, caps_of(Family::OpenAiCompat), Some(&wide));

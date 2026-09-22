@@ -334,11 +334,28 @@ function 工具（所有出站族统一，`tools_degraded` 表）：
 | Boolean | none | `thinking:{type:"disabled"}` |
 | None | 任意 | 忽略 + WARN |
 
+**入站方向**（客户端 → IR，2026-09-22 补齐）：
+
+| 入站族 | 客户端字段 | IR |
+| --- | --- | --- |
+| openai_compat | 顶层 `reasoning_effort` | `params.reasoning_effort`（原样透传） |
+| openai_responses | `reasoning.effort`（`reasoning` 内其余同级键不保留） | `params.reasoning_effort`（原样透传） |
+| anthropic | 优先 `output_config.effort`；否则 `thinking.type == "disabled"` → `none` | `params.reasoning_effort`（原样透传；`enabled` / `adaptive` 不带档位时**不臆断**） |
+| gemini | — | 无 |
+
+值域归一（`effort::place`）只在**出站族**为 Native（openai 系）时生效 —— 直通（`normalize_body`）
+与跨族（`plan_reasoning` → `EffortRewrite`）两条路径一致；Boolean / None 族只记诊断不改写。
+
 ## 11. 已知边界与未决项
 
 | # | 事项 | 当前决策/说明 |
 | --- | --- | --- |
 | 1 | `POST /v1/messages/count_tokens`（Claude Code 会调用） | MVP 返回粗估（chars/4 级别），避免 CC 降级报错；精确实现随用量统计一起做 |
 | 2 | http(s) 图片 → Gemini | Gemini 不接受任意外链（fileData 仅限 GCS URI），Codec 需拉取转 inlineData/base64；拉取失败明确报错 |
-| 3 | thinking/signature 跨族 | v1 仅占位存储不转换；直通不受影响 |
+| 3 | thinking/signature 跨族 | **已实现（2026-09-22）**：入站三个族都产出 `Block::Thinking`（anthropic 的 `thinking` / `redacted_thinking` 内容块、openai 的三种推理字段拼写、responses 的 reasoning item）；出站 openai 系重建推理字段、responses 重建 reasoning item，**anthropic 出站仍不产出**（本族直通不受影响）。`Block::Thinking.signature` 在 openai 线上承载**实际命中的字段名**（`reasoning_content` / `reasoning_text` / `reasoning`，回传时原样同名），在 anthropic 线上承载加密签名串 —— 编码侧做白名单校验，两者不会互相污染 |
 | 4 | Anthropic prompt caching 标记（cache_control） | 仅同族直通有效；跨族丢弃并 WARN |
+| 5 | Responses 上游流式 | **已支持（2026-09-22）**：`responses::parse_stream_event` 按官方 SSE 形状（`response.created` / `output_item.added` / `*_text.delta` / `reasoning_*_text.delta` / `output_item.done` / `response.completed`）解析成 IR StreamEvent，`stop_reason` / usage 与 `parse_response` 同一套口径。此前该分支把每个 `data:` 行直接丢弃 → 「200 + text/event-stream + 零帧」的静默空轮 |
+| 6 | 上游忽略 `stream:true` 回整包 JSON | **已兜底（2026-09-22）**：转换器按上游**实际** content-type 选择（`ct_is_sse`），整包响应由 `convert_plain_response(as_stream)` 用同一套渲染器补成入站 SSE，收尾口径与流式自然结束一致 |
+| 7 | 上游错误响应头 | **白名单回传（2026-09-22）**：`retry-after` / `retry-after-ms` / `x-request-id`。其余上游头不回传。此前错误收尾只重建 status + content-type + body，退避提示全丢 → 客户端与上游限速窗口错拍 |
+| 8 | 严格中继要求**非空**推理回放 | **已实现（自适应，2026-09-22）**：见 [`codec::replay`](../../crates/gateway-core/src/codec/replay.rs)。三层逐层收紧 —— ①**推断**：渠道模型名 / base_url / 供应商名含 `deepseek` ⇒ 直接按「需要非空回放」处理（零额外往返）；②**学习**：没猜中的上游第一次被它 400（识别「点名推理字段 + 要求存在/非空」的 4xx）后记下该渠道并**用兼容原地重试一次**，客户端只看到成功，**只有重试成功才保留**；③**抑制**：已开启仍被同类错误拒 ⇒ 记 `Some(false)` 压住推断，之后不干预也**不抖动**（三态 `Option<bool>`，只在未学习时判断一次）。标记是**供应商级**的，落库走现成 `meta` KV 表 ⇒ **无新迁移**；规划层经 `req.extensions`（`__jai_reasoning_replay`）告知编码器 ⇒ **四个 `encode_request` 签名不变**。跨族路径由 `openai::encode_request` 补占位；同族直通（不经编码器）由 `replay::inject_placeholders` 在原始 JSON 上补（只动「三个已知拼写都没有」的 assistant 消息）。占位符默认关闭 —— 网关不发明模型没产生过的内容 |
+| 9 | `role: "developer"` 入站 | **已支持（2026-09-22）**：两条 OpenAI 系入站都归一到 system 段 / `instructions`。此前 chat-completions 侧整条丢弃（system prompt 静默消失）、responses 侧折成 User 消息 |

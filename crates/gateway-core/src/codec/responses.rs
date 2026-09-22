@@ -385,6 +385,23 @@ pub fn decode_request(body: &[u8]) -> Result<CanonicalRequest, String> {
                                     }
                                 }
                             }
+                            // `developer` / `system` 输入项是 Responses 协议里 system prompt
+                            // 的两种写法。此前只区分 assistant 与「其他」→ 它们被折成 User
+                            // 消息，指令语义降级成用户轮次。这里提升为 system 段。
+                            if role == "developer" || role == "system" {
+                                let text = blocks
+                                    .iter()
+                                    .filter_map(|b| match b {
+                                        Block::Text { text } => Some(text.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
+                                if !text.is_empty() {
+                                    system.push(text);
+                                }
+                                continue;
+                            }
                             if role == "assistant" {
                                 // 消息内嵌 reasoning 字段（OpenAI 标准形状）或内嵌
                                 // function_call（推理模型的真实历史格式）都并入本轮。
@@ -876,6 +893,29 @@ fn finish_status(stop_reason: &StopReason) -> (&'static str, Option<&'static str
     }
 }
 
+/// ## 已知边界（决策记录）：零可见输出的截断在 Responses 协议上不可区分
+///
+/// 「上游 `finish_reason:"length"`、整轮只有 reasoning、正文为空」这种轮次，对 agent 客户端
+/// 等于丢一轮（PI-Desktop 判 silent turn → 重跑一次 → 仍静默 → `EMPTY_MODEL_RESPONSE`）。
+/// 网关侧能分辨它（见 `server::proxy::truncation_diagnostic`，已落 `request_logs.error_kind`），
+/// 但**刻意不把它编进 Responses 响应体**，理由三条：
+///
+/// 1. **对现有客户端零收益**。PI-Desktop 的 Responses 解析器只读 `status` /
+///    `incomplete_details` / `output` / `usage`，不读任何扩展字段 ⇒ 加字段不会改变用户看到的
+///    东西（仍是 `stopReason:"length"` + 空正文 → 仍报 `EMPTY_MODEL_RESPONSE`）。要兑现收益
+///    必须同时改客户端，是跨仓库协同。
+/// 2. **客户端用已有信息就能解决**。它手上已经有 `stopReason:"length"` + 空正文，完全可以在
+///    本地给出「输出预算被推理耗尽」。不需要网关多给一个字段。
+/// 3. **改响应体形状有实测过的风险**。`TERMINAL_EVENT` 的注释就是实测得来的（`openai@6.x`
+///    只在 `response.completed` 上累积快照）；同一 SDK 对未知字段的态度未验证。且 `metadata`
+///    是**用户传入、原样回显**的字段，网关往里写会与客户端自己的 metadata 冲突 —— 真要加
+///    只能用 JAI 私有顶层键，而 `status` / `incomplete_details.reason` 的组合绝不能动
+///    （见 [`finish_status`]：偏离现状会复现「一次截断被放大成重试风暴」）。
+///
+/// 所以：**诊断走日志，不走协议**。将来若确要走客户端可见那条路，顺序是
+/// ① 先实测 `openai@6.x` 与目标客户端对未知字段的态度；② 用 JAI 私有顶层键而非 `metadata`；
+/// ③ 绝不碰 `status` / `incomplete_details` 的组合。
+///
 /// 终局事件名：**恒为 `response.completed`**（含截断）。
 ///
 /// 刻意不跟 OpenAI 的 `response.incomplete` 事件名：语义（`status` + `incomplete_details`）
@@ -1366,6 +1406,168 @@ pub fn parse_response(body: &[u8]) -> Result<CanonicalResponse, String> {
         stop_reason,
         usage: parsed_usage,
     })
+}
+
+/// 解析 OpenAI Responses 的 SSE 帧 → IR StreamEvent（上游侧）。
+///
+/// 与 [`render_stream_event`]（入站渲染）互逆；事件名/字段名以官方 Responses 流式形状为准，
+/// `response.completed` 里带**完整** `response` 对象（含 `output` 与 `usage`），所以
+/// `stop_reason` / usage 可以照 [`parse_response`] 的同一套口径推导，不必在流里另做累计。
+///
+/// 此前这条线**没有解析器**：`proxy.rs` 的 `convert_streaming_response` 对
+/// `openai_responses` 上游把每个 `data:` 行直接丢弃 → 客户端拿到
+/// 「200 + text/event-stream + 零帧」的静默空轮（见该处注释与回归用例）。
+pub fn parse_stream_event(raw: &[u8]) -> Result<Vec<StreamEvent>, String> {
+    let v: Value =
+        serde_json::from_slice(raw).map_err(|e| format!("Responses SSE JSON 解析失败: {e}"))?;
+    let typ = v.get("type").and_then(Value::as_str).unwrap_or_default();
+    let mut out: Vec<StreamEvent> = Vec::new();
+
+    // 上游的 output_index 就是 IR 的工具下标（同一流内自洽，渲染侧只做分组）。
+    let idx = v.get("output_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+    match typ {
+        // 建流事件：只报 Start，让渲染侧重置状态（output_index / 累积 output）
+        "response.created" | "response.in_progress" => {
+            if let Some(model) = v
+                .get("response")
+                .and_then(|r| r.get("model"))
+                .and_then(Value::as_str)
+            {
+                out.push(StreamEvent::Start {
+                    model: model.to_string(),
+                });
+            }
+        }
+        "response.output_item.added" => {
+            if let Some(item) = v.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    // 与 parse_response 同一口径：优先 call_id，退回 item id
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    out.push(StreamEvent::ToolCallStart {
+                        index: idx,
+                        id,
+                        name,
+                    });
+                }
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            if let Some(d) = v.get("delta").and_then(Value::as_str) {
+                if !d.is_empty() {
+                    out.push(StreamEvent::ToolCallArgsDelta {
+                        index: idx,
+                        args_fragment: d.to_string(),
+                    });
+                }
+            }
+        }
+        // 每个 item 都有终结帧；严格客户端（zcode / AI SDK）只认 output_item.done 来终结工具调用
+        "response.output_item.done" => {
+            if let Some(item) = v.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    out.push(StreamEvent::ToolCallEnd { index: idx });
+                }
+            }
+        }
+        "response.output_text.delta" => {
+            if let Some(d) = v.get("delta").and_then(Value::as_str) {
+                if !d.is_empty() {
+                    out.push(StreamEvent::TextDelta {
+                        text: d.to_string(),
+                    });
+                }
+            }
+        }
+        // 推理增量：summary 与 content 两种通道都映射为 ThinkingDelta
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            if let Some(d) = v.get("delta").and_then(Value::as_str) {
+                if !d.is_empty() {
+                    out.push(StreamEvent::ThinkingDelta {
+                        text: d.to_string(),
+                    });
+                }
+            }
+        }
+        // 终局：completed / incomplete 都带完整 response 对象
+        "response.completed" | "response.incomplete" => {
+            let response = v.get("response").cloned().unwrap_or_else(|| json!({}));
+            let saw_tool_use = response
+                .get("output")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .any(|i| i.get("type").and_then(Value::as_str) == Some("function_call"))
+                })
+                .unwrap_or(false);
+            let status = response
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            let stop_reason = if saw_tool_use {
+                StopReason::ToolUse
+            } else if status == "incomplete" {
+                StopReason::MaxTokens
+            } else {
+                StopReason::EndTurn
+            };
+            out.push(StreamEvent::Finish {
+                stop_reason,
+                usage: usage_from_response_object(&response),
+            });
+        }
+        // 上游在流里报错：交给调用方按 SseParseWarn 记日志（不静默当成功）
+        "response.failed" | "error" => {
+            let msg = v
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .or_else(|| v.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("上游返回流式错误");
+            return Err(format!("Responses 上游流式错误: {msg}"));
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// Responses 的 usage 对象 → IR Usage；口径与 [`parse_response`] 完全一致。
+fn usage_from_response_object(r: &Value) -> Usage {
+    let usage = r.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let mut out = Usage::default();
+    if let Some(n) = usage.get("input_tokens").and_then(Value::as_u64) {
+        out.input_tokens = n;
+    }
+    if let Some(n) = usage.get("output_tokens").and_then(Value::as_u64) {
+        out.output_tokens = n;
+    }
+    if let Some(d) = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+    {
+        out.cache_read_tokens = Some(d);
+    }
+    if let Some(d) = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+    {
+        out.cache_write_tokens = Some(d);
+    }
+    out
 }
 
 /// 把非流式 CanonicalResponse 渲染为符合 OpenAI Responses 真实 SSE 形状的完整帧。
@@ -3879,5 +4081,31 @@ mod tests {
             .clone();
         assert_eq!(out.len(), 1, "第二轮不该带上第一轮的 item，实际 {out:?}");
         assert_eq!(out[0]["content"][0]["text"].as_str(), Some("第二轮"));
+    }
+
+    /// 2026-09-22（PI-Desktop 源码对账）：`developer` / `system` 输入项此前只区分
+    /// assistant 与「其他」→ 被折成 **User 消息**，指令语义降级成用户轮次。
+    #[test]
+    fn developer_and_system_items_become_instructions() {
+        let req = decode_request(
+            br#"{
+                "model":"gpt-5",
+                "input":[
+                    {"type":"message","role":"developer",
+                     "content":[{"type":"input_text","text":"be terse"}]},
+                    {"type":"message","role":"system",
+                     "content":[{"type":"input_text","text":"be kind"}]},
+                    {"role":"user","content":[{"type":"input_text","text":"hi"}]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.system,
+            vec!["be terse".to_string(), "be kind".to_string()],
+            "developer / system 输入项应提升为 system 段（按序）"
+        );
+        assert_eq!(req.messages.len(), 1, "只剩那条真正的用户消息");
+        assert_eq!(req.messages[0].role, Role::User);
     }
 }

@@ -7,6 +7,7 @@
 //! - `anthropic`：Anthropic 直通助手（M3）+ UpstreamCodec::Anthropic（M4）
 //! - `gemini`   ：UpstreamCodec::Gemini（M4）
 //! - `image`    ：图片块构造与 data URL 解析的共享工具（跨族保真）
+//! - `replay`   ：推理回放兼容（自适应：推断 + 学习 + 遗忘，见模块头）
 //!
 //! 实现节奏：M1 直通 → M3 Anthropic 直通 → M4/M5 跨族 Codec → M6 Responses 入站。
 
@@ -18,6 +19,7 @@ pub mod gemini;
 pub mod image;
 pub mod ir;
 pub mod openai;
+pub mod replay;
 pub mod responses;
 
 /// 协议家族。同族请求/上游之间允许字节级直通（见 IR 文档 §1 原则一）。
