@@ -1439,3 +1439,95 @@ $ node -e "…_env.mjs…"                            → /…/JAI/ui/node_modul
 - **`fold.mjs` 崩溃而 `gate.mjs` 报「✓ 全部通过」。** 根因与对策见 4.2。
   修后实测：`tables` 字段恢复（模型页 900×600 表 674/容器 724、溢出 -50），
   且**探针崩溃时门禁必红**（判据「探针可运行」）。
+
+## 5. 最小窗口尺寸：实测下限 + macOS 上的静默失效（2026-09-22）
+
+> 触发来源：用户提出「估测一下最小窗口需要多少，把最小大小限制一下 —— 缩得太小 UI 会错乱/难看，
+> 所有 UI 都要能正常展示」。
+> 结论：**最小 900×600 不变**（这次是实测出来的下限，不是拍的），但**它在主力平台 macOS 上从未生效**，
+> 本轮把这条限制真正落地，并把「不许再静默丢」变成一条门禁。
+
+### 5.1 下限是怎么量出来的（不是估的）
+
+判据用现有门禁的 `audit.mjs`（`truncated` = **被截断且没有 `title` 兜底**的文本，即信息真的丢了）。
+固定高度 600、只改宽度：
+
+| 宽度 | 1180 | **900** | 890 | 880 | 860 | 820 |
+|---|---|---|---|---|---|---|
+| `truncated` | 0 | **0** | 7 | 9 | 16 | 18 |
+| `hScroll` | 0 | **0** | 0 | 0 | 0 | 0 |
+
+**900 是「零信息丢失」的硬边界，且余量为 0px**（890 立刻掉 7 处）。低于 900 布局不会「崩」
+（表格是流式的，`hScroll` 一直为 0），但会开始**静默截断**：`http://127.0.0.1:1314/v1/chat/completion`
+这类长 URL 与技能描述被切掉且没有 tooltip 兜底 —— 正是用户说的「比较难看 / 信息看不到」。
+
+高度方向宽松得多（弹窗自带 `max-h` + 内滚，自适应），固定宽度 900 只改高度：
+
+| 高度 | 600 | 560 | 520 | 480 |
+|---|---|---|---|---|
+| `truncated` / `hScroll` / 弹窗越界 / 弹窗控件滚不到 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+
+⇒ 高度 600 不是「技术下限」而是**可用性下限**（首屏要放得下主操作条 + 双列卡片），与
+§3 第 12 条（默认 1180×800、最小 900×600）的历史结论一致，故**不改这个数**。
+
+### 5.2 真问题：macOS 上这个限制根本没生效（根因）
+
+`tauri.macos.conf.json` 用 `app.windows` 覆盖窗口配置，而 Tauri 的平台配置合并走
+**JSON Merge Patch（RFC 7396）**：**数组是整体替换，不是按下标逐字段合并**。
+于是基础配置 `tauri.conf.json` 里那个窗口对象的 `label/title/width/height/minWidth/minHeight`
+在 macOS 上被**全部丢弃**：
+
+```rust
+// 实测：tauri_utils::config::parse::read_from(Target::MacOS, "src-tauri")  —— 改动前
+app.windows = [ { decorations, hiddenTitle, titleBarStyle, transparent, windowEffects } ]
+//              ↑ 没有 minWidth/minHeight ⇒ macOS 上没有任何最小尺寸限制，可以拖到极小
+//              ↑ 也没有 width/height ⇒ 窗口退回 Tauri 默认 800×600（而非设计值 1180×800）
+```
+
+为什么一直没被发现：§4 的双尺寸验收是在**浏览器探针**里按视口尺寸跑的（`gate.mjs --size=900x600`），
+它验证的是「900×600 时 UI 正常」，**从来不是**「真实窗口拖不到 900×600 以下」。
+即 §4 自己写的教训 —— **「最小窗口 900×600 从没被当成一等公民验收过」** —— 的又一处体现，
+只不过这次漏的是「限制本身是否生效」。
+
+### 5.3 处置
+
+1. **`src-tauri/tauri.macos.conf.json`**：把被数组替换吃掉的 6 个键**显式补齐**
+   （`label/title/width/height/minWidth/minHeight`），值取基础配置的设计值
+   （1180×800 / 最小 900×600）。平台专有的 `decorations/titleBarStyle/hiddenTitle/transparent/windowEffects` 保持不变。
+2. **新增 `scripts/tauri_window_check.mjs`（零依赖门禁）**，两条判据：
+   - ① **键集完整性**：平台配置里的窗口对象必须重新声明基础配置里的**每一个**键
+     （值可不同 —— `decorations`/`windowEffects` 正是故意按平台不同的）。以后谁在基础配置加一个窗口键、
+     忘了同步平台文件，门禁立刻红，而不是在某个平台上静默丢。
+   - ② **下限不低于 UI 验收尺寸**：解析后的 `minWidth/minHeight` ≥ UI 验收尺寸。
+     **单一来源**：不硬编码 900×600，而是从 `gate.mjs` 读它的 `--sizes` 默认值取最小一组 ——
+     改验收尺寸只需改 `gate.mjs` 一处；**正则失配时判据直接报错**（不允许静默变绿，见 §4 的教训）。
+   已接进 `tools/visual-regression/gate.mjs` 的「1. 静态规范（零依赖）」段，即
+   `release_check.sh` 第 6 步自动覆盖。
+
+### 5.4 验证证据
+
+**① 解析结果（`tauri_utils::config::parse::read_from` + 反序列化成 tauri `Config`，`deny_unknown_fields`）**
+
+```
+=== MacOS (files: ["tauri.conf.json", "tauri.macos.conf.json"])
+  反序列化 OK: label="main" title="JAI Gateway" size=1180x800 min=Some(900.0)xSome(600.0) decorations=true
+=== Windows (files: ["tauri.conf.json"])
+  反序列化 OK: label="main" title="JAI Gateway" size=1180x800 min=Some(900.0)xSome(600.0) decorations=false
+```
+
+**② 门禁本身的正/负控制（证明它真的能红，不是装饰）**
+
+| 场景 | 结果 |
+|---|---|
+| 修复后（正控制） | `✓ 最小窗口尺寸门禁通过（… 均为 900×600，默认 1180×800；UI 验收下限 900×600）` 退出码 0 |
+| 回退成改动前那份 macOS 配置（负控制 1） | 红：`漏了基础配置里的 label, title, width, height, minWidth, minHeight` + `minWidth=undefined minHeight=undefined`，退出码 1 |
+| 键齐全但 `minWidth/minHeight = 700×480`（负控制 2） | 红：`700×480 < 验收下限 900×600`，退出码 1 |
+| 恢复后 | 绿，退出码 0 |
+
+**③ 全量 UI 门禁**：`node tools/visual-regression/gate.mjs` → `✓ 全部通过`
+（新增的静态判据出现在输出里：`── scripts/tauri_window_check.mjs（最小窗口尺寸）`）。
+
+**④ 编译期校验**：`cargo check`（`generate_context!` 会在编译期解析平台配置）通过。
+
+> 备注（与 §4 ⑩ 同口径）：本轮**只改配置与门禁**，未触碰 `crates/` 与 `src-tauri/src/` 的任何 Rust 行为；
+> 工作区里 `crates/gateway-core/**` 的改动来自另一个并行工作流，与本轮无关。

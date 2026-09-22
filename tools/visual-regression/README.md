@@ -18,6 +18,7 @@ cd .. && node tools/visual-regression/gate.mjs                                 #
 | `probe-hits.mjs` | **有效命中区** ≥24×24（命中区判据的唯一归属） |
 | `fold.mjs` | 主操作首屏可达、无横向溢出、行内控件不被折叠线切半、表格不溢出容器、**吸顶表头真的吸顶**（实测滚动）、弹窗 Esc 可关 |
 | `audit.mjs` | 对比度 AA、字号、截断有 title 兜底、横向溢出、弹窗几何、**弹窗 footer 不与 toast 带重叠** |
+| `scripts/tauri_window_check.mjs` | **最小窗口尺寸在各平台都生效**（零依赖）：平台配置合并（RFC 7396）数组是整体替换，会把基础配置的 `minWidth/minHeight` 静默丢掉 —— macOS 曾因此**完全没有最小尺寸限制**；判据含「平台窗口必须补齐基础配置的每个键」+「解析后最小尺寸 ≥ 本文件 `SIZES` 的最小验收尺寸」 |
 
 判据集中写在 `gate.mjs` 里（不散落到各探针），任何一条不满足即退出码 1，并指出
 「哪条判据、哪个尺寸/主题、具体是什么」。它已接进 `scripts/release_check.sh` 第 6 步。

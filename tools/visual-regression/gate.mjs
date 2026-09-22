@@ -71,6 +71,17 @@ const runProbe = (label, file, outName) => {
 const lint = run("scripts/ui_lint.sh（静态 UI 规范）", "bash", ["scripts/ui_lint.sh"]);
 if (lint.code !== 0) fail("静态规范 ui_lint", "全仓库", "见上方违规清单");
 
+// 最小窗口尺寸门禁（零依赖）：平台配置合并（RFC 7396，数组整体替换）会把基础配置里的
+// `minWidth/minHeight` 静默丢掉 —— 曾经 macOS 上**完全没有最小尺寸限制**，
+// 而 900×600 这个下限本身是实测出来的（890 宽起出现静默截断）。
+// 判据的验收尺寸单一来源就是本文件的 SIZES，故放在这里而不是另立一处。
+const winCfg = run("scripts/tauri_window_check.mjs（最小窗口尺寸）", "node", [
+  "scripts/tauri_window_check.mjs",
+]);
+if (winCfg.code !== 0) {
+  fail("最小窗口尺寸在各平台都生效", "src-tauri/*.conf.json", winCfg.out.split("\n").filter(Boolean).slice(-6).join("\n"));
+}
+
 // ─────────────────────── 2. 逐尺寸的探针 ───────────────────────
 const hitResults = {};
 for (const size of SIZES) {

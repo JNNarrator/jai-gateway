@@ -238,7 +238,8 @@ bash scripts/dev.sh     # 一键启动：Vite + Tauri 桌面壳
 | --- | --- |
 | `bash scripts/regression.sh` | `cargo fmt --check` + `clippy -D warnings` + `cargo test --workspace` + 前端 `tsc --noEmit && vite build` |
 | `bash scripts/ui_lint.sh` | UI 静态规范：字号 ≥11px、图标按钮有可访问名、列表 key 不用下标、命中区不靠伪元素外扩 |
-| `node tools/visual-regression/gate.mjs` | UI 探针（需 vite:5173）：1180×800 / 900×600 × 明暗双主题，判据含对比度 AA、字号 ≥11px、无横向溢出、弹窗几何、主操作首屏可达、有效命中区 ≥24×24，单一退出码 |
+| `node tools/visual-regression/gate.mjs` | UI 探针（需 vite:5173）：1180×800 / 900×600 × 明暗双主题，判据含对比度 AA、字号 ≥11px、无横向溢出、弹窗几何、主操作首屏可达、有效命中区 ≥24×24、**最小窗口尺寸在各平台都生效**，单一退出码 |
+| `node scripts/tauri_window_check.mjs` | 最小窗口尺寸门禁（零依赖）：平台配置合并（RFC 7396）数组整体替换会静默丢掉基础配置的 `minWidth/minHeight`（macOS 曾因此没有最小尺寸限制），故要求平台窗口补齐基础配置的每个键，且解析后最小尺寸 ≥ UI 验收尺寸（900×600） |
 | `bash scripts/release_check.sh` | 发布前 7 步门禁：工作区干净 / 版本 / CHANGELOG / tag / 全量回归 / UI 门禁 |
 | `node scripts/setup_dsh_test.mjs` | dsh 接入脚本自测（离线、自带假网关，9 项断言） |
 | `bash scripts/observe48h.sh` | 常驻观察采样（配合 `scripts/jai_supervisor.sh` 拉活） |

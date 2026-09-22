@@ -169,6 +169,35 @@ All notable changes to this project will be documented in this file.
   §11-8「严格中继要求非空推理回放」由「未做（需渠道级开关 + 0013 迁移）」改为「已实现（自适应方案）」，
   并指向新增的 `codec::replay` 模块。
 
+### 最小窗口尺寸：macOS 上的限制从未生效（2026-09-22）
+
+- **macOS 上「最小窗口 900×600」一直是个空承诺**：`tauri.macos.conf.json` 用 `app.windows`
+  覆盖窗口配置，而 Tauri 的平台配置合并走 **JSON Merge Patch（RFC 7396）—— 数组是整体替换，
+  不是按下标逐字段合并**。于是基础配置里的 `label/title/width/height/minWidth/minHeight`
+  在 macOS 上被**全部丢弃**：窗口退回 Tauri 默认 **800×600**（而非设计值 1180×800），
+  且 `minWidth/minHeight` 变成 `None` ⇒ **macOS 上没有任何最小尺寸限制，窗口能被拖到极小、UI 错乱**。
+  实测（`tauri_utils::config::parse::read_from(Target::MacOS)`，改动前）：
+  `app.windows = [{ decorations, hiddenTitle, titleBarStyle, transparent, windowEffects }]`。
+  一直没被发现，是因为双尺寸验收是在**浏览器探针**里按视口跑的（验证「900×600 时 UI 正常」），
+  **从来不是**「真实窗口拖不到 900×600 以下」。
+- 处置：macOS 平台配置**显式补齐**被数组替换吃掉的 6 个键（值取基础配置设计值
+  1180×800 / 最小 900×600）；平台专有的 `decorations`/`titleBarStyle`/`hiddenTitle`/
+  `transparent`/`windowEffects` 保持不变。
+- **下限 900×600 是量出来的，不是估的**（`audit.mjs` 的 `truncated` = 被截断且无 `title` 兜底的文本）：
+  固定高 600 只改宽度 —— 1180/900 为 **0** 处，890 为 7、880 为 9、860 为 16、820 为 18；
+  `hScroll` 全程 0（表格是流式的，不会「崩」，但会开始**静默截断**长 URL 与技能描述）。
+  ⇒ **900 是「零信息丢失」的硬边界且余量为 0px**。高度方向宽松（900 宽下 600/560/520/480 的
+  `truncated`/`hScroll`/弹窗越界/弹窗控件滚不到**全为 0**，弹窗自带限高 + 内滚），
+  600 是**可用性下限**，故不改这个数。
+- **新增零依赖门禁 `scripts/tauri_window_check.mjs`**（已接进 `gate.mjs` 的静态规范段，
+  即 `release_check.sh` 第 6 步自动覆盖）：① 平台配置的窗口对象必须重新声明基础配置里的
+  **每一个**键（以后谁在基础配置加窗口键、忘了同步平台文件，门禁立刻红，而不是在某个平台静默丢）；
+  ② 解析后的 `minWidth/minHeight` ≥ UI 验收尺寸 —— **单一来源**，从 `gate.mjs` 的 `--sizes`
+  默认值取最小一组（改验收尺寸只需改一处），且**正则失配直接报错**（不允许静默变绿）。
+  负控制已做：回退成改动前的 macOS 配置 → 红（报出漏掉的 6 个键 + `minWidth=undefined`）；
+  键齐全但填 `700×480` → 红（低于验收下限）；恢复 → 绿。
+- 顺带修掉第一版门禁里的一个优先级 bug（`!(k in X || {})` 恒为 false 会让判据**静默失效**）。
+
 ## [0.2.13] - 2026-09-21
 
 ### Added

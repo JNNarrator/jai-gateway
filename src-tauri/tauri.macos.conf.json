@@ -4,6 +4,12 @@
     "macOSPrivateApi": true,
     "windows": [
       {
+        "label": "main",
+        "title": "JAI Gateway",
+        "width": 1180,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
         "decorations": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
