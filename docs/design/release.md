@@ -44,6 +44,18 @@
 - [x] Updater 签名密钥已生成并写入本地（见 §1）；CI secrets 需配置：
   - `TAURI_SIGNING_PRIVATE_KEY`：私钥文件内容（`~/.tauri/jai.key`）
   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码（`~/.tauri/jai.key.password`）
+- [x] tag 触发验证：**v0.3.1 实测**（run 35711981353，3/3 job success：Create release draft 5s、
+      Build macos-latest 7m19s、Build windows-latest 12m23s，整轮 12m35s）——
+      产物：`JAI_0.3.1_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、`JAI_0.3.1_x64-setup.exe(+.sig)`、
+      `JAI_0.3.1_x64_en-US.msi(+.sig)`、`latest.json`；`prerelease=false`。
+      **同轮 `CI`（main push）在 windows-latest 上红过一次，但那是与本次改动无关的测试时序抖动**
+      （`m3_anthropic.rs:244` 用固定 `sleep(700ms)` 等异步日志落库；同一提交重跑即绿，
+      macOS job 同轮也绿）——已按 bug 清单 15 改成有界轮询，修复落在 tag 之后的提交上。
+      **发布**：`gh release edit v0.3.1 --draft=false --latest`（`published=2026-09-22T10:08:15Z`），
+      随后 feed 校验通过：`releases/latest/download/latest.json` → `version=0.3.1`，
+      platforms = darwin-aarch64 / darwin-aarch64-app / windows-x86_64 / windows-x86_64-msi /
+      windows-x86_64-nsis（5 键齐全）。发布前实测 feed 仍是 `version=0.3.0`（草稿期不生效，
+      与 §5 记录一致）。
 - [x] tag 触发验证：**v0.2.13 实测**（run 35585047318，3/3 job success：Create draft 6s、Build windows-latest 12m37s、Build macos-latest 7m22s）——
       产物：`JAI_0.2.13_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、`JAI_0.2.13_x64-setup.exe(+.sig)`、`JAI_0.2.13_x64_en-US.msi(+.sig)`、`latest.json`；`prerelease=false`。
       **草稿必须人工发布**：`draft=true` 期间 `releases/latest/download/latest.json` 仍指向上一版（实测 `version=0.2.12`，**无任何报错**），执行 `gh release edit v0.2.13 --draft=false` 后 feed 才更新为 `version=0.2.13`（`published=2026-09-21T10:26:52Z`，platforms = darwin-aarch64 / darwin-aarch64-app / windows-x86_64 / windows-x86_64-msi / windows-x86_64-nsis）。
