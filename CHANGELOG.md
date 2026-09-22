@@ -3,7 +3,11 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+
+## [0.3.1] - 2026-09-22
+
 ### Fixed
+
 - **WebDAV 404 不再一律说成「目标目录不存在」**（真机 2026-09-22）：推送失败时提示
   `WebDAV 推送失败 HTTP 404（目标目录不存在，请先在远端创建该目录）: <!DOCTYPE html> …`，
   后面还跟着一整页 nginx 的 HTML 404 页。按提示去远端建目录没有任何改善（那边本来就有目录、
@@ -31,6 +35,23 @@ All notable changes to this project will be documented in this file.
     `Ok(())`）。变异验证：把 `looks_like_web_page` 改成恒 `false` ⇒ **8 个用例变红**
     （2 单测 + 6 集成）、5 个反向控制仍绿；把 `try_pull` 改回 fail-closed ⇒
     `try_pull_html_404_is_not_fail_closed` 变红。
+- **WebDAV 真机验收用例入库**（`crates/gateway-core/tests/webdav_live_e2e.rs`，`#[ignore]`）：
+  发布检查单 §4 一直要求「每次发版有 WebDAV 真机验收」，但此前只能手点 UI，没有可复现的
+  记录。现在是一条命令（`JAI_DAV_LIVE_URL/USER/PASS/DIR` + `-- --ignored --nocapture`），
+  在**隔离目录**里跑完整链路：连接测试 → 推送 → 拉取逐字节比对 → 覆盖前留存时间戳备份 →
+  备份列表/读取/删除（含幂等）→ 第二台机器 `apply_import` 落库（供应商 / 上游密钥 / 模型 /
+  网关 Key）→ 空目录 404 语义 → 自动清理。**v0.3.1 实测通过**（2026-09-22，DUFS 真机）：
+  ```
+  [1/8] 连接测试：连接成功          [2/8] 推送成功（1010 字节）
+  [3/8] 拉取一致（1010 字节）        [4/8] 覆盖前留存备份：jai-config.1790069393632.json
+  [5/8] 备份内容 = 覆盖前的旧版      [6/8] 备份删除 + 幂等删除均成功
+  [7/8] 第二台机器导入：供应商 / 上游密钥 / 模型 / 网关 Key 全部到位
+  [8/8] 空目录拉取提示：远端尚无配置文件（`text/plain` 404，与网页 404 区分正确）
+  [cleanup] 已删除隔离目录 …         真机验收通过
+  ```
+  顺带记录两条真机行为（mock 测不出）：**DUFS 对不存在的目录会自动建目录**（首次推送即
+  成功建出 `jai-e2e-*/`）；**`apply_import` 会为新供应商重新生成本地 id**（文件里的 id 只
+  用于模型映射），所以「数据是否到位」必须按名字/列表核对，不能拿导出物里的 id 查。
 
 ## [0.3.0] - 2026-09-22
 

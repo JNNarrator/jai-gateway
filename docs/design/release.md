@@ -4,7 +4,7 @@
 
 ## 1. 版本与产物
 
-- 版本：`src-tauri/tauri.conf.json` `"version"`（当前 `0.3.0`）
+- 版本：`src-tauri/tauri.conf.json` `"version"`（当前 `0.3.1`）
 - 产物：
   - macOS：`.dmg` / `.app`（Tauri bundle `targets: all`）
     - ⚠️ **只有 `aarch64`（Apple Silicon）**：`macos-latest` runner 已是 arm64，
@@ -61,6 +61,17 @@
 - [x] `bash scripts/regression.sh` 全绿（已被 release_check.sh 覆盖）
 - [ ] 黄金夹具矩阵：M2/M3/M4/M5/M6/M7/M8 集成测试全绿
 - [ ] 真机验收：Claude Code、Codex、DeepSeek harness、zcode 各至少一例
+- [x] **WebDAV 真机验收（v0.3.1 实测通过，2026-09-22）**：一条命令跑完整链路
+      （`crates/gateway-core/tests/webdav_live_e2e.rs`，`#[ignore]`，不随常规回归跑）：
+      ```bash
+      JAI_DAV_LIVE_URL=https://dav.example.com JAI_DAV_LIVE_USER=user JAI_DAV_LIVE_PASS=pass \
+      JAI_DAV_LIVE_DIR=jai-e2e-$(date +%s) \
+        cargo test -p gateway-core --test webdav_live_e2e -- --ignored --nocapture
+      ```
+      **`JAI_DAV_LIVE_DIR` 必须是隔离目录**：用例只在该目录内增删，结束时会清空并尝试删掉它。
+      覆盖：连接测试 → 推送 → 拉取逐字节比对 → 覆盖前留存时间戳备份 → 备份列表/读取/删除
+      （含幂等删除）→ 第二台机器 `apply_import` 落库（供应商 / 上游密钥 / 模型 / 网关 Key）
+      → 空目录的 404 语义 → 自动清理。实测输出见 CHANGELOG 的 v0.3.1 条目。
 - [ ] 48h 本机常驻观察零崩溃
 - [ ] 签名/公证在干净 VM 验证安装包
 - [ ] 更新通道从上一版升级成功
