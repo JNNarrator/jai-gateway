@@ -319,6 +319,72 @@ fn oversized_remote_err(len: usize, max: usize) -> String {
     )
 }
 
+/// 错误正文摘要：折叠空白并截断，避免把整页 HTML（或超大正文）灌进 UI 与日志。
+///
+/// 真机教训（2026-09-22）：nginx 默认 404 页有 367 字节 HTML，原样拼进错误消息后，
+/// UI 上的「WebDAV 推送失败」变成一整段 `<style>` 标签，可读信息全被埋掉。
+const ERR_BODY_MAX_CHARS: usize = 200;
+
+pub fn brief_body(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(ERR_BODY_MAX_CHARS).collect();
+    if flat.chars().count() > ERR_BODY_MAX_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+/// 响应正文看起来是「网页」而不是 WebDAV 的（XML / 纯文本）错误吗？
+///
+/// WebDAV 的错误体是 XML（`<?xml … <D:error`）或纯文本（实测 DUFS 的「文件不存在」是
+/// `404 text/plain` + 正文 `Not Found`）；网页则从 `<!DOCTYPE html>` / `<html` 起头。
+/// 判据刻意宽松（只看开头一段的标签特征），但**只用它选提示措辞**：绝不用它做
+/// fail-closed 的控制流判断（健康的 WebDAV 也可能用 HTML 404 表示「文件不存在」，
+/// 见 `try_pull` 的注释）。所以判错方向的代价只是提示措辞不准。
+fn looks_like_web_page(text: &str) -> bool {
+    // 先剥掉 UTF-8 BOM（U+FEFF 不是空白字符，`trim_start` 不处理），
+    // 否则带 BOM 的网页 404 会被判成「不是网页」。
+    let head: String = text
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .chars()
+        .take(1024)
+        .collect();
+    let head = head.to_ascii_lowercase();
+    head.starts_with('<')
+        && (head.contains("<html")
+            || head.contains("<!doctype html")
+            || head.contains("<head")
+            || head.contains("<body"))
+}
+
+/// 404 且远端回的是网页时的提示：地址/服务问题，**不是**「目录不存在」。
+///
+/// 真机教训（2026-09-22，`jn_file.88933.vip` 上的 DUFS）：服务重启的那两分钟里，
+/// nginx 对**所有**路径（含 `/`）都返回它自己的 HTML 404 页，被本模块一律翻译成
+/// 「目标目录不存在，请先在远端创建该目录」——而 DUFS 对 PUT 到不存在的目录会返回
+/// **201 自动建目录**，这条提示在该服务器上不可能成立，排查方向被彻底带偏
+/// （真相是服务器自己没就绪，两分钟后自愈）。所以 404 必须先看正文再下结论。
+const NOT_A_WEBDAV_ENDPOINT_HINT: &str =
+    "（远端回的是网页而非 WebDAV 错误：该地址当前不是可用的 WebDAV 端点——\
+     服务未就绪，或根地址/路径不对；请检查设置，稍后重试）";
+
+/// 认证失败提示（各调用点共用一套措辞）。
+const AUTH_FAILED_HINT: &str = "（认证失败：检查 WebDAV 用户名/密码，可在设置中重新保存）";
+
+/// HTTP 错误 → 可操作提示。`not_found_hint` 是「已确认是 WebDAV 的 404」时的措辞。
+///
+/// 404 有两种截然不同的成因，只看状态码必然混为一谈：正文是网页 ⇒ 请求根本没到
+/// WebDAV 处理器（服务没起来 / 根地址写错）；正文为空或是 XML 错误 ⇒ 路径确实不存在。
+fn http_hint(status: u16, body: &str, not_found_hint: &'static str) -> &'static str {
+    match status {
+        401 | 403 => AUTH_FAILED_HINT,
+        404 if looks_like_web_page(body) => NOT_A_WEBDAV_ENDPOINT_HINT,
+        404 => not_found_hint,
+        _ => "",
+    }
+}
+
 /// 覆盖式推送：先尝试读取远端旧版并留存时间戳备份，再 PUT 覆盖主文件。
 ///
 /// 2026-09 数据丢失修复：此前直接 PUT 覆盖——另一台设备（空配置 + 自动推送）
@@ -345,13 +411,14 @@ pub async fn push(
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                let hint = match status.as_u16() {
-                    401 | 403 => "（认证失败：检查 WebDAV 用户名/密码）",
-                    404 => "（目标目录不存在，请先在远端创建该目录）",
-                    _ => "",
-                };
+                let hint = http_hint(
+                    status.as_u16(),
+                    &text,
+                    "（目标目录不存在，请先在远端创建该目录）",
+                );
                 return Err(format!(
-                    "WebDAV 备份远端旧配置失败 HTTP {status}{hint}: {text}（已中止推送，防止覆盖丢失）"
+                    "WebDAV 备份远端旧配置失败 HTTP {status}{hint}: {}（已中止推送，防止覆盖丢失）",
+                    brief_body(&text)
                 ));
             }
         }
@@ -372,22 +439,36 @@ pub async fn push(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let hint = match status.as_u16() {
-            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码）",
-            404 => "（目标目录不存在，请先在远端创建该目录）",
-            _ => "",
-        };
-        return Err(format!("WebDAV 推送失败 HTTP {status}{hint}: {text}"));
+        let hint = http_hint(
+            status.as_u16(),
+            &text,
+            "（目标目录不存在，请先在远端创建该目录）",
+        );
+        return Err(format!(
+            "WebDAV 推送失败 HTTP {status}{hint}: {}",
+            brief_body(&text)
+        ));
     }
     Ok(())
 }
 
-/// GET 远端配置文本；远端文件不存在（HTTP 404）返回 `Ok(None)`。
-pub async fn try_pull(
+/// GET 远端配置的结果细分（`try_pull` 与 `pull` 共用同一份实现，只在对 404 的
+/// **处置**上不同：前者不做 fail-closed，后者据此选提示措辞）。
+enum GetOutcome {
+    /// 拿到远端配置文本
+    Found(String),
+    /// 远端明确说「没有这个文件」：空正文 / 纯文本 / WebDAV 的 XML 错误
+    Missing,
+    /// 404 但正文是网页：请求很可能没到 WebDAV 处理器。携带已截断的正文摘要。
+    NotWebDav(String),
+}
+
+/// GET 远端配置（唯一实现；`try_pull` / `pull` 都走这里）。
+async fn get_config(
     http: &reqwest::Client,
     cfg: &WebDavConfig,
     password: &str,
-) -> Result<Option<String>, String> {
+) -> Result<GetOutcome, String> {
     let url = cfg.config_url();
     let resp = http
         .get(&url)
@@ -396,16 +477,25 @@ pub async fn try_pull(
         .await
         .map_err(|e| format!("WebDAV 拉取请求失败: {e}"))?;
     if resp.status().as_u16() == 404 {
-        return Ok(None);
+        let text = resp.text().await.unwrap_or_default();
+        return Ok(if looks_like_web_page(&text) {
+            GetOutcome::NotWebDav(brief_body(&text))
+        } else {
+            GetOutcome::Missing
+        });
     }
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let hint = match status.as_u16() {
-            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码，或在设置中重新保存）",
-            _ => "",
+        let hint = if status.as_u16() == 401 || status.as_u16() == 403 {
+            AUTH_FAILED_HINT
+        } else {
+            ""
         };
-        return Err(format!("WebDAV 拉取失败 HTTP {status}{hint}: {text}"));
+        return Err(format!(
+            "WebDAV 拉取失败 HTTP {status}{hint}: {}",
+            brief_body(&text)
+        ));
     }
     // 体积护栏：先看 Content-Length，再兜一次实读长度（服务器可能不给长度）。
     // 目的：远端文件若被历史自引用快照撑大（bug 清单 14），直接给出可操作的错误，
@@ -423,21 +513,50 @@ pub async fn try_pull(
     if text.len() > max {
         return Err(oversized_remote_err(text.len(), max));
     }
-    Ok(Some(text))
+    Ok(GetOutcome::Found(text))
+}
+
+/// GET 远端配置文本；远端文件不存在（HTTP 404）返回 `Ok(None)`。
+///
+/// **刻意不对「网页 404」fail-closed**（对抗性审查发现的坑，2026-09-22）：把 404 的
+/// 网页正文直接判成 `Err` 会在两个地方炸掉正常流程 —— `push` 的第 1 步（留存远端旧版）
+/// 与 `webdav_push` 的差异预警都拿这个 `?` 当日志前置，一旦报错，**首次推送永远建不出
+/// 远端文件**（建文件正是推送要做的事）。而「HTML 404」并不等于端点坏了：nginx 的
+/// dav_module 就用自带 HTML 页回答「文件不存在」，反向代理加一行 `error_page 404
+/// /404.html;` 也会把所有 404 正文改写成网页。所以分类只用来选措辞（见 `pull`），
+/// 控制流保持与修复前一致。
+///
+/// 本机那台 DUFS 的「文件不存在」是 `404 text/plain` + 正文 `Not Found`（实测），
+/// 不属于这一类；真出问题时由写路径（PUT）的 404 提示来定位，那才是权威判据。
+pub async fn try_pull(
+    http: &reqwest::Client,
+    cfg: &WebDavConfig,
+    password: &str,
+) -> Result<Option<String>, String> {
+    match get_config(http, cfg, password).await? {
+        GetOutcome::Found(text) => Ok(Some(text)),
+        GetOutcome::Missing | GetOutcome::NotWebDav(_) => Ok(None),
+    }
 }
 
 /// WebDAV GET：拉取远端配置文本（404 转「远端尚无配置文件」提示）。
+///
+/// 用户显式拉取时把「端点不可用」与「远端还没配置」分开说：否则服务没就绪会被当成
+/// 「远端还没推过」，用户按提示去别的设备推送也只会再撞一次同样的墙。
 pub async fn pull(
     http: &reqwest::Client,
     cfg: &WebDavConfig,
     password: &str,
 ) -> Result<String, String> {
-    match try_pull(http, cfg, password).await? {
-        Some(text) => Ok(text),
-        None => Err(
+    match get_config(http, cfg, password).await? {
+        GetOutcome::Found(text) => Ok(text),
+        GetOutcome::Missing => Err(
             "WebDAV 拉取失败 HTTP 404（远端尚无配置文件：请先在任一设备执行「推送」，或检查目录是否正确）"
                 .to_string(),
         ),
+        GetOutcome::NotWebDav(body) => Err(format!(
+            "WebDAV 拉取失败 HTTP 404{NOT_A_WEBDAV_ENDPOINT_HINT}: {body}"
+        )),
     }
 }
 
@@ -527,12 +646,15 @@ pub async fn list_backups(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let hint = match status.as_u16() {
-            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码）",
-            404 => "（目录不存在：请检查根地址与目录设置）",
-            _ => "",
-        };
-        return Err(format!("WebDAV 备份列表失败 HTTP {status}{hint}: {text}"));
+        let hint = http_hint(
+            status.as_u16(),
+            &text,
+            "（目录不存在：请检查根地址与目录设置）",
+        );
+        return Err(format!(
+            "WebDAV 备份列表失败 HTTP {status}{hint}: {}",
+            brief_body(&text)
+        ));
     }
     let xml = resp
         .text()
@@ -563,12 +685,11 @@ pub async fn fetch_backup(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let hint = match status.as_u16() {
-            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码）",
-            404 => "（备份不存在：可能已被清理）",
-            _ => "",
-        };
-        return Err(format!("WebDAV 备份读取失败 HTTP {status}{hint}: {text}"));
+        let hint = http_hint(status.as_u16(), &text, "（备份不存在：可能已被清理）");
+        return Err(format!(
+            "WebDAV 备份读取失败 HTTP {status}{hint}: {}",
+            brief_body(&text)
+        ));
     }
     resp.text()
         .await
@@ -589,17 +710,34 @@ pub async fn delete_backup(
         .send()
         .await
         .map_err(|e| format!("WebDAV 备份删除请求失败: {e}"))?;
-    if resp.status().as_u16() == 404 {
+    let code = resp.status().as_u16();
+    if code == 404 {
+        // 幂等删除只对「WebDAV 明确说文件不存在」成立。正文是网页 ⇒ 多半是服务没就绪
+        // （见 `looks_like_web_page`），此时**不谎报成功**：这里不存在 fail-closed 的
+        // 副作用（删除是幂等动作，报错只是让用户稍后重试），而谎报「已删除」会让用户
+        // 以为备份没了、实际还在远端。注意删除目前只有手动入口
+        // （`webdav_backup_delete`），滚动清理尚未接上调用方 —— 见 bug 清单 13 的顺带发现。
+        let text = resp.text().await.unwrap_or_default();
+        if looks_like_web_page(&text) {
+            return Err(format!(
+                "WebDAV 备份删除失败 HTTP 404{NOT_A_WEBDAV_ENDPOINT_HINT}: {}（备份可能仍在远端，请稍后重试）",
+                brief_body(&text)
+            ));
+        }
         return Ok(()); // 已不存在，幂等成功
     }
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let hint = match status.as_u16() {
-            401 | 403 => "（认证失败：检查 WebDAV 用户名/密码）",
-            _ => "",
+        let hint = if code == 401 || code == 403 {
+            AUTH_FAILED_HINT
+        } else {
+            ""
         };
-        return Err(format!("WebDAV 备份删除失败 HTTP {status}{hint}: {text}"));
+        return Err(format!(
+            "WebDAV 备份删除失败 HTTP {status}{hint}: {}",
+            brief_body(&text)
+        ));
     }
     Ok(())
 }
@@ -858,14 +996,27 @@ pub async fn probe(
         .await
         .map_err(|e| format!("连接失败: {e}"))?;
     let status = resp.status().as_u16();
-    match status {
-        200..=299 => Ok("连接成功".into()),
-        401 | 403 => Err(format!(
-            "认证失败（HTTP {status}）：用户名或密码不正确，请在设置中更新"
-        )),
-        404 => Err("路径不存在（HTTP 404）：请检查 WebDAV 根地址与目录设置".into()),
-        _ => Err(format!("连接异常（HTTP {status}）")),
+    if (200..=299).contains(&status) {
+        return Ok("连接成功".into());
     }
+    if status == 401 || status == 403 {
+        return Err(format!(
+            "认证失败（HTTP {status}）：用户名或密码不正确，请在设置中更新"
+        ));
+    }
+    // 404 同样要看正文：服务没起来时 nginx 用自己的 HTML 404 页回所有路径，
+    // 报成「路径不存在」会把人引到改地址上去（真机教训见 `http_hint`）。
+    let body = resp.text().await.unwrap_or_default();
+    if status == 404 {
+        if looks_like_web_page(&body) {
+            return Err(format!(
+                "连接失败 HTTP 404{NOT_A_WEBDAV_ENDPOINT_HINT}: {}",
+                brief_body(&body)
+            ));
+        }
+        return Err("路径不存在（HTTP 404）：请检查 WebDAV 根地址与目录设置".into());
+    }
+    Err(format!("连接异常（HTTP {status}）"))
 }
 
 #[cfg(test)]
@@ -1304,5 +1455,85 @@ mod tests {
         );
         assert!(msg.contains("bug 清单 14"), "应指向根因条目：{msg}");
         assert_eq!(remote_config_max_bytes(), REMOTE_CONFIG_MAX_BYTES_DEFAULT);
+    }
+
+    /// 真机回归（2026-09-22，`jn_file.88933.vip` 上的 DUFS）：服务重启窗口里 nginx 对
+    /// **所有**路径（含 `/`）回它自己的 HTML 404 页，此前被一律报成「目标目录不存在」——
+    /// 而 DUFS 对 PUT 到不存在的目录返回 201 自动建目录，这条提示不可能成立。
+    /// 现在 404 必须先看正文：网页 ⇒ 端点问题；空/XML ⇒ 路径问题。
+    #[test]
+    fn http_hint_separates_web_page_404_from_missing_path() {
+        const NGINX_404: &str = "<!DOCTYPE html>\n<html>\n<head>\n<title>Not Found</title>\n\
+                                 </head>\n<body>\n<h1>The page you requested was not found.</h1>\n\
+                                 </body>\n</html>";
+        let dir_hint = "（目标目录不存在，请先在远端创建该目录）";
+
+        let h = http_hint(404, NGINX_404, dir_hint);
+        assert!(h.contains("不是可用的 WebDAV 端点"), "{h}");
+        assert!(
+            !h.contains("目录不存在"),
+            "网页 404 不得再说目录不存在：{h}"
+        );
+
+        // 空正文（WebDAV 明确说文件不存在）与 WebDAV 的 XML 错误 → 仍是原措辞
+        assert_eq!(http_hint(404, "", dir_hint), dir_hint);
+        assert_eq!(
+            http_hint(
+                404,
+                "<?xml version=\"1.0\"?><D:error xmlns:D=\"DAV:\"/>",
+                dir_hint
+            ),
+            dir_hint
+        );
+
+        // 认证失败与其它状态码不受影响
+        assert!(http_hint(401, NGINX_404, dir_hint).contains("认证失败"));
+        assert!(http_hint(403, "", dir_hint).contains("认证失败"));
+        assert_eq!(http_hint(500, NGINX_404, dir_hint), "");
+    }
+
+    /// 网页判据不能把 WebDAV 的 XML 错误 / JSON 错误误判成网页（误判会颠倒提示方向）。
+    #[test]
+    fn web_page_detector_does_not_fire_on_dav_xml() {
+        assert!(looks_like_web_page("  <!DOCTYPE html><html>"));
+        assert!(looks_like_web_page("<html><body>x"));
+        assert!(looks_like_web_page(
+            "<head><title>401 Unauthorized</title></head>"
+        ));
+        assert!(!looks_like_web_page(""));
+        assert!(!looks_like_web_page(
+            "<?xml version=\"1.0\"?><D:error xmlns:D=\"DAV:\"/>"
+        ));
+        assert!(!looks_like_web_page("{\"error\":\"not found\"}"));
+        // 实测的真身（2026-09-22，DUFS）：文件不存在的 404 是 `text/plain` + `Not Found`
+        assert!(!looks_like_web_page("Not Found"));
+        // 带 UTF-8 BOM 的网页仍要认出来（BOM 不是空白字符，`trim_start` 不处理）
+        assert!(looks_like_web_page("\u{feff}<!DOCTYPE html><html>"));
+        // 只看开头一段：正文深处的 `<html` 不作数（避免超大正文里出现标签就翻转结论）
+        assert!(!looks_like_web_page(&format!(
+            "{}\n<html>",
+            "x".repeat(2000)
+        )));
+    }
+
+    /// 错误正文摘要：折叠空白 + 截断并留省略号（整页 nginx 404 曾原样糊进 UI）。
+    #[test]
+    fn brief_body_collapses_and_truncates() {
+        let page = format!("<!DOCTYPE html>\n{}\n</html>", "a ".repeat(500));
+        let brief = brief_body(&page);
+        assert!(!brief.contains('\n'), "应折叠空白：{brief}");
+        assert_eq!(
+            brief.chars().count(),
+            ERR_BODY_MAX_CHARS + 1,
+            "应截断到上限并留一个省略号：{brief}"
+        );
+        assert!(brief.ends_with('…'));
+        // 短正文只折叠空白，不截断也不加省略号
+        assert_eq!(brief_body("  a\n b  "), "a b");
+        assert_eq!(brief_body(""), "");
+        // 边界：正好等于上限时**不加**省略号（否则会误导「还有内容被截掉」）
+        let exact = brief_body(&"a".repeat(ERR_BODY_MAX_CHARS));
+        assert_eq!(exact.chars().count(), ERR_BODY_MAX_CHARS);
+        assert!(!exact.ends_with('…'));
     }
 }

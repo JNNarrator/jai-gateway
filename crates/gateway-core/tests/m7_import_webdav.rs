@@ -78,6 +78,49 @@ async fn spawn_dav_mock_missing() -> u16 {
     addr.port()
 }
 
+/// 真机复现（2026-09-22）：服务没就绪时，nginx 用自己的 HTML 404 页回应**所有**方法
+/// （`GET`/`PUT`/`PROPFIND` 全是 404），而不是 WebDAV 的 XML 错误。
+const NGINX_404_HTML: &str = "<!DOCTYPE html>\n<html>\n<head>\n<title>Not Found</title>\n\
+<style>\n    body {\n        width: 35em;\n        margin: 0 auto;\n        \
+font-family: Tahoma, Verdana, Arial, sans-serif;\n    }\n</style>\n</head>\n\
+<body>\n<h1>The page you requested was not found.</h1>\n<p>Sorry, the page you are \
+looking for is currently unavailable.<br/>\nPlease try again later.</p>\n</body>\n</html>\n";
+
+fn html_404() -> Response {
+    Response::builder()
+        .status(404)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Body::from(NGINX_404_HTML))
+        .unwrap()
+}
+
+/// 所有方法一律 HTML 404（服务未就绪 / 根地址打错）。
+async fn spawn_mock_html_404_all() -> u16 {
+    let app = Router::new().fallback(any(|| async { html_404() }));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.port()
+}
+
+/// GET 是「干净」的 404（远端确实还没有配置文件），PUT 时服务刚好没起来（HTML 404）
+/// —— 正是真机上「推送失败」的形态。
+async fn spawn_mock_get404_put_html404() -> u16 {
+    let app = Router::new().route(
+        "/jai-config.json",
+        get(|| async { Response::builder().status(404).body(Body::empty()).unwrap() })
+            .put(|| async { html_404() }),
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.port()
+}
+
 /// 有状态 mock：按路径存取（GET 200/404，PUT 201），支持配置文件与时间戳备份
 /// 共存的真实 WebDAV 行为。
 async fn spawn_dav_mock() -> (u16, Arc<Mutex<HashMap<String, String>>>) {
@@ -429,6 +472,145 @@ async fn probe_404_hints_bad_path() {
     };
     let err = sync::probe(&client, &cfg, "pw").await.unwrap_err();
     assert!(err.contains("路径不存在"), "{err}");
+}
+
+/// 真机回归（2026-09-22）：推送撞上服务器未就绪的 HTML 404 时，提示必须指向
+/// 「地址/服务」而不是「目标目录不存在」（DUFS 对 PUT 到不存在的目录返回 201）。
+#[tokio::test(flavor = "multi_thread")]
+async fn push_404_web_page_reports_endpoint_not_missing_directory() {
+    let port = spawn_mock_get404_put_html404().await;
+    let client = reqwest::Client::new();
+    let err = sync::push(&client, &cfg_for(port), "pw", "{}".into())
+        .await
+        .unwrap_err();
+    assert!(err.contains("不是可用的 WebDAV 端点"), "{err}");
+    assert!(!err.contains("目标目录不存在"), "{err}");
+    assert!(err.contains("HTTP 404"), "{err}");
+    // 整页 HTML 不再原样进消息：空白被折叠、正文被截断
+    assert!(!err.contains('\n'), "错误正文应折叠空白：{err}");
+    assert!(err.ends_with('…'), "超长正文应带省略号：{err}");
+    assert!(
+        err.chars().count() < 400,
+        "错误消息过长（{} 字符）：{err}",
+        err.chars().count()
+    );
+}
+
+/// 反向控制：空正文的 404 是 WebDAV 在说「文件/目录不存在」，原措辞必须保留。
+#[tokio::test(flavor = "multi_thread")]
+async fn push_404_without_body_keeps_directory_hint() {
+    let app = Router::new().fallback(any(|| async {
+        Response::builder().status(404).body(Body::empty()).unwrap()
+    }));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let err = sync::push(&client, &cfg_for(addr.port()), "pw", "{}".into())
+        .await
+        .unwrap_err();
+    assert!(err.contains("目标目录不存在"), "{err}");
+}
+
+/// 拉取：网页 404 不能被当成「远端尚无配置文件」（自动拉取会据此静默放弃）。
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_html_404_is_not_missing_remote_file() {
+    let port = spawn_mock_html_404_all().await;
+    let client = reqwest::Client::new();
+    let err = sync::pull(&client, &cfg_for(port), "pw").await.unwrap_err();
+    assert!(err.contains("不是可用的 WebDAV 端点"), "{err}");
+    assert!(!err.contains("远端尚无"), "{err}");
+}
+
+/// 关键决策的反向控制：`try_pull` 对「网页 404」**不做 fail-closed**（返回 `Ok(None)`）。
+/// 理由见 `try_pull` 的注释：健康的 WebDAV 也会用 HTML 404 表示「文件不存在」
+/// （nginx dav_module、反向代理 `error_page 404 /404.html`），若在这里报错，
+/// `push` 的第 1 步就会中止，**首次推送永远建不出远端文件**。
+/// 这条用例钉住「分类只用来选措辞、不改控制流」。
+#[tokio::test(flavor = "multi_thread")]
+async fn try_pull_html_404_is_not_fail_closed() {
+    let port = spawn_mock_html_404_all().await;
+    let client = reqwest::Client::new();
+    let got = sync::try_pull(&client, &cfg_for(port), "pw").await;
+    assert!(
+        matches!(got, Ok(None)),
+        "网页 404 不得 fail-closed（否则首次推送无法创建远端文件）：{got:?}"
+    );
+}
+
+/// 测连接：同样是 404，网页版要指向端点、空正文版才指向路径。
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_html_404_points_at_endpoint_not_path() {
+    let port = spawn_mock_html_404_all().await;
+    let client = reqwest::Client::new();
+    let err = sync::probe(&client, &cfg_for(port), "pw")
+        .await
+        .unwrap_err();
+    assert!(err.contains("不是可用的 WebDAV 端点"), "{err}");
+    assert!(!err.contains("路径不存在"), "{err}");
+}
+
+/// 删除备份：服务没就绪时不能谎报「幂等成功」（推送后的滚动清理会以为已删掉）。
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_backup_html_404_is_not_silent_success() {
+    let port = spawn_mock_html_404_all().await;
+    let client = reqwest::Client::new();
+    let err = sync::delete_backup(&client, &cfg_for(port), "pw", "jai-config.100.json")
+        .await
+        .unwrap_err();
+    assert!(err.contains("不是可用的 WebDAV 端点"), "{err}");
+}
+
+/// 推送前留存备份这一处（`push` 的第 1 步）此前没有用例覆盖：远端已有旧配置 ⇒
+/// 先 GET 到旧版，再 PUT `jai-config.<ts>.json`，而这一步撞上 HTML 404（服务没就绪）。
+/// 提示必须指向端点，且仍然中止推送（防覆盖丢失）。
+#[tokio::test(flavor = "multi_thread")]
+async fn push_backup_put_html_404_reports_endpoint() {
+    let app = Router::new().fallback(|uri: Uri, method: Method| async move {
+        match (method.as_str(), uri.path()) {
+            ("GET", "/jai-config.json") => Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"format":"jai-export/v1","providers":[{"id":"p1"}],"models":[]}"#,
+                ))
+                .unwrap(),
+            // 备份 PUT 落在 HTML 404 上（`/jai-config.<ts>.json` 走这里）
+            _ => html_404(),
+        }
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let err = sync::push(&client, &cfg_for(addr.port()), "pw", "{}".into())
+        .await
+        .unwrap_err();
+    assert!(err.contains("备份远端旧配置失败"), "{err}");
+    assert!(err.contains("不是可用的 WebDAV 端点"), "{err}");
+    assert!(err.contains("已中止推送"), "仍须中止，防覆盖丢失：{err}");
+}
+
+/// 备份列表 / 备份读取的 404 同样要分「网页」与「WebDAV 说不存在」两种。
+#[tokio::test(flavor = "multi_thread")]
+async fn backup_list_and_fetch_html_404_report_endpoint() {
+    let port = spawn_mock_html_404_all().await;
+    let client = reqwest::Client::new();
+    let cfg = cfg_for(port);
+
+    let err = sync::list_backups(&client, &cfg, "pw").await.unwrap_err();
+    assert!(err.contains("不是可用的 WebDAV 端点"), "{err}");
+    assert!(!err.contains("目录不存在"), "{err}");
+
+    let err = sync::fetch_backup(&client, &cfg, "pw", "jai-config.100.json")
+        .await
+        .unwrap_err();
+    assert!(err.contains("不是可用的 WebDAV 端点"), "{err}");
+    assert!(!err.contains("备份不存在"), "{err}");
 }
 
 /// T2 回归：远端备份列表（PROPFIND）过滤/排序、读取、删除与防误删。
