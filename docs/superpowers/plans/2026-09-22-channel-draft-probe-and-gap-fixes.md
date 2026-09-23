@@ -543,6 +543,8 @@ pub fn is_non_idempotent(wire: &InboundWire, body: &[u8]) -> bool;
 ---
 
 ### T4 单实例锁
+> ✅ **已实施（2026-09-22，commit 待补）**。落地情况：`tauri-plugin-single-instance = "2"`（解析到 v2.4.5）注册在插件链首位；托盘「显示主窗口」的内联逻辑抽成 `fn show_main_window(&AppHandle)` 与单实例回调共用；该插件无 `permissions/` 目录，**无需**在 `capabilities/default.json` 登记。`cargo check -p jai` 通过，`bash scripts/regression.sh` 全绿（31 套件）。**§T4.4 的真机验收仍未做**（需在 macOS / Windows 上实际双击两次）。
+
 
 **目标**：用户双击图标两次（或从 Finder/Dock 再点一次）时，不再起第二个网关进程，而是把已有窗口置前。
 

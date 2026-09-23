@@ -3224,8 +3224,27 @@ fn reflect_status(app: &AppHandle, st: &GatewayState) {
 
 // ---------------------------------------------------------------- 入口
 
+/// 显示并把主窗口置前。
+///
+/// 托盘菜单「显示主窗口」与单实例回调**共用**这一个实现 —— 不要复制两份。
+fn show_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 fn main() {
     tauri::Builder::default()
+        // 单实例：第二个实例不启动，改为把已有窗口置前 —— 否则双击两次图标会起两个
+        // 网关进程，端口自动顺延后两个网关各监听一个端口，用户不知道客户端该连哪个。
+        //
+        // 必须放在插件链**首位**：它的单实例判定发生在 Tauri runtime 初始化阶段，
+        // 早于 `setup()`，所以第二个实例不会执行 `Db::open`（不会碰数据目录）。
+        // 这条时序要在真机上确认（见方案 T4.2 第 3 点的回退方案）。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
@@ -3394,12 +3413,7 @@ fn main() {
                             request_stop(&st);
                             reflect_status(app, &st);
                         }
-                        "show" => {
-                            if let Some(w) = app.get_webview_window("main") {
-                                let _ = w.show();
-                                let _ = w.set_focus();
-                            }
-                        }
+                        "show" => show_main_window(app),
                         "quit" => app.exit(0),
                         _ => {}
                     }

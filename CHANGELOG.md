@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **单实例保护**（D9-T4）：此前启动路径**没有任何单实例机制**，双击两次图标（或从
+  Dock / 开始菜单再点一次）会起第二个进程。网关端口被占会自动顺延，于是两个网关各监听
+  一个端口 —— 用户看到两个窗口、两个网关，不知道客户端该连哪个；两个实例还会同时写
+  同一个 SQLite 数据目录。
+  接入官方 `tauri-plugin-single-instance = "2"`（v2.4.5）：第二个实例**不启动**，改为把
+  已有窗口显示并置前（符合桌面用户预期）。插件放在插件链**首位** —— 它的单实例判定发生在
+  Tauri runtime 初始化阶段、早于 `setup()`，所以第二个实例不会执行 `Db::open`，不碰数据目录。
+  顺带把托盘菜单「显示主窗口」里内联的 `show()` + `set_focus()` 抽成
+  `fn show_main_window(&AppHandle)`，与单实例回调共用（不复制两份）。
+  该插件无 JS API（无 `permissions/` 目录），因此不需要在 `capabilities/default.json` 登记。
+  ⚠️ **真机验收待做**：需要在 macOS / Windows 上实际双击两次验证（见
+  `docs/superpowers/plans/2026-09-22-channel-draft-probe-and-gap-fixes.md` §T4.4）。
+
 - **上游 `Retry-After` 现在真正用于网关内部退避**（D9-T2）：此前该头只被**回传给客户端**，
   网关自己切换候选时不等 —— 上游 429/503 明确说了「X 秒后再来」，我们却立刻去撞下一个
   候选，把限流窗口二次打满（实测某上游 502 占全量 9.78%）。
