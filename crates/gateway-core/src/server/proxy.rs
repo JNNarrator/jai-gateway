@@ -1049,6 +1049,11 @@ enum Attempt {
         summary: String,
         /// 最后一个带 HTTP 状态的上游错误（status + body + content-type）
         last_http: Option<UpstreamError>,
+        /// 上游给出的退避时长（毫秒，已解析 `Retry-After` / `retry-after-ms`）。
+        ///
+        /// `dispatch` 在切换下一候选前按它等待（有封顶 + 抖动，见 `router`）。
+        /// 只对限速 / 过载类失败有意义，所以别的失败路径一律填 `None`。
+        retry_after_ms: Option<u64>,
     },
 }
 
@@ -1064,6 +1069,28 @@ struct UpstreamError {
     /// 白名单内的上游响应头（目前是退避头 + 报障关联键）
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
+}
+/// 从上游错误响应头里解析退避时长（毫秒）。
+///
+/// 优先 `retry-after-ms`（非标准但精确，值本身就是毫秒；PI-Desktop 与 zcode
+/// 都发它），回退标准 `Retry-After`（delta-seconds 或 HTTP-date）。
+///
+/// 解析不出来就返回 `None` —— 调用方回退到指数退避，绝不因为头写坏而卡住。
+fn retry_after_from_headers(headers: &[(HeaderName, HeaderValue)]) -> Option<u64> {
+    let get = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .and_then(|(_, v)| v.to_str().ok())
+    };
+    if let Some(raw) = get("retry-after-ms") {
+        if let Ok(ms) = raw.trim().parse::<f64>() {
+            if ms.is_finite() && ms >= 0.0 {
+                return Some(ms.round() as u64);
+            }
+        }
+    }
+    get("retry-after").and_then(|raw| router::parse_retry_after(raw, store::now_ms() / 1000))
 }
 
 /// POST /v1/chat/completions —— OpenAI 线主入口。
@@ -1249,46 +1276,64 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
     // ---- 逐渠道尝试（按 priority, rowid 序）----
     // 故障转移：每个渠道失败时按 router 分类决定切换或停止；
     // 全部失败返回最后一个错误（roadmap M2：单轮遍历一遍即止，返回最后一个错误）。
+    //
+    // D9-T2：上游 429/503 给出的 Retry-After 用于**切换前的退避**，避免
+    // 「单轮把候选打光」把上游限流窗口二次打满（T3 会在此基础上加分组与预算）。
     let mut last_kind: &'static str = "ProviderOther";
     let mut last_summary = String::from("所有渠道均失败");
     let mut last_http: Option<UpstreamError> = None;
-    for cand in &candidates {
+    let mut last_retry_after_ms: Option<u64> = None;
+    let mut total_backoff_ms: u64 = 0;
+    for (i, cand) in candidates.iter().enumerate() {
         // 旧版 /v1/completions 只支持 OpenAI 兼容直通，不做跨族转换。
         if wire == InboundWire::Completions && cand.family != wire.family() {
             continue;
         }
-        if cand.family != wire.family() {
-            // 推理回放兼容的**自适应**一环在 `try_converted_candidate` 的错误分类处
-            // （400 走 `Stop` 直接交付，不会冒泡到这里），这里只做常规分类处理。
-            let attempt = try_converted_candidate(&ctx, wire, &peeked, cand, &body, started).await;
-            match attempt {
-                Attempt::Delivered(resp) => return resp,
-                Attempt::Failed {
-                    kind,
-                    summary,
-                    last_http: eh,
-                } => {
-                    last_kind = kind;
-                    last_summary = summary;
-                    if let Some(e) = eh {
-                        last_http = Some(e);
-                    }
-                }
-            }
-            continue;
-        }
+        // 跨族：推理回放兼容的**自适应**一环在 `try_converted_candidate` 的错误分类处
+        // （400 走 `Stop` 直接交付，不会冒泡到这里），这里只做常规分类处理。
+        let attempt = if cand.family != wire.family() {
+            try_converted_candidate(&ctx, wire, &peeked, cand, &body, started).await
+        } else {
+            try_candidate(&ctx, wire, &peeked, cand, &body, &inbound_headers, started).await
+        };
 
-        match try_candidate(&ctx, wire, &peeked, cand, &body, &inbound_headers, started).await {
+        let (kind, summary, eh, retry_after_ms) = match attempt {
             Attempt::Delivered(resp) => return resp,
             Attempt::Failed {
                 kind,
                 summary,
-                last_http: eh,
-            } => {
-                last_kind = kind;
-                last_summary = summary;
-                if let Some(e) = eh {
-                    last_http = Some(e);
+                last_http,
+                retry_after_ms,
+            } => (kind, summary, last_http, retry_after_ms),
+        };
+        last_kind = kind;
+        last_summary = summary;
+        if let Some(e) = eh {
+            last_http = Some(e);
+        }
+        if retry_after_ms.is_some() {
+            last_retry_after_ms = retry_after_ms;
+            // 退避：**只在上游明确给出 Retry-After 时等待**。
+            //
+            // 上游没说就不等 —— 500/503 往往是瞬时故障，而下一个候选是**另一个上游**，
+            // 等它对这个上游毫无意义，只会让客户端白白多等（实测 500 占比不低，
+            // 给每次切换都加 1s 会让多渠道路由整体变慢）。指数退避留给 T3 的
+            // 分组重试：那时同一组内会回到**同一个上游**，等待才有意义。
+            //
+            // 另外两个条件：
+            // - 只对限速/过载类失败等（认证错、请求错等多久都不会变好）
+            // - 只在后面确实还有候选可试时才等，否则只是让客户端多等一次超时
+            if let Some(ms) = retry_after_ms.filter(|_| router::kind_waits_for_backoff(kind)) {
+                let has_next = candidates[i + 1..]
+                    .iter()
+                    .any(|c| !(wire == InboundWire::Completions && c.family != wire.family()));
+                let remaining = router::MAX_TOTAL_BACKOFF_MS.saturating_sub(total_backoff_ms);
+                if has_next && remaining > 0 {
+                    let delay =
+                        router::backoff_delay_ms(Some(ms), 0, router::RETRY_AFTER_JITTER_PCT)
+                            .min(remaining);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    total_backoff_ms += delay;
                 }
             }
         }
@@ -1344,12 +1389,20 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
         Some(last_summary.clone()),
         None,
     );
-    wire.error_response(
+    let mut resp = wire.error_response(
         StatusCode::BAD_GATEWAY,
         &last_summary,
         "api_error",
         Some("all_providers_failed"),
-    )
+    );
+    // 转换路径全失败会走到这里（它刻意不原样回传上游错误体），但退避信息
+    // 不该跟着丢：上游明确给了 Retry-After 就带上，客户端才有退避依据。
+    if let Some(ms) = last_retry_after_ms {
+        if let Ok(v) = HeaderValue::from_str(&ms.div_ceil(1000).to_string()) {
+            resp.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+    }
+    resp
 }
 
 /// 把下游安全请求头透传给上游（同族字节直通时需要保留，例如
@@ -1459,6 +1512,7 @@ async fn try_candidate(
                 kind: "UpstreamAuth",
                 summary: format!("{}：{msg}", cand.provider_name),
                 last_http: None,
+                retry_after_ms: None,
             };
         }
     };
@@ -1629,6 +1683,7 @@ async fn try_candidate(
                 kind: "ProviderOther",
                 summary: format!("{}：{msg}", cand.provider_name),
                 last_http: None,
+                retry_after_ms: None,
             };
         }
     };
@@ -1759,6 +1814,8 @@ async fn try_candidate(
                     )),
                     None,
                 );
+                // 退避时长必须在 headers 被 move 进 UpstreamError 之前算出来。
+                let retry_after_ms = retry_after_from_headers(&upstream_headers);
                 return Attempt::Failed {
                     kind,
                     summary: format!(
@@ -1772,6 +1829,7 @@ async fn try_candidate(
                         headers: upstream_headers,
                         body: bytes,
                     }),
+                    retry_after_ms,
                 };
             }
             AttemptVerdict::Success => unreachable!("非 2xx 不会判 Success"),
@@ -2060,6 +2118,7 @@ async fn try_converted_candidate(
                 kind: "ProviderOther",
                 summary: format!("未知上游协议族: {other}"),
                 last_http: None,
+                retry_after_ms: None,
             };
         }
     };
@@ -2074,6 +2133,7 @@ async fn try_converted_candidate(
                 kind: "UpstreamAuth",
                 summary: format!("{}：{msg}", cand.provider_name),
                 last_http: None,
+                retry_after_ms: None,
             };
         }
     };
@@ -2148,6 +2208,7 @@ async fn try_converted_candidate(
                 kind: "ProviderOther",
                 summary: format!("{}：{msg}", cand.provider_name),
                 last_http: None,
+                retry_after_ms: None,
             };
         }
     };
@@ -2156,6 +2217,18 @@ async fn try_converted_candidate(
         StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     if !up_status.is_success() {
+        // 错误响应头白名单（与直通路径一致）：跨族失败**不**原样回传上游错误体
+        // （见测试 `converted_upstream_429_renders_oai_error`：跨族必须按入站方言
+        // 渲染 502，否则 OpenAI 客户端会收到 Anthropic 形状的错误体），
+        // 但退避头要用来做内部调度，不能跟着一起丢。
+        let upstream_headers: Vec<(HeaderName, HeaderValue)> = FORWARD_ERROR_HEADERS
+            .iter()
+            .filter_map(|name| {
+                resp.headers()
+                    .get(*name)
+                    .map(|v| (HeaderName::from_static(name), v.clone()))
+            })
+            .collect();
         let mut bytes = resp.bytes().await.unwrap_or_default();
         if bytes.len() > MAX_ERROR_BODY {
             bytes.truncate(MAX_ERROR_BODY);
@@ -2260,6 +2333,7 @@ async fn try_converted_candidate(
                         up_status.as_u16()
                     ),
                     last_http: None,
+                    retry_after_ms: retry_after_from_headers(&upstream_headers),
                 };
             }
             AttemptVerdict::Success => unreachable!("非 2xx 不会判 Success"),

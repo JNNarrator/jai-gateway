@@ -21,6 +21,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "socks",
 ] }
+httpdate = "1"
 keyring = { version = "3", features = [
     "apple-native",
     "windows-native",

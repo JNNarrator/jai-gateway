@@ -1361,6 +1361,7 @@ dependencies = [
  "axum",
  "bytes",
  "futures-util",
+ "httpdate",
  "keyring",
  "quick-xml 0.31.0",
  "rand 0.8.8",

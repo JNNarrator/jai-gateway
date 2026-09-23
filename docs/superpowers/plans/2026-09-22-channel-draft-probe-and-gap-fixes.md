@@ -360,29 +360,30 @@ pub fn backoff_delay_ms(retry_after_ms: Option<u64>, attempt: usize, jitter_pct:
 
 #### T2.2 修掉跨族丢头（bug）
 
-`try_converted_candidate` @ `proxy.rs:2158-2164` 现在只取 body，**不收集错误响应头**。改为与直通路径一致，收集 `FORWARD_ERROR_HEADERS`（`proxy.rs:1059`）并放进 `UpstreamError.headers`。
+`try_converted_candidate` @ `proxy.rs:2186` 现在只取 body，**不收集错误响应头**。改为收集 `FORWARD_ERROR_HEADERS`（`proxy.rs:1064`）——但**只用来解析退避时长，不放进 `UpstreamError`**。
+
+> ⚠️ **实施修正（2026-09-22）**：本方案原文写的是「与直通路径一致，放进 `UpstreamError.headers`」，**这是错的**。转换路径刻意保持 `last_http: None`，由测试 `m4_conversion.rs::converted_upstream_429_renders_oai_error` 守着：跨族时上游是 Anthropic 形状的错误体，直接回传给 OpenAI 入站客户端会违反协议，所以必须**按入站方言合成 502**。正确做法是「收集头 → 解析 `retry_after_ms` → `last_http` 照旧 `None`」。
+
+**额外**：转换路径全失败合成 502 时，把 `Retry-After` 头带上（`dispatch` 末尾），否则退避信息对客户端仍是丢的。
 
 #### T2.3 接线
 
-- `Attempt::Failed` 变体增加字段 `retry_after_ms: Option<u64>`（`proxy.rs`，直通 `:1769-1774` 与转换 `:2158` 两处都要填）
-- `dispatch` 主循环 @ `proxy.rs:1252`：在 `Failed` 且**还有下一个候选**时：
-  ```rust
-  if let Some(ms) = retry_after_ms {
-      let delay = router::backoff_delay_ms(Some(ms), attempt_idx, RETRY_AFTER_JITTER_PCT);
-      if total_backoff + delay <= MAX_TOTAL_BACKOFF_MS {
-          tokio::time::sleep(Duration::from_millis(delay)).await;
-          total_backoff += delay;
-      }
-  }
-  ```
-- **只对 `Retryable` 类失败等待**（429 / 5xx / 529）。`401/403`（认证错）与 `400`（请求错）不等——等了也没用。
+- `Attempt::Failed` 变体增加字段 `retry_after_ms: Option<u64>`（7 个构造点：5 处网络/配置级失败填 `None`，直通与转换两个 `Failover` 分支填解析结果）
+- `dispatch` 主循环 @ `proxy.rs:1277`：在 `Failed` 且**还有下一个候选**时按 `retry_after_ms` 等待
+- **只对限速/过载类失败等待**（`kind_waits_for_backoff`：`RateLimit` / `Overloaded`）。`401/403`（认证错）与 `400`（请求错）不等——等了也没用。
 - **流式已 commit 后不适用**（那时已经没候选了）
+
+> ⚠️ **实施修正（2026-09-22）**：本方案原文的伪代码是 `if let Some(ms) = retry_after_ms { ... }`，但 `backoff_delay_ms` 的 `None` 分支（指数退避）**在实施时被接了进去**，结果打破了 `m2_failover` 两个用例（500 无 Retry-After 也等 ~1s，且 A 的失败日志在 sleep 前就落库，`logs_settled` 看到计数稳定提前返回）。
+>
+> 复盘后确认**不该接**：500/503 往往是瞬时故障，而下一个候选是**另一个上游**，等它对这个上游毫无意义，只会让客户端白等。参考实现（WaLiAPI）也只在上游明确给了 `Retry-After` 时才等。指数退避留给 **T3 的分组重试**——那时同组内会回到同一个上游，等待才有意义。
+>
+> 现状：`dispatch` 只在 `retry_after_ms.is_some()` 时等待；`backoff_delay_ms` 的 `None` 分支保留（有单测）供 T3 使用。
 
 #### T2.4 测试
 
 - `parse_retry_after` 矩阵：`"120"` / `"0"` / `"0.5"` / `"-1"` / `"abc"` / 合法 HTTP-date / 过去的 HTTP-date / `"999999"`（截断）
 - `backoff_delay_ms`：无 retry_after 时的指数退避；jitter 在 ±20% 区间内（用固定 seed 或断言区间）
-- 集成（`tests/m13_retry_after.rs`）：假上游 A 返回 `429 + Retry-After: 1`，假上游 B 返回 200 → 断言 (a) 请求落到 B；(b) A 与 B 的**接收时间差 ≥ 900ms**（考虑 jitter）
+- 集成（`tests/m13_retry_after.rs`，4 个用例全绿）：`429 + Retry-After: 1` → 切换前等 ~1s；`429 + Retry-After: 3600` → 被 CAP 截断在 5s；`401 + Retry-After: 30` → **不等**；转换路径全失败 → 502 + 带 `Retry-After` 头
 - 回归：`m2_failover.rs` / `m11_connect_retry.rs` / `m12_qualified_provider_fallback.rs` 全绿
 - 保留现有测试 `m3_anthropic.rs:283 upstream_retry_after_is_forwarded_to_client`（**回传客户端的行为不能被破坏**——T2 是「同时用于内部调度」，不是「改为内部调度」）
 

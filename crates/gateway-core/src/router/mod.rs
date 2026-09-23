@@ -159,6 +159,96 @@ pub fn client_lost() -> AttemptVerdict {
     }
 }
 
+// ---------------------------------------------------------------- 退避（D9-T2）
+
+/// 单次等待上限：上游给的 `Retry-After` 再大也不等超过这个值。
+///
+/// 没有上限的话，一个返回 `Retry-After: 3600` 的坏上游就能把下游客户端挂住一小时。
+pub const RETRY_AFTER_CAP_MS: u64 = 5_000;
+
+/// 抖动幅度（百分比）。
+///
+/// 多个客户端、多个候选同拍重试会把限流窗口二次打满，所以实际等待在
+/// `±RETRY_AFTER_JITTER_PCT%` 内随机。
+pub const RETRY_AFTER_JITTER_PCT: u32 = 20;
+
+/// 一次请求内的累计等待上限（跨候选累加）。
+///
+/// 只封顶单次等待不够：6 个候选各等 5s 就是 30s，客户端会先超时。
+pub const MAX_TOTAL_BACKOFF_MS: u64 = 10_000;
+
+/// 该失败类型是否值得等待退避。
+///
+/// 只有上游限速 / 过载（`RateLimit` = 429、`Overloaded` = 5xx/529）值得等；
+/// 认证错（401/403）与请求错（4xx）等多久都不会变好。
+///
+/// T3 引入 `FailureClass` 后本函数由 `FailureClass::retryable_with_backoff()` 取代。
+pub fn kind_waits_for_backoff(kind: &str) -> bool {
+    matches!(kind, "RateLimit" | "Overloaded")
+}
+
+/// 解析上游 `Retry-After`（RFC 7231 §7.1.3），返回毫秒。
+///
+/// 两种形式：
+/// - `delta-seconds`（主路径，绝大多数上游）：`"120"`；宽松接受小数 `"0.5"`
+/// - `HTTP-date`（IMF-fixdate）：`"Wed, 21 Oct 2026 07:28:00 GMT"`
+///
+/// 非法 / 负数 / 已过期 / 非有限值 → `None`（调用方回退到指数退避）。
+///
+/// `now_unix`（秒）由调用方注入，便于单测确定化。
+pub fn parse_retry_after(value: &str, now_unix: i64) -> Option<u64> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    // delta-seconds。RFC 要求非负整数，但确有上游给小数，宽松接受。
+    // f64 → u64 是饱和转换，超大值（"1e30"）饱和到 u64::MAX，
+    // 由调用方的 RETRY_AFTER_CAP_MS 截断；这里不会 panic。
+    if let Ok(secs) = v.parse::<f64>() {
+        if !secs.is_finite() || secs < 0.0 {
+            return None;
+        }
+        return Some((secs * 1000.0).round() as u64);
+    }
+    // HTTP-date：用 httpdate 解析，绝不手写日期解析。
+    let target = httpdate::parse_http_date(v).ok()?;
+    let target_secs = target.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    if target_secs <= now_unix {
+        return None;
+    }
+    Some((target_secs - now_unix) as u64 * 1000)
+}
+
+/// 计算切换下一候选前的实际等待（毫秒）。
+///
+/// - `retry_after_ms` 有值：以它为准
+/// - 无值：按 `attempt` 次数的指数退避（1s / 2s / 4s / 8s）。
+///   注意：`dispatch` 目前**不会**走这一支（上游没说就不等，理由见 proxy 里的注释）；
+///   它是为 T3 的分组重试准备的 —— 同一组内会回到同一个上游，等待才有意义。
+/// - 两者都先封顶 [`RETRY_AFTER_CAP_MS`]，再叠加 ±`jitter_pct`% 抖动
+///
+/// 抖动是加在封顶之后的，所以返回值可能略超 `RETRY_AFTER_CAP_MS`
+/// （上限 +20%）；累计封顶由调用方的 [`MAX_TOTAL_BACKOFF_MS`] 负责。
+pub fn backoff_delay_ms(retry_after_ms: Option<u64>, attempt: usize, jitter_pct: u32) -> u64 {
+    use rand::Rng as _;
+
+    let base = match retry_after_ms {
+        Some(ms) => ms.min(RETRY_AFTER_CAP_MS),
+        None => (1000u64 << attempt.min(3) as u32).min(RETRY_AFTER_CAP_MS),
+    };
+    if jitter_pct == 0 {
+        return base;
+    }
+    let pct = jitter_pct.min(100) as i64;
+    let delta = (base as i64) * pct / 100;
+    if delta <= 0 {
+        return base;
+    }
+    let lo = (base as i64 - delta).max(0) as u64;
+    let hi = (base as i64 + delta) as u64;
+    rand::thread_rng().gen_range(lo..=hi)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +380,107 @@ mod tests {
         names.sort_unstable();
         assert_eq!(names, vec!["a", "b", "c"]);
         assert!(order_candidates(Vec::new(), now).is_empty());
+    }
+
+    // ------------------------------------------------------------ 退避（D9-T2）
+
+    #[test]
+    fn retry_after_delta_seconds() {
+        // 主路径：整数秒
+        assert_eq!(parse_retry_after("120", 0), Some(120_000));
+        assert_eq!(parse_retry_after("0", 0), Some(0));
+        // 前后空白要容忍（上游偶尔带空格）
+        assert_eq!(parse_retry_after("  30  ", 0), Some(30_000));
+        // 小数：非 RFC 但确有上游这么发
+        assert_eq!(parse_retry_after("0.5", 0), Some(500));
+        assert_eq!(parse_retry_after("1.5", 0), Some(1_500));
+    }
+
+    #[test]
+    fn retry_after_rejects_garbage_and_negative() {
+        assert_eq!(parse_retry_after("", 0), None);
+        assert_eq!(parse_retry_after("   ", 0), None);
+        assert_eq!(parse_retry_after("-1", 0), None);
+        assert_eq!(parse_retry_after("abc", 0), None);
+        assert_eq!(parse_retry_after("120abc", 0), None);
+        // 非有限值必须被拒（否则会污染后续的封顶计算）
+        assert_eq!(parse_retry_after("inf", 0), None);
+        assert_eq!(parse_retry_after("NaN", 0), None);
+    }
+
+    #[test]
+    fn retry_after_huge_value_saturates_without_panic() {
+        // 超大值不能 panic；饱和到 u64::MAX 后由调用方按 CAP 截断
+        let got = parse_retry_after("1e30", 0).expect("超大 delta-seconds 应能解析");
+        assert_eq!(got, u64::MAX);
+        assert_eq!(
+            backoff_delay_ms(Some(got), 0, 0),
+            RETRY_AFTER_CAP_MS,
+            "封顶必须把超大值压回 RETRY_AFTER_CAP_MS"
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date() {
+        // 2026-10-21T07:28:00Z = 1792567680
+        let now = 1_792_567_680 - 120;
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", now),
+            Some(120_000)
+        );
+        // 已过期的日期 → None（等一个过去的时间点没有意义）
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", 1_792_567_680),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT", 1_792_567_680 + 60),
+            None
+        );
+    }
+
+    #[test]
+    fn backoff_caps_single_wait() {
+        // 上游要 1 小时，我们只等 CAP
+        assert_eq!(backoff_delay_ms(Some(3_600_000), 0, 0), RETRY_AFTER_CAP_MS);
+        // 无 Retry-After 时的指数退避：1s / 2s / 4s，第 4 次起封顶
+        assert_eq!(backoff_delay_ms(None, 0, 0), 1_000);
+        assert_eq!(backoff_delay_ms(None, 1, 0), 2_000);
+        assert_eq!(backoff_delay_ms(None, 2, 0), 4_000);
+        assert_eq!(
+            backoff_delay_ms(None, 3, 0),
+            8_000_u64.min(RETRY_AFTER_CAP_MS)
+        );
+        assert_eq!(backoff_delay_ms(None, 99, 0), RETRY_AFTER_CAP_MS);
+    }
+
+    #[test]
+    fn backoff_jitter_stays_within_band() {
+        let base = 1_000u64;
+        let lo = base - base * RETRY_AFTER_JITTER_PCT as u64 / 100;
+        let hi = base + base * RETRY_AFTER_JITTER_PCT as u64 / 100;
+        for _ in 0..200 {
+            let d = backoff_delay_ms(Some(base), 0, RETRY_AFTER_JITTER_PCT);
+            assert!((lo..=hi).contains(&d), "抖动后 {d} 应落在 [{lo}, {hi}] 内");
+        }
+        // jitter=0 时必须确定化（回归保护：不要让抖动变成无条件随机）
+        assert_eq!(backoff_delay_ms(Some(base), 0, 0), base);
+    }
+
+    #[test]
+    fn backoff_zero_base_is_exactly_zero() {
+        // Retry-After: 0 → 不等待，且不能被抖动放大成非零
+        assert_eq!(backoff_delay_ms(Some(0), 0, RETRY_AFTER_JITTER_PCT), 0);
+    }
+
+    #[test]
+    fn only_rate_limit_and_overloaded_wait() {
+        assert!(kind_waits_for_backoff("RateLimit"));
+        assert!(kind_waits_for_backoff("Overloaded"));
+        // 认证错与请求错等多久都不会变好
+        assert!(!kind_waits_for_backoff("UpstreamAuth"));
+        assert!(!kind_waits_for_backoff("InvalidRequest"));
+        assert!(!kind_waits_for_backoff("ContextTooLong"));
+        assert!(!kind_waits_for_backoff("ProviderOther"));
     }
 }

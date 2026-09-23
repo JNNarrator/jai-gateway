@@ -4,7 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **上游 `Retry-After` 现在真正用于网关内部退避**（D9-T2）：此前该头只被**回传给客户端**，
+  网关自己切换候选时不等 —— 上游 429/503 明确说了「X 秒后再来」，我们却立刻去撞下一个
+  候选，把限流窗口二次打满（实测某上游 502 占全量 9.78%）。
+  新增 `router::{parse_retry_after, backoff_delay_ms, kind_waits_for_backoff}`：
+  `delta-seconds`（含小数）+ `HTTP-date` 两种形式都解析（用 `httpdate`，不手写日期解析），
+  单次等待封顶 `RETRY_AFTER_CAP_MS = 5s`、叠加 ±20% 抖动、一次请求累计封顶
+  `MAX_TOTAL_BACKOFF_MS = 10s`。`Attempt::Failed` 增加 `retry_after_ms` 字段，
+  直通与转换两条路径都填。
+  三个刻意的边界：
+  1. **只在上游明确给出 `Retry-After` 时等待** —— 上游没说就不等。500/503 往往是瞬时
+     故障，而下一个候选是**另一个上游**，等它对这个上游毫无意义，只会让客户端白等。
+     指数退避（`backoff_delay_ms` 的 `None` 分支）保留给 T3 的分组重试，那时同组内会
+     回到同一个上游，等待才有意义。
+  2. **只对限速/过载类失败等待**（`RateLimit` / `Overloaded`）—— 401/403 与 400 等多久
+     都不会变好。
+  3. **只在后面确实还有候选可试时才等**，否则只是让客户端多等一次超时。
+  `retry-after-ms`（非标准但精确）优先于标准 `Retry-After`。
+
 ### Fixed
+
+- **转换路径不再丢退避头**（D9-T2）：`try_converted_candidate` 此前只取错误 body、不收集
+  错误响应头，跨族失败时 `Retry-After` 直接丢失。现收集 `FORWARD_ERROR_HEADERS` 用于解析
+  退避时长；**但刻意不把它放进 `UpstreamError`** —— 跨族全失败仍按入站方言合成 502
+  （由 `m4_conversion.rs::converted_upstream_429_renders_oai_error` 守着：上游是 Anthropic
+  形状的错误体，直接回传给 OpenAI 入站客户端会违反协议），只是把 `Retry-After` 头附在
+  502 上，让客户端仍有退避依据。
+
+### Tests
+
+- 新增 `crates/gateway-core/tests/m13_retry_after.rs`（4 用例）：`Retry-After: 1` 真的等 ~1s；
+  `Retry-After: 3600` 被 CAP 截断在 5s；`401 + Retry-After: 30` **不等**；转换路径全失败
+  仍是 502 且带 `Retry-After` 头。时间断言用「A 首个请求到 B 首个请求的间隔」而非墙钟。
+- `router` 内联新增 7 个单测：delta-seconds / 小数 / 垃圾值 / `inf` / `NaN` / 超大值饱和
+  （不 panic）/ HTTP-date（含已过期）/ CAP 截断 / jitter 落在 ±20% 区间 / `Retry-After: 0`
+  不被抖动放大。
+- 新增依赖 `httpdate = "1"`（已在 `Cargo.lock` 里作为传递依赖存在，不引入新编译单元）。
+
 - **集成测试不再用固定 `sleep` 等异步日志落库**（v0.3.1 发版时撞上）：tag `v0.3.1` 的
   `CI`（main push）在 **windows-latest** 上红在 `m3_anthropic.rs:244`
   （`logs_recent(...).find(...).unwrap()` 拿到 `None`），而同一份代码 30 分钟前在 Windows
