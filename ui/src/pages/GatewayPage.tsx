@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Copy, Eye, EyeOff, HeartPulse, Play, Plus, Square, Trash2 } from "lucide-react";
+import { AlertTriangle, Copy, Eye, EyeOff, HeartPulse, Play, Plus, ShieldCheck, Square, Trash2 } from "lucide-react";
 import { api } from "../api";
 import type { GatewayKeyInfo, GwStatus, HealthSummary } from "../types";
 import { toast } from "../lib/toast";
@@ -9,6 +9,7 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { CopyField } from "@/components/common/CopyField";
 import { StatusBadge } from "@/components/common/StatusBadge";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { KeyRulesDialog } from "@/components/common/KeyRulesDialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -29,6 +30,10 @@ export function GatewayPage() {
   const [newLabel, setNewLabel] = useState("");
   const [keyBusy, setKeyBusy] = useState(false);
   const [confirmRevoke, setConfirmRevoke] = useState<GatewayKeyInfo | null>(null);
+  /** 正在编辑规则的密钥（null = 弹窗关闭） */
+  const [rulesFor, setRulesFor] = useState<GatewayKeyInfo | null>(null);
+  /** 已配过规则的密钥 id 集合 —— 列表上给个「已限制」标记，避免用户忘了配过 */
+  const [limitedKeys, setLimitedKeys] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [confirmRotate, setConfirmRotate] = useState(false);
@@ -66,7 +71,26 @@ export function GatewayPage() {
 
   const loadKeys = async () => {
     try {
-      setKeys(await api.gatewayKeyList());
+      const list = await api.gatewayKeyList();
+      setKeys(list);
+      // 规则摘要（列表上显示「已限制」标记）：失败不影响密钥列表本身
+      const flags: Record<string, boolean> = {};
+      await Promise.all(
+        list.map(async (k) => {
+          try {
+            const r = await api.gatewayKeyRulesGet(k.id);
+            flags[k.id] =
+              r.providerAllow.length +
+                r.providerDeny.length +
+                r.modelAllow.length +
+                r.modelDeny.length >
+              0;
+          } catch {
+            flags[k.id] = false;
+          }
+        }),
+      );
+      setLimitedKeys(flags);
     } catch (e) {
       setErr(String(e));
     }
@@ -362,7 +386,7 @@ export function GatewayPage() {
             <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
               <span className="text-muted-foreground">API Key</span>
               <span className="text-xs text-muted-foreground">
-                每个客户端 / 人一把，可独立吊销；常态只显示前缀
+                每个客户端 / 人一把，可独立吊销；常态只显示前缀。点「规则」可限制这把密钥能用的渠道 / 模型。
               </span>
             </div>
 
@@ -409,7 +433,26 @@ export function GatewayPage() {
                       >
                         {k.lastUsedAt ? `用 ${fmtClock(k.lastUsedAt)}` : "从未使用"}
                       </span>
+                      {limitedKeys[k.id] && (
+                        <span
+                          className="shrink-0 rounded border border-amber-500/50 bg-amber-500/10 px-1.5 py-0.5 text-[11px] text-amber-700 dark:text-amber-300"
+                          title="这把密钥配了渠道 / 模型规则"
+                          data-testid="gateway-key-limited"
+                        >
+                          已限制
+                        </span>
+                      )}
                       <span className="ml-auto flex shrink-0 items-center gap-1">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7"
+                          aria-label={`设置规则 ${k.prefix}`}
+                          onClick={() => setRulesFor(k)}
+                        >
+                          <ShieldCheck aria-hidden />
+                          规则
+                        </Button>
                         <Button
                           variant="outline"
                           size="sm"
@@ -558,6 +601,12 @@ export function GatewayPage() {
           </p>
         </CardContent>
       </Card>
+
+      <KeyRulesDialog
+        keyInfo={rulesFor}
+        onOpenChange={(o) => !o && setRulesFor(null)}
+        onSaved={() => void loadKeys()}
+      />
 
       <ConfirmDialog
         open={confirmRotate}

@@ -125,6 +125,9 @@ pub struct AppCore {
     /// 草稿端点探测的「通过」凭据（D9-T1）。**进程内存储、重启即失效** ——
     /// 刻意不落库：半年前测过的渠道不该被信任。
     pub probe_receipts: std::sync::Arc<gateway_core::probe::ProbeReceiptStore>,
+    /// 密钥白/黑名单的 5s TTL 缓存（D9-T6b）。与网关 `GatewayCtx.rules` 是**同一份**：
+    /// 保存规则后 IPC 侧立刻失效，用户不必等 TTL 过期才看到生效。
+    pub key_rules: std::sync::Arc<gateway_core::server::security::KeyRulesCache>,
 }
 
 /// 最近一轮健康检查摘要（UX-T3 横幅数据源）。
@@ -1015,6 +1018,105 @@ async fn gateway_key_regenerate(core: State<'_, AppCore>) -> Result<GatewayKeyIn
         revoked_at: None,
         key: new_key,
     })
+}
+
+// -------------------------------------------------- 密钥白/黑名单（D9-T6b）
+
+/// 一把密钥的规则 DTO。四个集合一一对应迁移 0013 的两张表。
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyRulesDto {
+    pub provider_allow: Vec<String>,
+    pub provider_deny: Vec<String>,
+    pub model_allow: Vec<String>,
+    pub model_deny: Vec<String>,
+}
+
+impl KeyRulesDto {
+    fn from_rules(r: &gateway_core::store::keyrules::KeyRules) -> Self {
+        let v = |s: &std::collections::BTreeSet<String>| s.iter().cloned().collect::<Vec<_>>();
+        Self {
+            provider_allow: v(&r.provider_allow),
+            provider_deny: v(&r.provider_deny),
+            model_allow: v(&r.model_allow),
+            model_deny: v(&r.model_deny),
+        }
+    }
+
+    fn to_rules(&self) -> gateway_core::store::keyrules::KeyRules {
+        let s = |v: &Vec<String>| v.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+        gateway_core::store::keyrules::KeyRules {
+            provider_allow: s(&self.provider_allow),
+            provider_deny: s(&self.provider_deny),
+            model_allow: s(&self.model_allow),
+            model_deny: s(&self.model_deny),
+        }
+    }
+}
+
+/// 规则选择器的一行候选（渠道 × 模型）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleOptionDto {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model_name: String,
+}
+
+/// 读某把密钥的规则（没配过 → 四个空数组 = 不限制）。
+#[tauri::command]
+async fn gateway_key_rules_get(
+    core: State<'_, AppCore>,
+    key_id: String,
+) -> Result<KeyRulesDto, String> {
+    let db = core.db.clone();
+    let rules = tokio::task::spawn_blocking(move || {
+        db.with(|c| store::keyrules::key_rules_get(c, &key_id))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    Ok(KeyRulesDto::from_rules(&rules))
+}
+
+/// 覆盖式保存某把密钥的规则，并**立刻失效缓存**（否则要等 5s TTL 才生效）。
+#[tauri::command]
+async fn gateway_key_rules_set(
+    core: State<'_, AppCore>,
+    key_id: String,
+    rules: KeyRulesDto,
+) -> Result<(), String> {
+    let db = core.db.clone();
+    let r = rules.to_rules();
+    let id = key_id.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with(|c| store::keyrules::key_rules_set(c, &id, &r))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    core.key_rules.invalidate(Some(&key_id));
+    Ok(())
+}
+
+/// 规则选择器的候选清单（启用中的渠道 × 模型）。
+#[tauri::command]
+async fn gateway_key_rules_options(core: State<'_, AppCore>) -> Result<Vec<RuleOptionDto>, String> {
+    let db = core.db.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        db.with(store::keyrules::rule_options)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    Ok(rows
+        .into_iter()
+        .map(|r| RuleOptionDto {
+            provider_id: r.provider_id,
+            provider_name: r.provider_name,
+            model_name: r.model_name,
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------- 日志 / 导出 / 设置
@@ -3317,7 +3419,10 @@ fn spawn_supervisor(
     let port_cell = st.port.clone();
     let restarts = st.restarts.clone();
     let preferred_port = st.preferred_port;
-    let ctx = GatewayCtx::new(core.db.clone(), core.logs.clone());
+    // 规则缓存用 AppCore 里那一份：`gateway_key_rules_set` 保存完就失效它，
+    // 否则用户要等 5s TTL 才看到新规则生效（会以为没保存上）。
+    let ctx =
+        GatewayCtx::new(core.db.clone(), core.logs.clone()).with_rules(core.key_rules.clone());
 
     let app_handle = app.clone();
     // detached 任务：生命周期由 running 标志与 stop 信号管理，无需持有句柄
@@ -3579,6 +3684,9 @@ fn main() {
                     std::sync::Mutex::new(HealthSummary::default()),
                 ),
                 probe_receipts: std::sync::Arc::new(gateway_core::probe::ProbeReceiptStore::new()),
+                key_rules: std::sync::Arc::new(
+                    gateway_core::server::security::KeyRulesCache::new(),
+                ),
             };
             ensure_gateway_key(&core)?;
 
@@ -3691,6 +3799,9 @@ fn main() {
             gateway_key_revoke,
             gateway_key_reveal,
             gateway_key_regenerate,
+            gateway_key_rules_get,
+            gateway_key_rules_set,
+            gateway_key_rules_options,
             logs_recent,
             stats_usage,
             export_config_json,

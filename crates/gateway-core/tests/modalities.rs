@@ -8,10 +8,11 @@
 //! 出站 GET /v1/models → 配置导出/导入（含老快照回填）。
 //! 用例前缀（enum_/store_/discover_/proxy_/sync_）供分组判据过滤使用。
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use gateway_core::discover;
 use gateway_core::modality::{self, Modality};
 use gateway_core::server::proxy::{models_list, GatewayCtx};
+use gateway_core::server::{self};
 use gateway_core::store::{self, Db, ProviderRow};
 use serde_json::{json, Value};
 
@@ -288,7 +289,15 @@ async fn proxy_models_list_exposes_input_output_modalities() {
     let (logs, _t) = store::logs::spawn_logger(log_path.to_str().unwrap()).unwrap();
     let ctx = GatewayCtx::new(db.clone(), logs);
 
-    let resp = models_list(State(ctx)).await;
+    // D9-T6b：handler 现在要一个鉴权结果（它据此查密钥规则）。给一把没配规则的密钥
+    // ⇒ 规则为空 ⇒ 不过滤，本用例的断言面不变。
+    let resp = models_list(
+        State(ctx),
+        Extension(server::security::AuthedKey {
+            id: "k-test-no-rules".to_string(),
+        }),
+    )
+    .await;
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();

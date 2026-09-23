@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::codec::openai;
+use crate::store::keyrules::KeyRules;
 use crate::store::{self, Db};
 
 /// 常量时间比较：先各自 sha256 归一为定长摘要再异或折叠，
@@ -112,7 +113,7 @@ fn origin_host(origin: &str) -> Option<String> {
     Some(hostname_of_host_header(hostport))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AuthedKey {
     pub id: String,
 }
@@ -286,5 +287,86 @@ impl CorsAllowlist {
         };
         *self.cache.lock().unwrap() = Some((now_ms, list.clone()));
         list
+    }
+}
+
+// ------------------------------------------------------ 密钥规则缓存（D9-T6b）
+
+/// 规则的 TTL（毫秒）。与 `CorsAllowlist` 同一档：5 秒足够挡掉同一客户端
+/// 连续请求的重复查库，又不至于让「改了规则」长时间不生效。
+const RULES_TTL_MS: i64 = 5000;
+
+/// 缓存内容：key_id → (写入时刻, 规则)。用 `Arc<KeyRules>` 让热路径只克隆指针。
+type RulesMap = std::collections::HashMap<String, (i64, Arc<KeyRules>)>;
+
+/// 密钥规则的缓存句柄（避免每个请求都查库）。
+///
+/// 与 `CorsAllowlist` 同一套模式（5 秒 TTL），差异在于**保存后立刻失效**：
+/// 用户刚在界面上写完规则就去测，等 5 秒才知道生效会以为是坏的，
+/// 所以 `gateway_key_rules_set` 会调 [`KeyRulesCache::invalidate`]。
+#[derive(Clone)]
+pub struct KeyRulesCache {
+    cache: Arc<std::sync::Mutex<RulesMap>>,
+}
+
+impl Default for KeyRulesCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyRulesCache {
+    pub fn new() -> Self {
+        Self {
+            cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// 取某把密钥的规则；未命中 / 过期则查库。
+    ///
+    /// 查库失败按**不限制**处理（打一条日志）：路由本身也要查库，DB 真坏了请求
+    /// 在下游照样会 500；把规则查询失败升级成「全拒」只会让所有客户端一起收到
+    /// 403，把一个本机单人用的网关变成 fail-closed 的边界，收益为负。
+    pub async fn get(&self, db: &Db, key_id: &str) -> Arc<KeyRules> {
+        let now_ms = crate::store::now_ms();
+        if let Some((ts, rules)) = self.cache.lock().unwrap().get(key_id) {
+            if now_ms - ts < RULES_TTL_MS {
+                return rules.clone();
+            }
+        }
+        let db2 = db.clone();
+        let id2 = key_id.to_string();
+        let read = tokio::task::spawn_blocking(move || {
+            db2.with(|c| store::keyrules::key_rules_get(c, &id2))
+        })
+        .await;
+        let rules = match read {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                eprintln!("[rules] 读取密钥规则失败，本次按不限制处理: {e}");
+                KeyRules::default()
+            }
+            Err(e) => {
+                eprintln!("[rules] 规则查询任务失败，本次按不限制处理: {e}");
+                KeyRules::default()
+            }
+        };
+        let rules = Arc::new(rules);
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(key_id.to_string(), (now_ms, rules.clone()));
+        rules
+    }
+
+    /// 让缓存立刻失效。`None` = 全部清空（留给「批量改规则」类路径）。
+    pub fn invalidate(&self, key_id: Option<&str>) {
+        let mut c = self.cache.lock().unwrap();
+        match key_id {
+            Some(id) => {
+                c.remove(id);
+            }
+            None => c.clear(),
+        }
     }
 }

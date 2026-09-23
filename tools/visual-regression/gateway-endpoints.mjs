@@ -44,6 +44,9 @@ function installMock() {
       case "gateway_key_info": return { ...fix.gateway_key_info };
       case "gateway_key_list": return (fix.gateway_key_list || []).map((k) => ({ ...k }));
       case "gateway_key_reveal": return { ...fix.gateway_key_info };
+      case "gateway_key_rules_get":
+        return (fix.key_rules || {})[args?.keyId] || { providerAllow: [], providerDeny: [], modelAllow: [], modelDeny: [] };
+      case "gateway_key_rules_options": return (fix.key_rules_options || []).map((o) => ({ ...o }));
       case "health_summary": return JSON.parse(JSON.stringify(fix.health_summary));
       case "plugin:window|theme": return "dark";
       case "plugin:window|cursor_position": return { x: 0, y: 0 };

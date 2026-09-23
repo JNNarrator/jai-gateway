@@ -48,6 +48,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0012_max_tools_per_channel",
         include_str!("migrations/0012_max_tools_per_channel.sql"),
     ),
+    (
+        "0013_key_rules",
+        include_str!("migrations/0013_key_rules.sql"),
+    ),
 ];
 
 #[cfg(test)]

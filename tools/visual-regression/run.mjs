@@ -33,7 +33,7 @@ const TAB_LABEL = {
 // ───────────────────────── mock ─────────────────────────
 function installMock() {
   const fix = window.__JAI_FIX__;
-  const state = { running: true, providers: null, models: null, mcp: null, skills: null, keys: (fix.gateway_key_list || []).map((k) => ({ ...k })) };
+  const state = { running: true, providers: null, models: null, mcp: null, skills: null, keys: (fix.gateway_key_list || []).map((k) => ({ ...k })), rules: JSON.parse(JSON.stringify(fix.key_rules || {})) };
   const calls = [];
   const opened = [];
   window.__JAI_CALLS__ = calls;
@@ -71,6 +71,14 @@ function installMock() {
       case "gateway_key_revoke":
         state.keys = state.keys.filter((k) => k.id !== args?.id);
         return true;
+      case "gateway_key_rules_get":
+        return state.rules[args?.keyId] || { providerAllow: [], providerDeny: [], modelAllow: [], modelDeny: [] };
+      case "gateway_key_rules_set":
+        // 真落进 state：探针据此验证「保存后再打开还是刚存的那份」
+        state.rules[args?.keyId] = JSON.parse(JSON.stringify(args?.rules));
+        return null;
+      case "gateway_key_rules_options":
+        return (fix.key_rules_options || []).map((o) => ({ ...o }));
       case "gateway_key_regenerate": {
         const row = {
           id: "k-rotated",

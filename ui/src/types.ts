@@ -78,6 +78,21 @@ export interface GatewayKeyInfo {
   key: string;
 }
 
+/** 一把密钥的白/黑名单（D9-T6b）。四个集合都为空 = 不限制。 */
+export interface KeyRules {
+  providerAllow: string[];
+  providerDeny: string[];
+  modelAllow: string[];
+  modelDeny: string[];
+}
+
+/** 规则选择器的一行候选（渠道 × 模型）。只含启用中的渠道与模型。 */
+export interface RuleOption {
+  providerId: string;
+  providerName: string;
+  modelName: string;
+}
+
 export interface UsageStatRow {
   day: number;
   requests: number;

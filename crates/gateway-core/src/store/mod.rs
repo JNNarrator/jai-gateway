@@ -5,6 +5,7 @@
 
 pub mod export;
 pub mod import;
+pub mod keyrules;
 pub mod logs;
 pub mod migrations;
 pub mod retention;

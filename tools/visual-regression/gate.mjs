@@ -263,6 +263,110 @@ for (const size of SIZES) {
     }
   }
 
+  // ── probe-rules：密钥白/黑名单弹窗（D9-T6b） ──
+  // 规则弹窗是**点击后**才出现的，audit/fold 都不会点到它，所以单独一条探针。
+  const pr = SKIP_PROBES
+    ? readJson(path.join(VR, `out-probe-rules-${size}.json`))
+    : runProbe(`probe-rules --size=${size}`, "probe-rules.mjs", `out-probe-rules-${size}.json`);
+  if (!pr) {
+    fail("密钥规则弹窗 probe-rules", size, "未产出结果文件（探针未跑或崩溃）");
+  } else {
+    const where = `${size} 网关页 · 密钥规则`;
+    const op = pr.opened;
+    if (!op) {
+      fail("密钥规则弹窗能打开", where, "点「规则」后没有出现弹窗");
+    } else {
+      // 候选清单：夹具 4 行「渠道 × 模型」→ 去重后 2 个渠道 / 4 个模型
+      if (op.providers?.length !== 2) {
+        fail("规则弹窗列出全部渠道", where, `渠道行 ${op.providers?.length} 个（期望 2）`);
+      }
+      if (op.models?.length !== 4) {
+        fail("规则弹窗列出全部模型", where, `模型行 ${op.models?.length} 个（期望 4）`);
+      }
+      // 回填：夹具里 k-laptop 的白名单只有 Anthropic ⇒ 该行必须是「允许」态
+      const anth = op.providers?.find((p) => p.id === pr.anthId);
+      if (anth?.state !== "allow") {
+        fail("规则弹窗回填已保存的规则", where, `Anthropic 行三态为「${anth?.state}」（期望 allow）`);
+      }
+      if (op.previewCount !== 2) {
+        fail("预览初始计数", where, `可访问模型 ${op.previewCount}（白名单只放行 Anthropic ⇒ 期望 2）`);
+      }
+      // 三条语义必须写在界面上，用户不该靠猜
+      for (const word of ["拒绝", "允许", "默认"]) {
+        if (!(op.legend || "").includes(word)) {
+          fail("规则语义写在界面上", where, `说明文案里没有「${word}」：${op.legend}`);
+        }
+      }
+    }
+    // 预览必须跟着**未保存的草稿**实时变
+    if (pr.previewTwoAllow !== 4) {
+      fail("预览跟随草稿", where, `再加允许主渠道后 ${pr.previewTwoAllow}（期望 4）`);
+    }
+    if (pr.previewMainOnly !== 2) {
+      fail("预览跟随草稿", where, `拒绝 Anthropic 后 ${pr.previewMainOnly}（期望 2）`);
+    }
+    if (pr.previewNone?.count !== 0) {
+      fail("预览跟随草稿", where, `两个渠道都拒绝后 ${pr.previewNone?.count}（期望 0）`);
+    }
+    // 「自己把自己锁死」是本功能最危险的误操作，必须当场把后果说清
+    if (!/403/.test(pr.previewNone?.text || "")) {
+      fail("无可访问模型时给出后果提示", where, `预览文案：${pr.previewNone?.text}`);
+    }
+    if (pr.previewMainAll !== 2) {
+      fail("预览跟随草稿", where, `只白名单主渠道后 ${pr.previewMainAll}（期望 2）`);
+    }
+    if (pr.previewOneModel !== 1) {
+      fail("模型白名单参与预览", where, `再白名单 kimi-k2.7-code 后 ${pr.previewOneModel}（期望 1）`);
+    }
+    // 提交给后端的四个数组必须与界面三态**逐字**一致
+    const pl = pr.payload?.rules;
+    const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    if (!pl) {
+      fail("保存规则真的调用后端", where, "没有捕获到 gateway_key_rules_set");
+    } else if (
+      !eq(pl.providerAllow, [pr.mainId]) ||
+      !eq(pl.providerDeny, []) ||
+      !eq(pl.modelAllow, ["kimi-k2.7-code"]) ||
+      !eq(pl.modelDeny, [])
+    ) {
+      fail("界面三态与提交的规则一致", where, JSON.stringify(pl));
+    }
+    if (pr.dialogAfterSave) {
+      fail("保存后弹窗关闭", where, "保存后弹窗仍然开着");
+    }
+    // 重新打开必须读回刚保存的那份（否则用户会以为没存上，反复保存）
+    const rp = pr.reopened;
+    const rpMain = rp?.providers?.find((p) => p.id === pr.mainId);
+    const rpAnth = rp?.providers?.find((p) => p.id === pr.anthId);
+    if (rpMain?.state !== "allow" || rpAnth?.state !== "default") {
+      fail(
+        "重新打开读回刚保存的规则",
+        where,
+        `主渠道=${rpMain?.state} / Anthropic=${rpAnth?.state}（期望 allow / default）`,
+      );
+    }
+    if (rp?.models?.find((m) => m.id === "kimi-k2.7-code")?.state !== "allow") {
+      fail("重新打开读回模型规则", where, "kimi-k2.7-code 未回到「允许」态");
+    }
+    if (rp?.previewCount !== 1) {
+      fail("重新打开预览一致", where, `预览 ${rp?.previewCount}（期望 1）`);
+    }
+    // 列表上的「已限制」徽标：只有配过规则的密钥才有
+    const badge = (rows, prefix) => rows?.find((r) => r.prefix === prefix)?.limited;
+    if (badge(pr.badges, "sk-jai-pnxAR")) {
+      fail("未配规则的密钥不显示「已限制」", where, "k-main 也被标成已限制");
+    }
+    if (!badge(pr.badges, "sk-jai-Lp7Qm") || !badge(pr.badges, "sk-jai-Ci9Zx")) {
+      fail("配过规则的密钥显示「已限制」", where, JSON.stringify(pr.badges));
+    }
+    if (!badge(pr.badgesAfterSave, "sk-jai-Lp7Qm")) {
+      fail("保存后列表仍标「已限制」", where, JSON.stringify(pr.badgesAfterSave));
+    }
+    if (pr.errors?.length) {
+      fail("密钥规则弹窗无报错", where, pr.errors.slice(0, 3).join(" | "));
+    }
+  }
+
   // ── probe-endpoint：渠道草稿端点探测面板（D9-T1） ──
   // 探测面板的结论行是**点击后**才出现的，audit/fold 都不会点到它，所以单独一条探针。
   const pe = SKIP_PROBES

@@ -145,6 +145,24 @@ export const fixtures = {
       key: "",
     },
   ],
+  // 密钥白/黑名单（D9-T6b）：候选清单 = 启用中的渠道 × 模型（P_GEM 已停用 ⇒ 不出现）
+  key_rules_options: [
+    { providerId: P_MAIN, providerName: "基元律动", modelName: "kimi-k2.7-code" },
+    { providerId: P_MAIN, providerName: "基元律动", modelName: "glm-5.3" },
+    { providerId: P_ANTH, providerName: "Anthropic 官方", modelName: "claude-sonnet-4-5" },
+    { providerId: P_ANTH, providerName: "Anthropic 官方", modelName: "claude-opus-4-1" },
+  ],
+  // 三把密钥覆盖三种规则形态：不限制 / 白名单（「已限制」徽标）/ 拒绝 + 模型白名单
+  key_rules: {
+    "k-main": { providerAllow: [], providerDeny: [], modelAllow: [], modelDeny: [] },
+    "k-laptop": { providerAllow: [P_ANTH], providerDeny: [], modelAllow: [], modelDeny: [] },
+    "k-ci": {
+      providerAllow: [],
+      providerDeny: [P_ANTH],
+      modelAllow: ["glm-5.3"],
+      modelDeny: [],
+    },
+  },
   provider_list: [
     {
       id: P_MAIN,

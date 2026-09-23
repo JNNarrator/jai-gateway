@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Extension, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use crate::codec::anthropic as anthropic_codec;
 use crate::codec::openai::{error_body, extract_usage, peek, url_join, PeekRequest, UsageScanner};
 use crate::router;
+use crate::store::keyrules::KeyRules;
 use crate::store::logs::LogEvent;
 use crate::store::{self, Db};
 
@@ -187,6 +188,9 @@ pub struct GatewayCtx {
     pub logs: crate::store::logs::LogHandle,
     pub http: reqwest::Client,
     pub cors: Arc<CorsAllowlist>,
+    /// 密钥白/黑名单缓存（D9-T6b）：5s TTL，保存规则后由 IPC 侧主动失效。
+    /// 桌面端 AppCore 持有同一份（见 `with_rules`），所以「刚保存就去请求」立刻生效。
+    pub rules: Arc<security::KeyRulesCache>,
     /// 鉴权失败限速（roadmap M2）
     pub rate: Arc<super::ratelimit::AuthRateLimiter>,
     pub version: String,
@@ -206,6 +210,7 @@ impl GatewayCtx {
             logs,
             http,
             cors: Arc::new(CorsAllowlist::new()),
+            rules: Arc::new(security::KeyRulesCache::new()),
             rate: Arc::new(super::ratelimit::AuthRateLimiter::new()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at_ms: store::now_ms() as u64,
@@ -214,10 +219,22 @@ impl GatewayCtx {
     }
 }
 
+impl GatewayCtx {
+    /// 换用外部持有的规则缓存。
+    ///
+    /// 桌面端把这一份存在 `AppCore` 里：`gateway_key_rules_set` 保存完就
+    /// [`security::KeyRulesCache::invalidate`]，否则用户要等 5s TTL 才看到生效。
+    /// 测试不调用 —— 各自一份更省事。
+    pub fn with_rules(mut self, rules: Arc<security::KeyRulesCache>) -> Self {
+        self.rules = rules;
+        self
+    }
+}
+
 // ---------------------------------------------------------------- 中间件
 
 /// 安全中间件：Host/Origin 校验 + 鉴权限速判定 + 强制鉴权。/healthz 豁免。
-pub async fn security_mw(State(ctx): State<GatewayCtx>, req: Request, next: Next) -> Response {
+pub async fn security_mw(State(ctx): State<GatewayCtx>, mut req: Request, next: Next) -> Response {
     if req.uri().path() == "/healthz" {
         return next.run(req).await;
     }
@@ -255,9 +272,14 @@ pub async fn security_mw(State(ctx): State<GatewayCtx>, req: Request, next: Next
         }
         BanStatus::Allowed => {}
     }
-
     match security::authenticate(&ctx.db, &headers).await {
-        Ok(_key) => next.run(req).await,
+        // D9-T6b：鉴权结果**必须带进请求扩展** —— `dispatch` 与 `models_list`
+        // 靠它问「这条请求用的是哪把密钥」。此前这里是 `Ok(_key) =>`，直接丢掉，
+        // 于是「按密钥过滤」根本无处安放（这正是 T6b 的前置缺失）。
+        Ok(key) => {
+            req.extensions_mut().insert(key);
+            next.run(req).await
+        }
         Err(resp) => {
             // 记录失败：同一源窗口内超阈值即封禁
             ctx.rate.record_failure(peer_ip, store::now_ms());
@@ -939,24 +961,46 @@ fn provider_mark_fail(db: &Db, pid: &str, msg: &str) {
 
 // ---------------------------------------------------------------- handlers
 
-/// GET /v1/models 查询行：(模型名, 供应商名, 上下文窗口, 旧 vision 列, 输入模态串, 输出模态串)。
-type ModelListRow = (
-    String,
-    String,
-    Option<i64>,
-    Option<i64>,
-    Option<String>,
-    Option<String>,
-);
+/// GET /v1/models 查询行。
+///
+/// 用结构体而不是元组：T6b 加上 `provider_id` 后字段到七个，元组写法
+/// （`|(id, owner, _ctx, _l, _i, _o)|`）已经看不出谁是谁了。
+struct ModelListRow {
+    model_name: String,
+    provider_id: String,
+    provider_name: String,
+    context_window: Option<i64>,
+    legacy_multimodal: Option<i64>,
+    input_modalities: Option<String>,
+    output_modalities: Option<String>,
+}
+
+/// 取本次请求那把密钥的规则（5s TTL 缓存，见 [`security::KeyRulesCache`]）。
+///
+/// `None`（请求扩展里没有鉴权结果）只可能出现在中间件被绕过的测试路径 —— 按
+/// 「不限制」处理，与「没配规则的密钥」行为一致。
+async fn key_rules_of(ctx: &GatewayCtx, key: Option<&security::AuthedKey>) -> Arc<KeyRules> {
+    match key {
+        Some(k) => ctx.rules.get(&ctx.db, &k.id).await,
+        None => Arc::new(KeyRules::default()),
+    }
+}
 
 /// GET /v1/models —— 数据库内启用模型的去重聚合输出。
-pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
+///
+/// D9-T6b：按**调用方那把密钥**的规则过滤。不过滤的话客户端会看到一堆自己
+/// 根本调不通的模型（选到了必然 403），体验比看不到更差。
+pub async fn models_list(
+    State(ctx): State<GatewayCtx>,
+    Extension(authed): Extension<security::AuthedKey>,
+) -> Response {
+    let rules = key_rules_of(&ctx, Some(&authed)).await;
     let list = {
         let db = ctx.db.clone();
         tokio::task::spawn_blocking(move || {
             db.with(|c| -> Result<Vec<ModelListRow>, store::StoreError> {
                 let mut stmt = c.prepare(
-                    "SELECT m.model_name, p.name, m.context_window, m.supports_multimodal, \
+                    "SELECT m.model_name, p.id, p.name, m.context_window, m.supports_multimodal, \
                             m.input_modalities, m.output_modalities \
                       FROM models m \
                       JOIN providers p ON p.id=m.provider_id \
@@ -965,14 +1009,15 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
                 )?;
                 let rows = stmt
                     .query_map([], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, Option<i64>>(2)?,
-                            r.get::<_, Option<i64>>(3)?,
-                            r.get::<_, Option<String>>(4)?,
-                            r.get::<_, Option<String>>(5)?,
-                        ))
+                        Ok(ModelListRow {
+                            model_name: r.get(0)?,
+                            provider_id: r.get(1)?,
+                            provider_name: r.get(2)?,
+                            context_window: r.get(3)?,
+                            legacy_multimodal: r.get(4)?,
+                            input_modalities: r.get(5)?,
+                            output_modalities: r.get(6)?,
+                        })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
@@ -985,17 +1030,21 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
         Ok(Ok(rows)) => {
             let mut seen = std::collections::HashSet::new();
             rows.into_iter()
-                .filter(|(id, owner, _ctx, _l, _i, _o)| seen.insert(format!("{owner}/{id}")))
-                .map(|(id, owner, ctx, legacy, input_raw, output_raw)| {
+                // 密钥规则：渠道轴与模型轴都要通过（空规则 ⇒ 全通过）
+                .filter(|r| {
+                    rules.allows_provider(&r.provider_id) && rules.allows_model(&r.model_name)
+                })
+                .filter(|r| seen.insert(format!("{}/{}", r.provider_name, r.model_name)))
+                .map(|r| {
                     // context_window 为 NULL 时给保守默认 128k（与 schema 注释/UI 编辑页一致），
                     // 供客户端模型目录解析模型上下文窗口、计算 ctx 占用百分比。
-                    let context_window = ctx.unwrap_or(128_000);
-                    let input = crate::modality::parse_opt(input_raw.as_deref());
-                    let output = crate::modality::parse_opt(output_raw.as_deref());
+                    let context_window = r.context_window.unwrap_or(128_000);
+                    let input = crate::modality::parse_opt(r.input_modalities.as_deref());
+                    let output = crate::modality::parse_opt(r.output_modalities.as_deref());
                     // supportsMultimodal 自 0010 起降为**派生视图**：集合优先、缺失回落旧列。
                     let supports_multimodal = crate::modality::derive_supports_multimodal(
                         input.as_deref(),
-                        legacy.map(|v| v != 0),
+                        r.legacy_multimodal.map(|v| v != 0),
                     );
                     // 仅追加字段，旧客户端不受影响：contextWindow / supportsMultimodal 语义未变。
                     //
@@ -1006,9 +1055,9 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
                     // token → 模型把整轮耗在推理上 → 正文一个字不出）正是这条链路的产物。
                     // 网关只做转发与诊断，不发明预算。
                     json!({
-                        "id": format!("{owner}/{id}"),
+                        "id": format!("{}/{}", r.provider_name, r.model_name),
                         "object": "model",
-                        "owned_by": owner,
+                        "owned_by": r.provider_name,
                         "contextWindow": context_window,
                         "supportsMultimodal": supports_multimodal,
                         "inputModalities": input,
@@ -1196,6 +1245,9 @@ pub async fn anthropic_count_tokens(State(_ctx): State<GatewayCtx>, req: Request
 /// 直通主流程：路由候选 → 逐渠道尝试（故障转移）。
 async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response {
     let started = Instant::now();
+    // D9-T6b：鉴权中间件把 `AuthedKey` 放进了请求扩展。**必须在消费 body 之前取出来**
+    // （后面 `req.into_body()` 会把请求拆掉），规则过滤要用它定位密钥。
+    let authed = req.extensions().get::<security::AuthedKey>().cloned();
     // 直通路径需要把下游安全请求头带到上游（Content-Type/Accept 等）
     let inbound_headers = req.headers().clone();
 
@@ -1329,6 +1381,47 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
         );
     }
 
+    // ---- 密钥规则过滤（D9-T6b）----
+    //
+    // 位置刻意排在「模型不存在 / 指定供应商不存在」两个 404 **之后**：那两个是
+    // 「东西本来就没有」，而这里被挡掉是「你有，但不给你用」—— 按验收要求必须
+    // 是 **403 `model_not_allowed`**，不能退化成 404（用户会以为模型没了，
+    // 实际上换把密钥就能用）。
+    //
+    // 反过来，指定 `供应商/模型` 而该供应商被规则挡住时：只要还有别的候选可用
+    // 就照常走（沿用「指定优先、其余后备」的既有语义）；一个都不剩才 403。
+    let rules = key_rules_of(&ctx, authed.as_ref()).await;
+    if !rules.is_empty() {
+        candidates
+            .retain(|c| rules.allows_provider(&c.provider_id) && rules.allows_model(&model_key));
+        if candidates.is_empty() {
+            let msg = format!(
+                "模型 {model:?} 不被当前 API Key 的规则允许（该密钥限制了可用的渠道 / 模型，\
+                 可在「网关」页的密钥规则里调整）"
+            );
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(&peeked),
+                None,
+                None,
+                403,
+                ms_since(started),
+                peeked.stream,
+                None,
+                0,
+                Some("ModelNotAllowed".into()),
+                Some(msg.clone()),
+                None,
+            );
+            return wire.error_response(
+                StatusCode::FORBIDDEN,
+                &msg,
+                "permission_error",
+                Some("model_not_allowed"),
+            );
+        }
+    }
     // ---- 重试预算（D9-T3）----
     // meta 覆盖项：`retry_max_per_group` / `retry_max_total`；缺失 / 非法用默认 (3, 6)。
     // 设成 (1, 1) 等于关掉重试 = 改造前行为。
@@ -3864,6 +3957,15 @@ async fn streaming_response(
 mod tests {
     use super::*;
 
+    /// 直接调用 handler 的用例需要一个鉴权结果（D9-T6b 起 handler 会拿它查密钥规则）。
+    /// 用固定 id —— 测试库与 `GatewayCtx` 都是新建的，缓存里必然没有它，
+    /// 于是查库得到「空规则」⇒ 不过滤。
+    fn authed_test_key() -> Extension<security::AuthedKey> {
+        Extension(security::AuthedKey {
+            id: "k-test-no-rules".to_string(),
+        })
+    }
+
     /// bug 11 回归：`tool_calls` 日志列必须真数工具调用，不能再恒 0。
     /// 三种入站线的直通响应体形状各取一次（并行工具调用要全数到）。
     #[test]
@@ -4180,7 +4282,8 @@ mod tests {
         let (logs, _t) = crate::store::logs::spawn_logger(log_path.to_str().unwrap()).unwrap();
         let ctx = GatewayCtx::new(db.clone(), logs);
 
-        let resp = models_list(State(ctx)).await;
+        // D9-T6b：同 `models_list_exposes_supports_multimodal` —— 给一把没配规则的密钥。
+        let resp = models_list(State(ctx), authed_test_key()).await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -4323,7 +4426,9 @@ mod tests {
         let (logs, _t) = crate::store::logs::spawn_logger(log_path.to_str().unwrap()).unwrap();
         let ctx = GatewayCtx::new(db.clone(), logs);
 
-        let resp = models_list(State(ctx)).await;
+        // D9-T6b：handler 现在要一个鉴权结果（它据此查密钥规则）。给一把「没配规则」
+        // 的密钥即可 —— 规则为空 ⇒ 不过滤，本用例原本的断言面不变。
+        let resp = models_list(State(ctx), authed_test_key()).await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();

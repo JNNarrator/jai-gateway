@@ -7,6 +7,7 @@ import type {
   GatewayKeyInfo,
   HealthSummary,
   ImportReport,
+  KeyRules,
   LogRowView,
   McpServerRow,
   McpTool,
@@ -15,6 +16,7 @@ import type {
   ProxyConfigDto,
   ProbeDraftInput,
   ProviderDto,
+  RuleOption,
   SettingsDto,
   SkillRow,
   UsageStatRow,
@@ -130,6 +132,15 @@ export const api = {
     invoke<GatewayKeyInfo>("gateway_key_reveal", { id: id ?? null }),
   gatewayKeyRegenerate: () =>
     invoke<GatewayKeyInfo>("gateway_key_regenerate"),
+  /** 密钥白/黑名单（D9-T6b）：读某把密钥的规则（没配过 → 四个空数组） */
+  gatewayKeyRulesGet: (keyId: string) =>
+    invoke<KeyRules>("gateway_key_rules_get", { keyId }),
+  /** 覆盖式保存规则；后端保存后会立刻失效 5s TTL 缓存，无需等生效 */
+  gatewayKeyRulesSet: (keyId: string, rules: KeyRules) =>
+    invoke<void>("gateway_key_rules_set", { keyId, rules }),
+  /** 规则选择器的候选清单（启用中的渠道 × 模型） */
+  gatewayKeyRulesOptions: () =>
+    invoke<RuleOption[]>("gateway_key_rules_options"),
 
   // 日志 / 导出 / 设置 / WebDAV
   logsRecent: (limit = 100) => invoke<LogRowView[]>("logs_recent", { limit }),
