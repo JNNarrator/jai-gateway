@@ -4,7 +4,7 @@
 
 ## 1. 版本与产物
 
-- 版本：`src-tauri/tauri.conf.json` `"version"`（当前 `0.3.1`）
+- 版本：`src-tauri/tauri.conf.json` `"version"`（当前 `0.4.0`）
 - 产物：
   - macOS：`.dmg` / `.app`（Tauri bundle `targets: all`）
     - ⚠️ **只有 `aarch64`（Apple Silicon）**：`macos-latest` runner 已是 arm64，
@@ -71,6 +71,11 @@
 
 - [x] 自动化门禁脚本：`bash scripts/release_check.sh`（工作区干净、版本号、CHANGELOG、tag、全量回归）
 - [x] `bash scripts/regression.sh` 全绿（已被 release_check.sh 覆盖）
+- [ ] **D9 批次（v0.4.0）的真机验收** —— 自动化门禁覆盖不到、必须手点的三项：
+      - 单实例保护（D9-T4）：连点两次图标只出一个窗口、第二次把已有窗口前置
+      - 端点探测（D9-T1）：在「新建供应商」里填**真实上游**点一次探测，逐端点结论与延迟合理
+      - 多密钥 + 白/黑名单（D9-T6a/T6b）：给一把密钥配上规则，在真实客户端里跑一次
+        「能用的模型能用 / 被限制的模型返回 403 且文案点名规则」
 - [ ] 黄金夹具矩阵：M2/M3/M4/M5/M6/M7/M8 集成测试全绿
 - [ ] 真机验收：Claude Code、Codex、DeepSeek harness、zcode 各至少一例
 - [x] **WebDAV 真机验收（v0.3.1 实测通过，2026-09-22）**：一条命令跑完整链路
