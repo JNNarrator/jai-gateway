@@ -22,6 +22,9 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// 本地文件操作（迁移前备份的建目录 / 清理）。
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 // ================================================================ 连接与迁移
@@ -39,12 +42,127 @@ pub fn open_and_migrate(path: &str) -> Result<Connection, StoreError> {
     }
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    migrate(&conn)?;
+    migrate(&conn, Some(path))?;
     Ok(conn)
 }
 
+// ---------------------------------------------------------------- 迁移前备份（D9-T5）
+
+/// 迁移前自动备份的保留份数。
+///
+/// 与 WebDAV 远端备份的 `sync::BACKUP_KEEP` **无关**：那是远端配置备份，
+/// 这是本地 DB 快照；两者的文件名形态也不同，所以不共用清理函数。
+pub const MIGRATION_BACKUP_KEEP: usize = 3;
+
+/// 备份子目录名（相对数据目录）。
+pub const BACKUP_DIR: &str = "backups";
+
+const BACKUP_PREFIX: &str = "jai.db.";
+const BACKUP_SUFFIX: &str = ".bak";
+
+fn backup_dir_of(db_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    db_path.parent().map(|p| p.join(BACKUP_DIR))
+}
+
+/// 从 `jai.db.<unix_ms>.bak` 解析时间戳；不匹配返回 None。
+fn backup_timestamp_of(name: &str) -> Option<i64> {
+    let stem = name
+        .strip_prefix(BACKUP_PREFIX)?
+        .strip_suffix(BACKUP_SUFFIX)?;
+    stem.parse::<i64>().ok()
+}
+
+/// 列出本地迁移备份，按时间戳升序（最后一个最新）。
+///
+/// 目录不存在 / 不可读时返回空表 —— 备份是尽力而为，不因此报错。
+pub fn list_migration_backups(db_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Some(dir) = backup_dir_of(db_path) else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(i64, std::path::PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            backup_timestamp_of(&name).map(|ts| (ts, e.path()))
+        })
+        .collect();
+    out.sort_by_key(|(ts, _)| *ts);
+    out.into_iter().map(|(_, p)| p).collect()
+}
+
+/// 最新一份本地迁移备份。
+///
+/// 供桌面壳在**迁移失败**时告诉用户「回滚点在哪」—— 此时 `Db::open` 已经返回 Err，
+/// 拿不到 `migrate` 的返回值，所以独立查一次目录。
+pub fn latest_migration_backup(db_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    list_migration_backups(db_path).pop()
+}
+
+/// 迁移前把当前 DB 快照一份，并滚动清理到 [`MIGRATION_BACKUP_KEEP`] 份。
+///
+/// 用 `VACUUM INTO` 而不是 `fs::copy`：WAL 模式下直接拷文件可能漏掉尚未 checkpoint
+/// 的数据；`VACUUM INTO` 产出的是一致的快照，且不要求停机。
+fn backup_before_migrate(
+    conn: &Connection,
+    db_path: &std::path::Path,
+) -> Result<std::path::PathBuf, StoreError> {
+    let dir = backup_dir_of(db_path).ok_or_else(|| {
+        StoreError::Io(std::io::Error::other("DB 路径没有父目录，无法定位备份目录"))
+    })?;
+    std::fs::create_dir_all(&dir)?;
+
+    let stamp = now_ms();
+    let mut target = dir.join(format!("{BACKUP_PREFIX}{stamp}{BACKUP_SUFFIX}"));
+    // VACUUM INTO 要求目标文件不存在；同毫秒撞车（并发/快速重启）时加后缀。
+    if target.exists() {
+        target = dir.join(format!("{BACKUP_PREFIX}{stamp}-1{BACKUP_SUFFIX}"));
+    }
+    // 路径里的单引号必须转义，否则会打断 SQL 字面量。
+    let escaped = target.to_string_lossy().replace('\'', "''");
+    conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+
+    // 滚动清理：只留最近 MIGRATION_BACKUP_KEEP 份
+    let all = list_migration_backups(db_path);
+    if all.len() > MIGRATION_BACKUP_KEEP {
+        for old in &all[..all.len() - MIGRATION_BACKUP_KEEP] {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    Ok(target)
+}
+
 /// 在既有连接上执行迁移（供测试注入内存库）。
-pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
+///
+/// `db_path`：文件库路径。给出时会在应用**任何**迁移之前自动备份一份
+/// （仅当「已存在的库且有迁移待应用」）。内存库传 `None`。
+/// 返回本次产生的备份路径（未产生则为 `None`）。
+///
+/// **备份失败不阻止迁移**：磁盘满 / 权限这类原因导致应用打不开，比「没有备份」更糟；
+/// 迁移本身仍有逐条事务保护（版本号与 schema 同事务提交）。
+pub fn migrate(
+    conn: &Connection,
+    db_path: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, StoreError> {
+    let mut backup: Option<std::path::PathBuf> = None;
+    if let Some(p) = db_path.filter(|p| *p != ":memory:") {
+        let path = std::path::Path::new(p);
+        let current: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let pending = (current as usize) < migrations::MIGRATIONS.len();
+        // user_version = 0 是全新库：没有数据可丢，备份只会留垃圾文件。
+        if current > 0 && pending {
+            match backup_before_migrate(conn, path) {
+                Ok(b) => {
+                    eprintln!("[store] 迁移前已备份: {}", b.display());
+                    backup = Some(b);
+                }
+                Err(e) => eprintln!("[store] 迁移前备份失败（继续迁移）: {e}"),
+            }
+        }
+    }
+
     // 0003 需要重建 providers 表；迁移期临时关闭外键，跑完恢复
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     let result = (|| -> Result<(), StoreError> {
@@ -63,7 +181,8 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
         Ok(())
     })();
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    result
+    result?;
+    Ok(backup)
 }
 
 // ================================================================ 共享句柄

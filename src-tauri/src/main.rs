@@ -2268,7 +2268,7 @@ async fn health_round(core: &AppCore, app: &AppHandle, first_round: bool) -> Res
                 .await;
                 if !first_round && was_failing {
                     eprintln!("[health] 恢复: {}（发现 {n} 个模型）", row.name);
-                    notify_health(
+                    notify_user(
                         app,
                         format!("供应商『{}』已恢复", row.name),
                         "健康检查：连接已恢复正常".to_string(),
@@ -2286,7 +2286,7 @@ async fn health_round(core: &AppCore, app: &AppHandle, first_round: bool) -> Res
                 .await;
                 if !first_round && !was_failing {
                     eprintln!("[health] 失败: {} - {msg}", row.name);
-                    notify_health(
+                    notify_user(
                         app,
                         format!("供应商『{}』连接失败", row.name),
                         msg.chars().take(HEALTH_NOTIFY_SUMMARY_CHARS).collect(),
@@ -2312,8 +2312,10 @@ async fn health_summary(core: State<'_, AppCore>) -> Result<HealthSummary, Strin
     Ok(core.health_summary.lock().unwrap().clone())
 }
 
-/// 发送系统通知（失败只打日志，不影响探测流程）。
-fn notify_health(app: &AppHandle, title: String, body: String) {
+/// 发送系统通知（失败只打日志，不影响调用方流程）。
+///
+/// 供应商健康跃迁与「启动失败」共用 —— 不要在别处再写一份 `notification().builder()`。
+fn notify_user(app: &AppHandle, title: String, body: String) {
     if let Err(e) = app.notification().builder().title(title).body(body).show() {
         eprintln!("[health] 通知发送失败: {e}");
     }
@@ -3283,7 +3285,21 @@ fn main() {
             let db_path = data_dir.join("jai.db");
             let db_str = db_path.to_string_lossy().to_string();
 
-            let db = Db::open(&db_str)?;
+            // 迁移失败 = 中止启动（storage §4 早拦截）。此前这里是裸 `?` —— 失败直接
+            // panic 退出（`.expect("error while running jai")`），用户只看到一个闪退的
+            // 图标，且不知道有没有回滚点。现在把「迁移前备份在哪」一并告诉用户。
+            let db = match Db::open(&db_str) {
+                Ok(db) => db,
+                Err(e) => {
+                    let hint = store::latest_migration_backup(&db_path)
+                        .map(|p| format!("；迁移前备份在 {}", p.display()))
+                        .unwrap_or_default();
+                    let msg = format!("数据库打开/迁移失败：{e}{hint}");
+                    eprintln!("[jai] {msg}");
+                    notify_user(app.handle(), "JAI 启动失败".into(), msg.clone());
+                    return Err(msg.into());
+                }
+            };
             // 启动按需回收磁盘（bug 清单 14 的永久解法）：SQLite 删除大行后文件不会自动缩小，
             // 历史事故实测出现过「895 MB 库里 894 MB 全是空洞」。必须在**日志连接建立之前**
             // 执行（VACUUM 需要独占），失败仅告警、不阻塞启动。

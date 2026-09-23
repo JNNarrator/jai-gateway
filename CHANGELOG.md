@@ -6,6 +6,29 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **迁移前自动备份 DB**（D9-T5）：此前 `Db::open` 用裸 `?`，迁移失败 → `setup` 返回 Err
+  → `main.rs` 的 `.expect("error while running jai")` panic 退出。用户只看到一个闪退的
+  图标，**既没有提示、也没有回滚点**。
+  现在 `store::migrate` 在应用**任何**迁移之前把当前库快照一份到
+  `<数据目录>/backups/jai.db.<unix_ms>.bak`，滚动保留最近 `MIGRATION_BACKUP_KEEP = 3` 份。
+  三条同时满足才备份（避免产生垃圾文件）：① 文件库（`:memory:` 跳过）；② `user_version > 0`
+  （全新库没有数据可丢）；③ `user_version < MIGRATIONS.len()`（没有待应用迁移就不备份，
+  否则每次启动都会备份一次）。
+  用 **`VACUUM INTO`** 而不是 `fs::copy` —— WAL 模式下直接拷文件可能漏掉尚未 checkpoint
+  的数据；`VACUUM INTO` 产出的是一致快照，且不要求停机。
+  备份**失败不阻止迁移**（决策 D4）：磁盘满 / 权限这类原因导致应用打不开，比「没有备份」
+  更糟；迁移本身仍有逐条事务保护（版本号与 schema 同事务提交）。
+  桌面壳侧：迁移失败不再 panic，改为发系统通知并带上「迁移前备份在 <路径>」
+  （新增 `store::latest_migration_backup`，因为此时 `Db::open` 已返回 Err，拿不到
+  `migrate` 的返回值）。顺带把 `notify_health` 更名为 `notify_user`（它已不只服务健康检查）。
+  `StoreError` 增加 `Io` 变体。
+  注：原方案打算复用 `sync::backup_evict_candidates`，但那个纯函数硬编码识别
+  `jai-config.<ts>.json`（远端配置备份的命名），与本地 DB 快照的
+  `jai.db.<ts>.bak` 形态不同，因此另写了一个同样只认时间戳的本地清理。
+  测试：新增 `crates/gateway-core/tests/m13_migration_backup.rs`（9 用例，全绿）——
+  内存库/全新库/已最新 → 不备份；落后一版 → 备份且**内容是迁移前状态**
+  （断言备份的 `user_version` = 11）；清理保留最新 3 份；备份目录不可写时迁移照常完成；
+  无关文件不被误认成备份。
 - **单实例保护**（D9-T4）：此前启动路径**没有任何单实例机制**，双击两次图标（或从
   Dock / 开始菜单再点一次）会起第二个进程。网关端口被占会自动顺延，于是两个网关各监听
   一个端口 —— 用户看到两个窗口、两个网关，不知道客户端该连哪个；两个实例还会同时写

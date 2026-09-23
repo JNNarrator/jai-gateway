@@ -593,6 +593,18 @@ pub fn is_non_idempotent(wire: &InboundWire, body: &[u8]) -> bool;
 ---
 
 ### T5 迁移前自动备份 DB
+> ✅ **已实施（2026-09-22）**。落地情况：`store::migrate` 签名改为
+> `(conn, db_path: Option<&str>) -> Result<Option<PathBuf>, StoreError>`；新增
+> `MIGRATION_BACKUP_KEEP = 3` / `BACKUP_DIR` / `list_migration_backups` /
+> `latest_migration_backup` / `backup_before_migrate`；`StoreError` 增加 `Io` 变体。
+> 桌面壳：迁移失败不再 panic，改发系统通知并带上备份路径（`notify_health` 更名 `notify_user`）。
+> `cargo check -p jai` + `bash scripts/regression.sh` 全绿（32 套件）。
+>
+> ⚠️ **方案修正**：原文说「复用 `sync::backup_evict_candidates`」——**不成立**。该纯函数
+> 硬编码识别 `jai-config.<digits>.json`（WebDAV 远端配置备份的命名），与本地 DB 快照的
+> `jai.db.<ms>.bak` 形态不同，匹配不到任何文件。已改为另写一个同样「只认时间戳」的本地
+> 清理，并保留 `sync::BACKUP_KEEP` 的语义不变（仍作用于远端备份）。
+
 
 **目标**：应用任何迁移之前，先把当前 DB 备份一份；迁移失败时用户能看到「已备份到 X」而不是一个闪退的图标。
 
