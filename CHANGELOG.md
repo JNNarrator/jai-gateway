@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-23
+
 ### Changed
 
 - **网关页（首页）排版整改**（用户反馈「按钮样式排版混乱不堪都看不懂啥意思了」）。先按真实
