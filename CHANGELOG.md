@@ -60,6 +60,48 @@ All notable changes to this project will be documented in this file.
   3. **只在后面确实还有候选可试时才等**，否则只是让客户端多等一次超时。
   `retry-after-ms`（非标准但精确）优先于标准 `Retry-After`。
 
+### Changed
+
+- **重试模型升级：候选分组 + 双档预算 + 跨组规则**（D9-T3）。此前 `dispatch` 是
+  「单轮把候选遍历一遍即止」：没有预算概念，也没有「哪些失败允许跨协议族重试」的语义。
+  三处具体问题：① 候选多时会把上游全部打一遍（限流窗口被二次打满）；
+  ② 401/403 这类**渠道凭据错**会继续往别的协议族上撞 —— 一旦那个协议恰好成功，
+  权限/语义错误就被静默掩盖成「能用」；③ `router::first_byte_verdict` 是**死代码**
+  （只有自己的单测），它想表达的「响应头已到、首字节未到时的失败可以 failover」
+  从未接线 —— 每个上游都会碰到的偶发断流被直接变成客户端可见的 502。
+  新增（`router`，纯函数可单测）：`FailureClass` 六类（`CallerTerminal` /
+  `ChannelAuthTerminal` / `EndpointUnsupported` / `Retryable` / `UpstreamProtocolError` /
+  `CommittedStreamError`）、`Failure{class, kind}`、`classify_failure`、
+  `GroupTier` + `group_candidates`（把 `proxy.rs` 里隐式的 `family` 排序显式化）、
+  `RetryBudget` + `retry_budget_from_meta`、`FlowStep` + `AttemptFlow` 状态机。
+  `dispatch` 改为「原生组 → 转换组」两组遍历，组内顺序**沿用改造前的排序结果**
+  （所以分组本身不改变现状行为），失败后由 `AttemptFlow::next(class, group_exhausted)`
+  决定「组内换 / 跨组 / 停」：
+  - 预算默认「组内 3 / 全局 6」，可由 meta `retry_max_per_group` / `retry_max_total`
+    覆盖；设成 `(1, 1)` 等价于**关掉重试**（= 改造前行为）。
+  - 跨组规则：401/403 **只在本组内换候选，绝不跨组**；429/5xx/404/408 与
+    405/501（端点不支持）允许降到转换组。`classify_status` 相应把 405/501 从
+    「其它 4xx → Stop」里摘出来判为 `Failover{ProviderOther}`。
+  - **非幂等请求不放宽**：Responses 入站带 `store:true` / `background:true`
+    （会产生服务端持久化副作用）时预算强制压到 `(1, 1)` —— 重发等于提交两次。
+  - `group_exhausted` 必须参与判定：否则「同组只有 1 个候选」时 `per_group_used`
+    永远小于上限，401 会顺着候选列表跨进转换组，绕过上面那条硬约束
+    （有专门的单测 `attempt_flow_treats_group_exhausted_as_budget_exhausted` 守着）。
+  - 首字节失败落地：`streaming_response` / `convert_streaming_response` 的三个首字节
+    分支（流错误 / 空流 / 首字节超时）从 `Attempt::Delivered(错误响应)` 改为
+    `Attempt::Failed` —— 边界严格是「`tx.send(first_chunk)` 之前」，之后一律按
+    现状断流 + 落日志。同时把预构造的错误响应放进 `Attempt::Failed::fallback`：
+    真的没有候选可试时**原样回它**，否则 `upstream_stream_error` /
+    `upstream_empty_stream` / `upstream_first_byte_timeout` 这些专属诊断码会退化成
+    笼统的 `all_providers_failed`，排障信息反而变少。死代码 `first_byte_verdict` 删除。
+  **兼容约束**：落库 `request_logs.error_kind` 的字符串**逐字不变**（仍由
+  `classify_status` 的 kind 携带，`Failure::as_kind()` 原样透出），有单测
+  `classify_failure_kind_matches_classify_status_verbatim` 对照守着 —— 否则会静默
+  改掉前端日志页与统计的语义。退避判定从 `kind_waits_for_backoff` 换成
+  `FailureClass::waits_for_backoff`（只有 `Retryable` 值得等，语义不变）。
+  已知遗留（**不是**本次引入）：转换路径的三个首字节分支本来就没有 `emit_log`，
+  现在仍然没有 —— 跨组成功时那条候选的失败不会留下日志行。
+
 ### Fixed
 
 - **转换路径不再丢退避头**（D9-T2）：`try_converted_candidate` 此前只取错误 body、不收集
@@ -70,6 +112,20 @@ All notable changes to this project will be documented in this file.
   502 上，让客户端仍有退避依据。
 
 ### Tests
+
+- 新增 `crates/gateway-core/tests/m13_retry_model.rs`（9 用例，全绿）——每个用例都按
+  「mock 被请求了几次」断言，而不是只看状态码：
+  401 同族全失败 → 转换族**零请求**；429 与 405 → 跨组并成功；组内预算 3（4 个同族候选
+  只试 3 个，第 4 个零请求）；总预算 6（meta 放宽组内预算到 10 → 4+2 恰好 6 次，后面的
+  转换族候选零请求）；Responses + `store:true` 只尝试 1 次（对照 `store:false` 走满 3 次）；
+  首字节失败（上游 200 + `text/event-stream` 但流立即结束）→ 切到下一个候选并拿到内容；
+  首字节失败且无候选可试 → 保留 `upstream_empty_stream` 专属诊断码；meta `(1,1)` →
+  只尝试第一个候选。
+- `router` 内联新增 11 个单测：`AttemptFlow::next` 真值表（6 类 × 组内预算状态）、
+  「候选走完 == 预算耗尽」的跨组判定、跨组只发生一次且进组后组内计数归零、总预算封顶、
+  非幂等压到 (1,1)、`retry_budget_from_meta` 的默认/非法/覆盖/(1,1)、`group_candidates`
+  保序切分、`classify_failure` 的状态码 → 分类矩阵、`from_kind` 还原、`degradable` /
+  `waits_for_backoff` 矩阵、以及 **kind 字符串与 `classify_status` 逐字一致**的兼容护栏。
 
 - 新增 `crates/gateway-core/tests/m13_retry_after.rs`（4 用例）：`Retry-After: 1` 真的等 ~1s；
   `Retry-After: 3600` 被 CAP 截断在 5s；`401 + Retry-After: 30` **不等**；转换路径全失败

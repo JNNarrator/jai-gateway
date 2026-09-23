@@ -395,6 +395,19 @@ pub fn backoff_delay_ms(retry_after_ms: Option<u64>, attempt: usize, jitter_pct:
 
 **目标**：把「单轮遍历一遍」换成带预算与跨组语义的状态机；**同时把 `first_byte_verdict` 这块死代码落地**（首字节失败允许 failover）。
 
+> ✅ **已实施（2026-09-22）**。落地与本文的差异（都是实现时才看清的点，正文保留原设计以便回溯）：
+>
+> 1. **`as_kind()` 挂在 `Failure` 上，不是 `FailureClass` 上**。`ProviderOther` 是复合 kind（404 / 405 / 501 / 建连失败都用它），若把 `as_kind()` 放在分类枚举上就无法为同一个分类还原出正确的字符串。故结构为 `Failure { class, kind }` + `Failure::as_kind()`，`classify_failure(status, body)` 返回 `Failure`。反向还原（手上只有 kind 字符串时）另给 `FailureClass::from_kind`，并把 `ProviderOther` 按最宽松的 `Retryable` 处理。
+> 2. **`AttemptFlow::next` 多一个 `group_exhausted: bool` 参数**。原设计的判定只看 `per_group_used`，而同组候选可能少于组内预算（甚至只有 1 个）——那时 `per_group_used` 永远小于上限，401 会被判成 `NextInGroup` 并顺着候选列表**跨进转换组**，等于绕过「凭据类错误不跨组」。现在「候选走完」与「组内预算耗尽」同等触发跨组判定（有单测守着）。
+> 3. **`Attempt::Failed` 增加 `fallback: Option<Response>`**。首字节失败改为可 failover 后，若真的没有候选可试，不能退化成笼统的 `all_providers_failed` —— 否则 `upstream_stream_error` / `upstream_empty_stream` / `upstream_first_byte_timeout` 这些专属诊断码就没了。故首字节分支预构造错误响应放进 `fallback`，`dispatch` 在候选用尽时原样回它。只有**最近一次**失败是首字节失败时才用它兜底。
+> 4. **`is_non_idempotent` 放在 `proxy.rs`**（`router` 看不到 `InboundWire`，为它把 axum 类型拖进纯函数层不划算）。判定只认 Responses 的 `store` / `background`；「`stream=true` 且已 commit」由 `CommittedStreamError` 负责，不在这里判。
+> 5. **`classify_status` 的 405/501 从「其它 4xx → Stop」摘出来**判为 `Failover{ProviderOther}`（kind 字符串仍是 `ProviderOther`，日志语义不变），否则 `EndpointUnsupported` 分类永远不会出现。
+> 6. **`degradable()` 之外的 `UpstreamProtocolError` 暂无生产者**：本次只落地首字节失败与状态码分类；「响应解析失败可 failover」涉及转换路径的解析错误分支，改动面与回归风险都更大，留给后续迭代（分类已就位，接上即可）。
+> 7. **预算读取**：`dispatch` 里另起一次 `spawn_blocking` 读 `meta`（`retry_max_per_group` / `retry_max_total`），读不到就用默认 `(3, 6)`。
+> 8. **已知遗留**：转换路径的三个首字节分支本来就没有 `emit_log`，现在仍然没有 —— 跨组成功时那条候选的失败不会留下日志行（非本次引入）。
+>
+> 验收：`bash scripts/regression.sh` 的 Rust 部分全绿（fmt / clippy `-D warnings` / `cargo test --workspace` 32 套件）；新增 `tests/m13_retry_model.rs` 9 用例 + `router` 内联 11 个单测。
+
 #### T3.1 关键兼容约束（先说清楚）
 
 现有的 `AttemptVerdict::{Stop, Failover}` 里那个 `kind: &'static str`（`UpstreamAuth` / `RateLimit` / `Overloaded` / `ProviderOther` / `InvalidRequest` / `ContextTooLong`）**会落进 `request_logs.error_kind`**（`0001_initial_schema.sql:48-69`），前端日志页与统计依赖它。

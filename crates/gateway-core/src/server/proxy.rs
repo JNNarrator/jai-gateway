@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::codec::anthropic as anthropic_codec;
 use crate::codec::openai::{error_body, extract_usage, peek, url_join, PeekRequest, UsageScanner};
-use crate::router::{self, AttemptVerdict};
+use crate::router;
 use crate::store::logs::LogEvent;
 use crate::store::{self, Db};
 
@@ -1042,9 +1042,13 @@ pub async fn models_list(State(ctx): State<GatewayCtx>) -> Response {
 enum Attempt {
     /// 已经向客户端交付（最终响应或确定性错误）
     Delivered(Response),
-    /// 本次渠道失败，且允许转移到下一渠道。
+    /// 本次渠道失败，且**允许**转移到下一渠道（是否真的转移由 `router::AttemptFlow`
+    /// 按失败分类 + 预算裁决；例如确定性 4xx 会在这里被拦下）。
     /// 携带最后一个 HTTP 错误（若为网络级失败则无），供全渠道失败时原样回传。
     Failed {
+        /// 行为分类（D9-T3）：决定换不换候选、能不能跨组、值不值得退避
+        class: router::FailureClass,
+        /// 落库 `request_logs.error_kind` 的字符串（与 `classify_status` 逐字一致）
         kind: &'static str,
         summary: String,
         /// 最后一个带 HTTP 状态的上游错误（status + body + content-type）
@@ -1054,6 +1058,15 @@ enum Attempt {
         /// `dispatch` 在切换下一候选前按它等待（有封顶 + 抖动，见 `router`）。
         /// 只对限速 / 过载类失败有意义，所以别的失败路径一律填 `None`。
         retry_after_ms: Option<u64>,
+        /// 首字节阶段（已收到响应头、**还没有任何字节下发给客户端**）失败时，
+        /// 预构造的「最终失败」响应。
+        ///
+        /// 此时允许 failover（这正是 `first_byte_verdict` 当年想表达、
+        /// 却从未接线的语义）。但若后面没有候选可试，必须原样回这个响应 ——
+        /// 否则 `upstream_stream_error` / `upstream_empty_stream` /
+        /// `upstream_first_byte_timeout` 这些专属诊断码会退化成笼统的
+        /// `all_providers_failed`，排障信息反而变少。
+        fallback: Option<Response>,
     },
 }
 
@@ -1091,6 +1104,49 @@ fn retry_after_from_headers(headers: &[(HeaderName, HeaderValue)]) -> Option<u64
         }
     }
     get("retry-after").and_then(|raw| router::parse_retry_after(raw, store::now_ms() / 1000))
+}
+
+/// 首字节阶段（已收到响应头、**尚未向下游发出任何字节**）的失败。
+///
+/// 返回 `Attempt::Failed` 让 `dispatch` 有机会换下一个候选；同时把「最终失败」
+/// 响应预构造进 `fallback`，真的没候选可试时原样回它，保住专属诊断码。
+fn first_byte_failure(
+    wire: InboundWire,
+    msg: &str,
+    status: StatusCode,
+    code: &'static str,
+    kind: &'static str,
+) -> Attempt {
+    Attempt::Failed {
+        class: router::FailureClass::from_kind(kind),
+        kind,
+        summary: msg.to_string(),
+        last_http: None,
+        retry_after_ms: None,
+        fallback: Some(wire.error_response(status, msg, "api_error", Some(code))),
+    }
+}
+
+/// 请求是否**非幂等**（重发会产生服务端副作用）→ 预算压到 (1, 1)，一次失败即止。
+///
+/// 目前只有 Responses 协议有这种开关：
+/// - `store: true`：上游会把这次响应持久化（OpenAI 侧可 `GET /v1/responses/{id}` 取回）
+/// - `background: true`：异步任务，重发等于提交两次任务
+///
+/// 其余协议只在「已向下游 commit 后断流」这一种情形下才不可重试，
+/// 而那由 `FailureClass::CommittedStreamError` 负责，不在这里判。
+/// 请求体解析不出来时按幂等处理 —— 那种请求会在解码阶段被判 CallerTerminal。
+fn is_non_idempotent(wire: InboundWire, body: &[u8]) -> bool {
+    if wire != InboundWire::Responses {
+        return false;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    v.get("store").and_then(Value::as_bool).unwrap_or(false)
+        || v.get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// POST /v1/chat/completions —— OpenAI 线主入口。
@@ -1273,22 +1329,75 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
         );
     }
 
-    // ---- 逐渠道尝试（按 priority, rowid 序）----
-    // 故障转移：每个渠道失败时按 router 分类决定切换或停止；
-    // 全部失败返回最后一个错误（roadmap M2：单轮遍历一遍即止，返回最后一个错误）。
+    // ---- 重试预算（D9-T3）----
+    // meta 覆盖项：`retry_max_per_group` / `retry_max_total`；缺失 / 非法用默认 (3, 6)。
+    // 设成 (1, 1) 等于关掉重试 = 改造前行为。
+    let budget = {
+        let db = ctx.db.clone();
+        match tokio::task::spawn_blocking(move || {
+            db.with(|c| {
+                Ok(router::retry_budget_from_meta(|k| {
+                    store::meta_get(c, k).ok().flatten()
+                }))
+            })
+        })
+        .await
+        {
+            Ok(Ok(b)) => b,
+            // 读不到 meta 不该挡路：回退默认预算
+            _ => router::RetryBudget::default(),
+        }
+    };
+
+    // ---- 逐渠道尝试（分组 + 预算 + 跨组规则）----
+    // D9-T3：把「单轮遍历一遍」换成带预算与跨组语义的状态机。
     //
-    // D9-T2：上游 429/503 给出的 Retry-After 用于**切换前的退避**，避免
-    // 「单轮把候选打光」把上游限流窗口二次打满（T3 会在此基础上加分组与预算）。
+    // 分组：原生协议组（同族，字节直通）在前，转换组（跨族，走 IR）在后。
+    // 组内顺序沿用上面的排序结果（priority + 健康 + 权重 + 限定名优先），
+    // 所以**分组本身不改变现状行为**，只是把「隐式的 family 排序」显式化。
+    //
+    // 跨组规则是这一步的核心语义：凭据类失败（401/403）**只在同族组内**换候选，
+    // 绝不跨组 —— 跨协议重试会让权限 / 语义错误被另一个协议的成功掩盖。
+    // 只有限速 / 过载 / 端点不支持这类「可降级」失败才允许落到转换组。
+    let (native, conversion) = router::group_candidates(candidates, wire.family());
+    let groups: [Vec<store::RouteCandidate>; 2] = [
+        native,
+        // 旧版 /v1/completions 只支持 OpenAI 兼容直通，不做跨族转换
+        if wire == InboundWire::Completions {
+            Vec::new()
+        } else {
+            conversion
+        },
+    ];
+    // 非幂等请求（Responses 带 `store` / `background`）预算压到 (1,1)：重发会有副作用。
+    //
+    // 注：原生组为空（候选全是跨族）时，「组内预算」同样作用于转换组 ——
+    // 即最多试 `per_group` 个转换族候选就停，而不是把候选列表走完。
+    let mut flow = router::AttemptFlow::new(budget, is_non_idempotent(wire, &body));
+    let mut gi = 0usize;
+    let mut ci = 0usize;
     let mut last_kind: &'static str = "ProviderOther";
     let mut last_summary = String::from("所有渠道均失败");
     let mut last_http: Option<UpstreamError> = None;
     let mut last_retry_after_ms: Option<u64> = None;
+    // 首字节阶段的失败会带一份「预构造的失败响应」：真的没候选可试时用它兜底
+    let mut last_fallback: Option<Response> = None;
     let mut total_backoff_ms: u64 = 0;
-    for (i, cand) in candidates.iter().enumerate() {
-        // 旧版 /v1/completions 只支持 OpenAI 兼容直通，不做跨族转换。
-        if wire == InboundWire::Completions && cand.family != wire.family() {
-            continue;
+
+    'attempts: loop {
+        // 定位下一个候选；本组走完就顺延到下一组，两组都走完则结束
+        while ci >= groups[gi].len() {
+            if gi + 1 < groups.len() && !groups[gi + 1].is_empty() {
+                gi += 1;
+                ci = 0;
+            } else {
+                break 'attempts;
+            }
         }
+        let cand = &groups[gi][ci];
+        ci += 1;
+        flow.record_attempt();
+
         // 跨族：推理回放兼容的**自适应**一环在 `try_converted_candidate` 的错误分类处
         // （400 走 `Stop` 直接交付，不会冒泡到这里），这里只做常规分类处理。
         let attempt = if cand.family != wire.family() {
@@ -1297,52 +1406,73 @@ async fn dispatch(wire: InboundWire, ctx: GatewayCtx, req: Request) -> Response 
             try_candidate(&ctx, wire, &peeked, cand, &body, &inbound_headers, started).await
         };
 
-        let (kind, summary, eh, retry_after_ms) = match attempt {
+        let (class, kind, summary, eh, retry_after_ms, fallback) = match attempt {
             Attempt::Delivered(resp) => return resp,
             Attempt::Failed {
+                class,
                 kind,
                 summary,
                 last_http,
                 retry_after_ms,
-            } => (kind, summary, last_http, retry_after_ms),
+                fallback,
+            } => (class, kind, summary, last_http, retry_after_ms, fallback),
         };
         last_kind = kind;
         last_summary = summary;
         if let Some(e) = eh {
             last_http = Some(e);
         }
+        // 只有**最近一次**失败发生在首字节阶段时才用预构造响应兜底：
+        // 否则该回后面那个候选的真实错误（上游错误体原样 / 502）
+        last_fallback = if fallback.is_some() { fallback } else { None };
+
+        // 本组还有候选吗？（决定 `next` 是「组内换」还是「跨组 / 停」）
+        let group_exhausted = ci >= groups[gi].len();
+        let has_next = !group_exhausted || groups[gi + 1..].iter().any(|g| !g.is_empty());
+
         if retry_after_ms.is_some() {
+            // 即便不值得等，也要记住它：全失败时附在合成响应上（客户端退避依据），
+            // 与改造前一致 —— 那个头是客户端唯一的退避依据。
             last_retry_after_ms = retry_after_ms;
-            // 退避：**只在上游明确给出 Retry-After 时等待**。
-            //
-            // 上游没说就不等 —— 500/503 往往是瞬时故障，而下一个候选是**另一个上游**，
-            // 等它对这个上游毫无意义，只会让客户端白白多等（实测 500 占比不低，
-            // 给每次切换都加 1s 会让多渠道路由整体变慢）。指数退避留给 T3 的
-            // 分组重试：那时同一组内会回到**同一个上游**，等待才有意义。
-            //
-            // 另外两个条件：
-            // - 只对限速/过载类失败等（认证错、请求错等多久都不会变好）
-            // - 只在后面确实还有候选可试时才等，否则只是让客户端多等一次超时
-            if let Some(ms) = retry_after_ms.filter(|_| router::kind_waits_for_backoff(kind)) {
-                let has_next = candidates[i + 1..]
-                    .iter()
-                    .any(|c| !(wire == InboundWire::Completions && c.family != wire.family()));
-                let remaining = router::MAX_TOTAL_BACKOFF_MS.saturating_sub(total_backoff_ms);
-                if has_next && remaining > 0 {
-                    let delay =
-                        router::backoff_delay_ms(Some(ms), 0, router::RETRY_AFTER_JITTER_PCT)
-                            .min(remaining);
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    total_backoff_ms += delay;
+        }
+        // 退避：**只在上游明确给出 Retry-After 且该类失败值得等**时等待。
+        //
+        // 上游没说就不等 —— 500/503 往往是瞬时故障，而下一个候选是**另一个上游**，
+        // 等它对这个上游毫无意义，只会让客户端白白多等（实测 500 占比不低，
+        // 给每次切换都加 1s 会让多渠道路由整体变慢）。
+        if let Some(ms) = retry_after_ms.filter(|_| class.waits_for_backoff()) {
+            let remaining = router::MAX_TOTAL_BACKOFF_MS.saturating_sub(total_backoff_ms);
+            if has_next && remaining > 0 {
+                let delay = router::backoff_delay_ms(Some(ms), 0, router::RETRY_AFTER_JITTER_PCT)
+                    .min(remaining);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                total_backoff_ms += delay;
+            }
+        }
+
+        match flow.next(class, group_exhausted) {
+            router::FlowStep::Stop => break,
+            router::FlowStep::NextInGroup => continue,
+            router::FlowStep::NextGroup => {
+                // 跳过本组剩余候选（组内预算已耗尽），进转换组
+                if gi + 1 >= groups.len() {
+                    break;
                 }
+                gi += 1;
+                ci = 0;
             }
         }
     }
-
     // 全部渠道失败。
+    // - 首字节阶段的失败已经预构造了响应（含 `upstream_stream_error` 这类专属
+    //   诊断码）：此时没有任何候选可试了，原样回它，别退化成笼统的
+    //   `all_providers_failed`
     // - 若存在带 HTTP 状态的上游错误：原样回传（保留状态码与协议方言形状，
     //   如 Anthropic 线 429/529）—— roadmap M2「返回最后一个错误」
     // - 否则（网络级失败）：统一 502
+    if let Some(resp) = last_fallback {
+        return resp;
+    }
     if let Some(err) = last_http {
         emit_log(
             &ctx.logs,
@@ -1509,10 +1639,12 @@ async fn try_candidate(
                 None,
             );
             return Attempt::Failed {
+                class: router::FailureClass::from_kind("UpstreamAuth"),
                 kind: "UpstreamAuth",
                 summary: format!("{}：{msg}", cand.provider_name),
                 last_http: None,
                 retry_after_ms: None,
+                fallback: None,
             };
         }
     };
@@ -1680,10 +1812,13 @@ async fn try_candidate(
                 None,
             );
             return Attempt::Failed {
+                // 建连失败：网络级瞬时故障，换个候选有意义
+                class: router::FailureClass::Retryable,
                 kind: "ProviderOther",
                 summary: format!("{}：{msg}", cand.provider_name),
                 last_http: None,
                 retry_after_ms: None,
+                fallback: None,
             };
         }
     };
@@ -1756,83 +1891,85 @@ async fn try_candidate(
             return retried;
         }
 
-        // 错误分类：可转移 → 下一渠道；确定性错误 → 原样返回
-        // 错误分类：可转移 → 下一渠道；确定性错误 → 原样返回
-        match router::classify_status(up_status.as_u16(), &snippet) {
-            AttemptVerdict::Stop { kind } => {
-                provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
-                emit_log(
-                    &ctx.logs,
-                    wire.log_family(),
-                    Some(peeked),
-                    Some(&cand.provider_id),
-                    cand.upstream_model_id.clone(),
-                    up_status.as_u16() as i64,
-                    ms_since(started),
-                    peeked.stream,
-                    None,
-                    0,
-                    Some(kind.into()),
-                    Some(if kind == "ContextTooLong" {
-                        format!("{}：上下文长度超限（{kind}）", cand.provider_name)
-                    } else {
-                        format!("{}：{snippet}", cand.provider_name)
-                    }),
-                    None,
-                );
-                let mut b = Response::builder().status(up_status);
-                b = match upstream_ct {
-                    Some(ct) => b.header(header::CONTENT_TYPE, ct),
-                    None => b.header(header::CONTENT_TYPE, "application/json"),
-                };
-                // 确定性错误也带上退避头（上游 429 被归类为 Stop 时客户端同样需要）
-                for (name, value) in &upstream_headers {
-                    b = b.header(name, value);
-                }
-                return Attempt::Delivered(
-                    b.body(Body::from(bytes))
-                        .unwrap_or_else(|_| empty_resp(up_status)),
-                );
+        // 错误分类：可转移 → 下一渠道；确定性错误 → 原样返回。
+        // D9-T3：分类改用 `classify_failure`（多了「能不能跨组」一维），
+        // 但落库的 `kind` 字符串仍由它携带，与 `classify_status` 逐字一致。
+        let failure = router::classify_failure(up_status.as_u16(), &snippet);
+        let kind = failure.as_kind();
+        if failure.class == router::FailureClass::CallerTerminal {
+            provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                cand.upstream_model_id.clone(),
+                up_status.as_u16() as i64,
+                ms_since(started),
+                peeked.stream,
+                None,
+                0,
+                Some(kind.into()),
+                Some(if kind == "ContextTooLong" {
+                    format!("{}：上下文长度超限（{kind}）", cand.provider_name)
+                } else {
+                    format!("{}：{snippet}", cand.provider_name)
+                }),
+                None,
+            );
+            let mut b = Response::builder().status(up_status);
+            b = match upstream_ct {
+                Some(ct) => b.header(header::CONTENT_TYPE, ct),
+                None => b.header(header::CONTENT_TYPE, "application/json"),
+            };
+            // 确定性错误也带上退避头（上游 429 被归类为 Stop 时客户端同样需要）
+            for (name, value) in &upstream_headers {
+                b = b.header(name, value);
             }
-            AttemptVerdict::Failover { kind } => {
-                provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
-                emit_log(
-                    &ctx.logs,
-                    wire.log_family(),
-                    Some(peeked),
-                    Some(&cand.provider_id),
-                    cand.upstream_model_id.clone(),
-                    up_status.as_u16() as i64,
-                    ms_since(started),
-                    peeked.stream,
-                    None,
-                    0,
-                    Some(kind.into()),
-                    Some(format!(
-                        "{}：「{kind}」即将切换渠道：{snippet}",
-                        cand.provider_name
-                    )),
-                    None,
-                );
-                // 退避时长必须在 headers 被 move 进 UpstreamError 之前算出来。
-                let retry_after_ms = retry_after_from_headers(&upstream_headers);
-                return Attempt::Failed {
-                    kind,
-                    summary: format!(
-                        "{}：上游 {kind}（HTTP {}）",
-                        cand.provider_name,
-                        up_status.as_u16()
-                    ),
-                    last_http: Some(UpstreamError {
-                        status: up_status,
-                        content_type: upstream_ct,
-                        headers: upstream_headers,
-                        body: bytes,
-                    }),
-                    retry_after_ms,
-                };
-            }
-            AttemptVerdict::Success => unreachable!("非 2xx 不会判 Success"),
+            return Attempt::Delivered(
+                b.body(Body::from(bytes))
+                    .unwrap_or_else(|_| empty_resp(up_status)),
+            );
+        }
+        {
+            provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
+            emit_log(
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                cand.upstream_model_id.clone(),
+                up_status.as_u16() as i64,
+                ms_since(started),
+                peeked.stream,
+                None,
+                0,
+                Some(kind.into()),
+                Some(format!(
+                    "{}：「{kind}」即将切换渠道：{snippet}",
+                    cand.provider_name
+                )),
+                None,
+            );
+            // 退避时长必须在 headers 被 move 进 UpstreamError 之前算出来。
+            let retry_after_ms = retry_after_from_headers(&upstream_headers);
+            return Attempt::Failed {
+                class: failure.class,
+                kind,
+                summary: format!(
+                    "{}：上游 {kind}（HTTP {}）",
+                    cand.provider_name,
+                    up_status.as_u16()
+                ),
+                last_http: Some(UpstreamError {
+                    status: up_status,
+                    content_type: upstream_ct,
+                    headers: upstream_headers,
+                    body: bytes,
+                }),
+                retry_after_ms,
+                fallback: None,
+            };
         }
     }
 
@@ -1846,7 +1983,9 @@ async fn try_candidate(
         .map(|v| v.starts_with("text/event-stream"))
         .unwrap_or(false);
 
-    let delivered = if ct_is_sse || peeked.stream {
+    // 直通流式：首字节阶段失败会返回 `Attempt::Failed`（可 failover），
+    // 非流式与已 commit 后的失败一律 `Delivered`。
+    if ct_is_sse || peeked.stream {
         streaming_response(
             ctx.clone(),
             wire,
@@ -1858,18 +1997,19 @@ async fn try_candidate(
         )
         .await
     } else {
-        plain_response(
-            ctx.clone(),
-            wire,
-            peeked.clone(),
-            cand.clone(),
-            resp,
-            up_status,
-            started,
+        Attempt::Delivered(
+            plain_response(
+                ctx.clone(),
+                wire,
+                peeked.clone(),
+                cand.clone(),
+                resp,
+                up_status,
+                started,
+            )
+            .await,
         )
-        .await
-    };
-    Attempt::Delivered(delivered)
+    }
 }
 
 // ---------------------------------------------------------------- M4/M5：跨族转换
@@ -2115,10 +2255,13 @@ async fn try_converted_candidate(
         }
         other => {
             return Attempt::Failed {
+                // 渠道声明了网关不认识的协议族：换个候选有意义
+                class: router::FailureClass::Retryable,
                 kind: "ProviderOther",
                 summary: format!("未知上游协议族: {other}"),
                 last_http: None,
                 retry_after_ms: None,
+                fallback: None,
             };
         }
     };
@@ -2130,10 +2273,12 @@ async fn try_converted_candidate(
             let msg = "该供应商尚未录入 API Key，请在设置中补录";
             provider_mark_fail(&ctx.db, &cand.provider_id, msg);
             return Attempt::Failed {
+                class: router::FailureClass::from_kind("UpstreamAuth"),
                 kind: "UpstreamAuth",
                 summary: format!("{}：{msg}", cand.provider_name),
                 last_http: None,
                 retry_after_ms: None,
+                fallback: None,
             };
         }
     };
@@ -2205,10 +2350,13 @@ async fn try_converted_candidate(
                 None,
             );
             return Attempt::Failed {
+                // 转换路径的建连失败：同样是网络级瞬时故障
+                class: router::FailureClass::Retryable,
                 kind: "ProviderOther",
                 summary: format!("{}：{msg}", cand.provider_name),
                 last_http: None,
                 retry_after_ms: None,
+                fallback: None,
             };
         }
     };
@@ -2278,65 +2426,67 @@ async fn try_converted_candidate(
             return retried;
         }
 
-        match router::classify_status(up_status.as_u16(), &snippet) {
-            AttemptVerdict::Stop { kind } => {
-                provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
-                emit_log_with(
-                    RouteMode::Converted,
-                    &ctx.logs,
-                    wire.log_family(),
-                    Some(peeked),
-                    Some(&cand.provider_id),
-                    cand.upstream_model_id.clone(),
-                    up_status.as_u16() as i64,
-                    ms_since(started),
-                    req.stream,
-                    None,
-                    0,
-                    Some(kind.into()),
-                    Some(format!("[convert] {}：{snippet}", cand.provider_name)),
-                    None,
-                );
-                // 确定性错误：翻译为入站方言（OpenAI schema）
-                let (tname, code) = match kind {
-                    "ContextTooLong" => ("invalid_request_error", Some("context_length_exceeded")),
-                    _ => ("invalid_request_error", None),
-                };
-                return Attempt::Delivered(wire.error_response(up_status, &snippet, tname, code));
-            }
-            AttemptVerdict::Failover { kind } => {
-                provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
-                emit_log_with(
-                    RouteMode::Converted,
-                    &ctx.logs,
-                    wire.log_family(),
-                    Some(peeked),
-                    Some(&cand.provider_id),
-                    cand.upstream_model_id.clone(),
-                    up_status.as_u16() as i64,
-                    ms_since(started),
-                    req.stream,
-                    None,
-                    0,
-                    Some(kind.into()),
-                    Some(format!(
-                        "[convert] {}：「{kind}」即将切换渠道：{snippet}",
-                        cand.provider_name
-                    )),
-                    None,
-                );
-                return Attempt::Failed {
-                    kind,
-                    summary: format!(
-                        "{}：上游 {kind}（HTTP {}）",
-                        cand.provider_name,
-                        up_status.as_u16()
-                    ),
-                    last_http: None,
-                    retry_after_ms: retry_after_from_headers(&upstream_headers),
-                };
-            }
-            AttemptVerdict::Success => unreachable!("非 2xx 不会判 Success"),
+        // D9-T3：与直通路径同一口径（`kind` 逐字不变，多出跨组维度）
+        let failure = router::classify_failure(up_status.as_u16(), &snippet);
+        let kind = failure.as_kind();
+        if failure.class == router::FailureClass::CallerTerminal {
+            provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
+            emit_log_with(
+                RouteMode::Converted,
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                cand.upstream_model_id.clone(),
+                up_status.as_u16() as i64,
+                ms_since(started),
+                req.stream,
+                None,
+                0,
+                Some(kind.into()),
+                Some(format!("[convert] {}：{snippet}", cand.provider_name)),
+                None,
+            );
+            // 确定性错误：翻译为入站方言（OpenAI schema）
+            let (tname, code) = match kind {
+                "ContextTooLong" => ("invalid_request_error", Some("context_length_exceeded")),
+                _ => ("invalid_request_error", None),
+            };
+            return Attempt::Delivered(wire.error_response(up_status, &snippet, tname, code));
+        }
+        {
+            provider_mark_fail(&ctx.db, &cand.provider_id, &snippet);
+            emit_log_with(
+                RouteMode::Converted,
+                &ctx.logs,
+                wire.log_family(),
+                Some(peeked),
+                Some(&cand.provider_id),
+                cand.upstream_model_id.clone(),
+                up_status.as_u16() as i64,
+                ms_since(started),
+                req.stream,
+                None,
+                0,
+                Some(kind.into()),
+                Some(format!(
+                    "[convert] {}：「{kind}」即将切换渠道：{snippet}",
+                    cand.provider_name
+                )),
+                None,
+            );
+            return Attempt::Failed {
+                class: failure.class,
+                kind,
+                summary: format!(
+                    "{}：上游 {kind}（HTTP {}）",
+                    cand.provider_name,
+                    up_status.as_u16()
+                ),
+                last_http: None,
+                retry_after_ms: retry_after_from_headers(&upstream_headers),
+                fallback: None,
+            };
         }
     }
 
@@ -2824,34 +2974,37 @@ async fn convert_streaming_response(
 ) -> Attempt {
     let mut upstream_stream = resp.bytes_stream();
 
-    // 首字节持票
+    // 首字节持票：**在拿到任何字节之前失败都可以 failover**（此刻客户端一个字节
+    // 也还没收到）。预构造失败响应放进 `fallback`，供「真的没候选可试」时原样回。
     let first = tokio::time::timeout(UPSTREAM_FIRST_BYTE_TIMEOUT, upstream_stream.next()).await;
     let first_chunk = match first {
         Ok(Some(Ok(b))) => b,
         Ok(Some(Err(e))) => {
-            let msg = format!("上游流建立失败: {e}");
-            return Attempt::Delivered(wire.error_response(
+            return first_byte_failure(
+                wire,
+                &format!("上游流建立失败: {e}"),
                 StatusCode::BAD_GATEWAY,
-                &msg,
-                "api_error",
-                Some("upstream_stream_error"),
-            ));
+                "upstream_stream_error",
+                "ProviderOther",
+            );
         }
         Ok(None) => {
-            return Attempt::Delivered(wire.error_response(
-                StatusCode::BAD_GATEWAY,
+            return first_byte_failure(
+                wire,
                 "上游流立即关闭",
-                "api_error",
-                Some("upstream_empty_stream"),
-            ));
+                StatusCode::BAD_GATEWAY,
+                "upstream_empty_stream",
+                "ProviderOther",
+            );
         }
         Err(_) => {
-            return Attempt::Delivered(wire.error_response(
-                wire.overloaded_status(),
+            return first_byte_failure(
+                wire,
                 "上游首字节超时(60s)",
-                "api_error",
-                Some("upstream_first_byte_timeout"),
-            ));
+                wire.overloaded_status(),
+                "upstream_first_byte_timeout",
+                "Overloaded",
+            );
         }
     };
 
@@ -3434,7 +3587,14 @@ async fn streaming_response(
     resp: reqwest::Response,
     status: StatusCode,
     started: Instant,
-) -> Response {
+) -> Attempt {
+    // 首字节持票：成功前不给客户端下 200。
+    //
+    // D9-T3：此前这三个分支直接返回错误响应（包成 `Attempt::Delivered`），
+    // 于是「首字节失败可 failover」这条语义（老 `first_byte_verdict` 想表达的）
+    // 从未真正生效 —— 恰恰每个上游都会碰到的偶发断流，被白白变成客户端可见的 502。
+    // 现在：**只要还没向下游发出任何字节**，就按可转移失败处理，让下一个候选接管；
+    // 同时把错误响应塞进 `fallback`，真的没候选可试时原样回它（保住专属诊断码）。
     let mut upstream_stream = resp.bytes_stream();
 
     // 首字节持票：成功前不给客户端下 200，失败可整体换成错误响应
@@ -3459,11 +3619,12 @@ async fn streaming_response(
                 Some(msg.clone()),
                 None,
             );
-            return wire.error_response(
-                StatusCode::BAD_GATEWAY,
+            return first_byte_failure(
+                wire,
                 &msg,
-                "api_error",
-                Some("upstream_stream_error"),
+                StatusCode::BAD_GATEWAY,
+                "upstream_stream_error",
+                "ProviderOther",
             );
         }
         Ok(None) => {
@@ -3484,11 +3645,12 @@ async fn streaming_response(
                 Some(msg.to_string()),
                 None,
             );
-            return wire.error_response(
-                StatusCode::BAD_GATEWAY,
+            return first_byte_failure(
+                wire,
                 msg,
-                "api_error",
-                Some("upstream_empty_stream"),
+                StatusCode::BAD_GATEWAY,
+                "upstream_empty_stream",
+                "ProviderOther",
             );
         }
         Err(_) => {
@@ -3510,11 +3672,12 @@ async fn streaming_response(
                 )),
                 None,
             );
-            return wire.error_response(
-                wire.overloaded_status(),
+            return first_byte_failure(
+                wire,
                 "上游首字节超时(60s)",
-                "api_error",
-                Some("upstream_first_byte_timeout"),
+                wire.overloaded_status(),
+                "upstream_first_byte_timeout",
+                "Overloaded",
             );
         }
     };
@@ -3551,7 +3714,7 @@ async fn streaming_response(
             Some("client disconnected early".into()),
             None,
         );
-        return empty_resp(StatusCode::OK);
+        return Attempt::Delivered(empty_resp(StatusCode::OK));
     }
 
     // 后台泵任务：持有 tx，循环转发并应用空闲超时；结束时负责落日志
@@ -3682,17 +3845,19 @@ async fn streaming_response(
         rx.recv().await.map(|item| (item, rx))
     });
 
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(
-            "x-jai-provider",
-            HeaderValue::from_str(&cand.provider_name)
-                .unwrap_or(HeaderValue::from_static("unknown")),
-        )
-        .body(Body::from_stream(client_stream))
-        .unwrap_or_else(|_| empty_resp(status))
+    Attempt::Delivered(
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(
+                "x-jai-provider",
+                HeaderValue::from_str(&cand.provider_name)
+                    .unwrap_or(HeaderValue::from_static("unknown")),
+            )
+            .body(Body::from_stream(client_stream))
+            .unwrap_or_else(|_| empty_resp(status)),
+    )
 }
 
 #[cfg(test)]
