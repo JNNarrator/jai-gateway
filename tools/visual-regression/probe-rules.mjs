@@ -43,13 +43,17 @@ page.on("pageerror", (e) => errors.push(String(e).slice(0, 200)));
 await page.goto("http://127.0.0.1:5173/");
 await page.waitForTimeout(1400);
 
-/** 密钥列表上「已限制」徽标出现情况 */
+/** 密钥列表上规则状态 chip 的出现情况（2026-09-23 起由「已限制」徽标改为「不限 / 已限制」chip） */
 const readBadges = () =>
   page.evaluate(() =>
-    [...document.querySelectorAll('[data-testid="gateway-key-row"]')].map((li) => ({
-      prefix: li.getAttribute("data-prefix"),
-      limited: !!li.querySelector('[data-testid="gateway-key-limited"]'),
-    })),
+    [...document.querySelectorAll('[data-testid="gateway-key-row"]')].map((li) => {
+      const chip = li.querySelector('[data-testid="gateway-key-rules"]');
+      return {
+        prefix: li.getAttribute("data-prefix"),
+        limited: chip?.getAttribute("data-limited") === "1",
+        state: chip?.textContent?.trim() ?? null,
+      };
+    }),
   );
 
 /** 弹窗内部状态：候选行 + 三态 + 预览计数 */

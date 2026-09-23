@@ -43,6 +43,13 @@ function installMock() {
       // 关键：每次返回**新的**副本，模拟真实 IPC 的反序列化边界。
       // 若直接返回同一个数组引用，React 的 setList(next) 会因 Object.is(prev,next) 跳过重渲染，
       // 于是「切换开关后 UI 不更新」是 mock 假象而非真 bug（2026-09-16 实测踩到）。
+      // 网关页（首页）会调这两个命令取「密钥管理」列表。**必须返回数组**：
+      // 本 mock 的 `default: return null` 会让 `setKeys(null)` 在渲染时抛
+      // `Cannot read properties of null`，整棵 React 树被卸载 → 连侧边栏都没有，
+      // 探针切页时表现为「等按钮超时」。多密钥（D9-T6a）之后新增的依赖，
+      // 这类极简 mock 都要跟着补。
+      case "gateway_key_list": return [];
+      case "gateway_key_rules_get": return { providerAllow: [], providerDeny: [], modelAllow: [], modelDeny: [] };
       case "mcp_list": return JSON.parse(JSON.stringify(fix.mcp_list));
       case "mcp_tools_list": return JSON.parse(JSON.stringify(fix.mcp_tools_list));
       case "mcp_export_config": return { mcpServers: {} };

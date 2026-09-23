@@ -115,14 +115,16 @@ export const fixtures = {
     key: "sk-jai-pnxARZHZCYBK3sCEJxOxZ8UrUCws",
   },
   // 多密钥（D9-T6a）：三把覆盖三种展示形态 —— 有备注且用过 / 无备注从未用过 /
-  // 很久以前建的（时间列宽度与截断都要能扛住）。
+  // 很久以前建的。**顺序按契约「新建在前」**（`gw_keys_active` 的 ORDER BY
+  // created_at DESC, rowid DESC）—— 界面用 `keys[0]` 当「最新一把」，
+  // 夹具若按别的顺序摆就会渲染出一个真实后端不可能出现的状态。
   gateway_key_list: [
     {
-      id: "k-main",
-      prefix: "sk-jai-pnxAR",
-      label: null,
-      createdAt: NOW - 30 * DAY,
-      lastUsedAt: NOW - 3 * 60_000,
+      id: "k-ci",
+      prefix: "sk-jai-Ci9Zx",
+      label: "CI 流水线",
+      createdAt: NOW - 2 * 3600_000,
+      lastUsedAt: null,
       revokedAt: null,
       key: "",
     },
@@ -136,11 +138,11 @@ export const fixtures = {
       key: "",
     },
     {
-      id: "k-ci",
-      prefix: "sk-jai-Ci9Zx",
-      label: "CI 流水线",
-      createdAt: NOW - 2 * 3600_000,
-      lastUsedAt: null,
+      id: "k-main",
+      prefix: "sk-jai-pnxAR",
+      label: null,
+      createdAt: NOW - 30 * DAY,
+      lastUsedAt: NOW - 3 * 60_000,
       revokedAt: null,
       key: "",
     },
@@ -152,16 +154,16 @@ export const fixtures = {
     { providerId: P_ANTH, providerName: "Anthropic 官方", modelName: "claude-sonnet-4-5" },
     { providerId: P_ANTH, providerName: "Anthropic 官方", modelName: "claude-opus-4-1" },
   ],
-  // 三把密钥覆盖三种规则形态：不限制 / 白名单（「已限制」徽标）/ 拒绝 + 模型白名单
+  // 三把密钥覆盖三种规则形态：不限制 / 白名单（chip 显示「已限制」）/ 拒绝 + 模型白名单
   key_rules: {
-    "k-main": { providerAllow: [], providerDeny: [], modelAllow: [], modelDeny: [] },
-    "k-laptop": { providerAllow: [P_ANTH], providerDeny: [], modelAllow: [], modelDeny: [] },
     "k-ci": {
       providerAllow: [],
       providerDeny: [P_ANTH],
       modelAllow: ["glm-5.3"],
       modelDeny: [],
     },
+    "k-laptop": { providerAllow: [P_ANTH], providerDeny: [], modelAllow: [], modelDeny: [] },
+    "k-main": { providerAllow: [], providerDeny: [], modelAllow: [], modelDeny: [] },
   },
   provider_list: [
     {

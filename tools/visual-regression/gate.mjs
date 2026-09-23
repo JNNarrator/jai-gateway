@@ -202,37 +202,80 @@ for (const size of SIZES) {
     if (audit.errors?.length) fail("无页面报错", `${size}/${theme} audit`, audit.errors.slice(0, 3).join(" | "));
   }
 
-  // ── probe-keys：网关多密钥列表（D9-T6a） ──
+  // ── probe-keys：网关「密钥管理」列表（D9-T6a + 2026-09-23 排版整改） ──
   const pk = SKIP_PROBES
     ? readJson(path.join(VR, `out-probe-keys-${size}.json`))
     : runProbe(`probe-keys --size=${size}`, "probe-keys.mjs", `out-probe-keys-${size}.json`);
   if (!pk) {
-    fail("多密钥列表 probe-keys", size, "未产出结果文件（探针未跑或崩溃）");
+    fail("密钥管理列表 probe-keys", size, "未产出结果文件（探针未跑或崩溃）");
   } else {
-    const where = `${size} 网关页`;
+    const where = `${size} 网关页 · 密钥管理`;
     const init = pk.initial?.rows || [];
     if (init.length < 3) {
-      fail("多密钥列表渲染全部密钥", where, `初始只渲染出 ${init.length} 行（夹具 3 把）`);
+      fail("密钥列表渲染全部密钥", where, `初始只渲染出 ${init.length} 行（夹具 3 把）`);
     }
     for (const r of init) {
-      if (!r.prefix || !r.label || !r.created || !r.used) {
-        fail("密钥行内容完整", where, `行缺前缀/备注/创建时间/最后使用：${JSON.stringify(r)}`);
+      // 创建时间已让位给「最后使用」（低频信息移进 hover 提示）—— 断言它**可查**，
+      // 而不是断言它消失：真回归是「时间信息整块丢了」。
+      if (!r.prefix || !r.label || !r.used || !/创建于/.test(r.usedTitle || "")) {
+        fail("密钥行内容完整", where, `行缺前缀/备注/最后使用/创建时间提示：${JSON.stringify(r)}`);
       }
       if (r.clipped) {
         fail("密钥列截断有 title", where, `列被截断且无 title：${r.prefix}`);
       }
+      if (!/不限|已限制/.test(r.rulesState || "")) {
+        fail("规则状态写在行上", where, `规则 chip 文案为「${r.rulesState}」（应说明这把密钥是否受限）`);
+      }
     }
-    // 显示全文 → 该行变长；再点回到前缀态
-    const shown = pk.revealed?.rows?.[0]?.shown ?? "";
-    if (shown.length <= (init[0]?.prefix?.length ?? 0) + 4 || shown.endsWith("…")) {
-      fail("显示全文真的显示全文", where, `显示全文后仍是「${shown}」`);
+    // ── 排版硬指标（2026-09-23 用户反馈「按钮样式排版混乱」的回归闸门）──
+    // ① 每行只占一行。此前每行 4 个按钮必然换行成两行 —— 元数据在第一行、
+    //    按钮掉到第二行且左边界对不齐，是用户报的「排版混乱」的主要来源。
+    //    判据用「直接子元素的行顶是否一致」，不用行高（行高受按钮高度影响，区分不出来）。
+    const wrapped = init.filter((r) => (r.childCenters?.length ?? 1) > 1);
+    if (wrapped.length) {
+      fail("密钥行不换行", where, `${wrapped.length} 行的内容分成了多行：${wrapped.map((r) => r.prefix).join("、")}`);
     }
-    if (!(pk.hiddenAgain?.rows?.[0]?.shown ?? "").endsWith("…")) {
-      fail("隐藏全文回到前缀态", where, `隐藏后为「${pk.hiddenAgain?.rows?.[0]?.shown}」`);
+    // ② 行内按钮收敛到 2 个（复制 + ⋯）。规则/显示全文/吊销都改了入口。
+    if (pk.initial?.rowButtons > 2) {
+      fail("密钥行按钮收敛", where, `行内 ${pk.initial.rowButtons} 个按钮（期望 ≤2：复制 + ⋯）`);
+    }
+    // ③ 内容宽度吃满窗口（此前 max-w-2xl 把 1180 的窗口压成 672px，白扔 1/3）
+    const cw = pk.initial?.contentW || 0;
+    const mw = pk.initial?.mainW || 0;
+    if (mw - cw > 120) {
+      fail("页面宽度吃满窗口", where, `内容宽 ${cw} / 可用 ${mw}（差 ${mw - cw}px，左右留白过多会让行内元素被迫换行）`);
+    }
+    // ④ 按钮高度档位收敛（此前同屏 28/32/36 三档）
+    const hs = pk.initial?.buttonHeights || [];
+    if (hs.length > 2) {
+      fail("按钮高度档位收敛", where, `同屏 ${hs.length} 档高度：${hs.join(" / ")}`);
+    }
+    // ⑤ 危险动作不再用实心红抢注意力 —— 页面主体上一个都不该有
+    //    （实心红只保留在二次确认框里的确认按钮，见下）
+    if ((pk.initial?.filledDanger ?? -1) !== 0) {
+      fail("危险动作不用实心红", where, `页面主体有 ${pk.initial?.filledDanger} 个实心红按钮`);
+    }
+    if (pk.confirmOpen && (pk.confirmOpen.filledDangerInside ?? 0) < 1) {
+      fail("二次确认里才是实心红", where, "确认框的确认按钮不是实心红（危险动作的最后一道视觉提示）");
+    }
+    // ── 交互 ──
+    const shown = pk.revealed?.rows?.[2]?.shown ?? "";
+    if (shown.length <= (init[2]?.prefix?.length ?? 0) + 4 || shown.endsWith("…")) {
+      fail("点前缀真的显示全文", where, `点前缀后仍是「${shown}」`);
+    }
+    if (!(pk.hiddenAgain?.rows?.[2]?.shown ?? "").endsWith("…")) {
+      fail("再点回到前缀态", where, `再点后为「${pk.hiddenAgain?.rows?.[2]?.shown}」`);
+    }
+    // 「⋯」菜单：低频与危险动作都收在这里
+    const items = pk.menu?.items || [];
+    for (const want of ["显示全文", "吊销"]) {
+      if (!items.some((t) => t.includes(want))) {
+        fail("「⋯」菜单含低频/危险动作", where, `菜单项：${items.join(" / ") || "（空）"}，缺「${want}」`);
+      }
     }
     // 吊销必须先二次确认，且确认前不动数据
     if (!pk.confirmOpen) {
-      fail("吊销密钥需二次确认", where, "点「吊销」没有弹确认框（直接删了？）");
+      fail("吊销密钥需二次确认", where, "菜单里点「吊销」没有弹确认框（直接删了？）");
     } else {
       if (pk.confirmOpen.rowsStillThere !== init.length) {
         fail("吊销确认前不改数据", where, `确认框打开时列表已变成 ${pk.confirmOpen.rowsStillThere} 行`);
@@ -259,7 +302,7 @@ for (const size of SIZES) {
       fail("空列表有空态文案", where, "列表为空但没有提示文案");
     }
     if (pk.errors?.length) {
-      fail("多密钥页无报错", where, pk.errors.slice(0, 3).join(" | "));
+      fail("密钥管理页无报错", where, pk.errors.slice(0, 3).join(" | "));
     }
   }
 

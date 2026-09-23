@@ -49,6 +49,14 @@ function installMock() {
   function invokeCmd(cmd, args = {}) {
     calls.push({ cmd, args });
     switch (cmd) {
+
+      // 网关页（首页）会调这两个命令取「密钥管理」列表。**必须返回数组**：
+      // 本 mock 的 `default: return null` 会让 `setKeys(null)` 在渲染时抛
+      // `Cannot read properties of null`，整棵 React 树被卸载 → 连侧边栏都没有，
+      // 探针切页时表现为「等按钮超时」。多密钥（D9-T6a）之后新增的依赖，
+      // 这类极简 mock 都要跟着补。
+      case "gateway_key_list": return [];
+      case "gateway_key_rules_get": return { providerAllow: [], providerDeny: [], modelAllow: [], modelDeny: [] };
       case "gateway_status": return { ...fix.gateway_status, running: true };
       case "webdav_config_get": return JSON.parse(JSON.stringify(state.cfg));
       case "webdav_config_set": {

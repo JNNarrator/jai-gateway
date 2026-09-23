@@ -9,7 +9,6 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { cn } from "@/lib/utils";
 
 /** 危险/重要操作的二次确认框（替换 window.confirm），受控使用 */
 export function ConfirmDialog({
@@ -40,11 +39,12 @@ export function ConfirmDialog({
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>取消</AlertDialogCancel>
+          {/* 危险样式走设计系统的 `variant="destructive"`，不再手写一份色值：
+              ① 与页面上的按钮共用同一套 token（改一处两边都跟着变）；
+              ② 带上 `data-variant` 之后「实心红只出现在二次确认里」这条才**可被门禁断言**
+                 （见 probe-keys 的 filledDanger / filledDangerInside）。 */}
           <AlertDialogAction
-            className={cn(
-              destructive &&
-                "bg-destructive text-white hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:bg-destructive/60 dark:text-white",
-            )}
+            variant={destructive ? "destructive" : "default"}
             onClick={() => {
               onOpenChange(false);
               onConfirm();
