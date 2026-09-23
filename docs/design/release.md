@@ -44,6 +44,17 @@
 - [x] Updater 签名密钥已生成并写入本地（见 §1）；CI secrets 需配置：
   - `TAURI_SIGNING_PRIVATE_KEY`：私钥文件内容（`~/.tauri/jai.key`）
   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码（`~/.tauri/jai.key.password`）
+- [x] tag 触发验证：**v0.4.0 实测**（run 35839374439，3/3 job success：Create release draft 5s、
+      Build windows-latest 9m57s、Build macos-latest 11m33s，整轮 11m51s）——
+      产物：`JAI_0.4.0_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、`JAI_0.4.0_x64-setup.exe(+.sig)`、
+      `JAI_0.4.0_x64_en-US.msi(+.sig)`、`latest.json`；`prerelease=false`。
+      同轮 `CI`（main push，run 35839349074）**三个 job 全绿**（Frontend build 22s /
+      Rust windows-latest 6m41s / Rust macos-latest 4m9s，整轮 6m46s）—— v0.3.1 那次
+      windows-latest 的日志落库时序抖动未复现（有界轮询的修复生效）。
+      **发布**：`gh release edit v0.4.0 --draft=false --latest`（`published=2026-09-23T09:18:53Z`），
+      随后 feed 校验通过：`releases/latest/download/latest.json` → `version=0.4.0`，
+      platforms = darwin-aarch64 / darwin-aarch64-app / windows-x86_64 / windows-x86_64-msi /
+      windows-x86_64-nsis（5 键齐全）。草稿期 feed 仍是上一版（与 §5 记录一致，每次发布都必须跑这条校验）。
 - [x] tag 触发验证：**v0.3.1 实测**（run 35711981353，3/3 job success：Create release draft 5s、
       Build macos-latest 7m19s、Build windows-latest 12m23s，整轮 12m35s）——
       产物：`JAI_0.3.1_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、`JAI_0.3.1_x64-setup.exe(+.sig)`、
