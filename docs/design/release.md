@@ -44,6 +44,19 @@
 - [x] Updater 签名密钥已生成并写入本地（见 §1）；CI secrets 需配置：
   - `TAURI_SIGNING_PRIVATE_KEY`：私钥文件内容（`~/.tauri/jai.key`）
   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码（`~/.tauri/jai.key.password`）
+- [x] tag 触发验证：**v0.4.1 实测**（run 35852602856，3/3 job success：Create release draft 6s、
+      Build macos-latest 10m17s、Build windows-latest 12m43s，整轮 13m）——
+      产物：`JAI_0.4.1_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、`JAI_0.4.1_x64-setup.exe(+.sig)`、
+      `JAI_0.4.1_x64_en-US.msi(+.sig)`、`latest.json`；`prerelease=false`。
+      同轮 `CI`（main push，run 35852583751）三个 job 全绿（mac 2m12s / win 3m57s / frontend 24s）。
+      **发布**：`gh release edit v0.4.1 --draft=false --latest`（`published=2026-09-23T11:20:28Z`），
+      随后 feed 校验通过：`version=0.4.1`，5 个平台键齐全。
+      ⚠️ **feed 校验必须带 cache-bust**（本次实测踩到）：发布后 30 秒查
+      `releases/latest/download/latest.json` 仍返回**上一版 0.4.0**，看着像发布失败 ——
+      实际是**重定向被 CDN 缓存**（拿到的签名 URL `ske` 时间戳早于发布时间）。
+      加 `-H 'Cache-Control: no-cache, no-store'` 与随机 query 后立刻是 `0.4.1`。
+      同时 `gh api repos/.../releases/latest --jq .tag_name` 当时**已经是** v0.4.1，
+      所以两者不一致时以带 cache-bust 的结果为准（API 不经过那层 CDN）。
 - [x] tag 触发验证：**v0.4.0 实测**（run 35839374439，3/3 job success：Create release draft 5s、
       Build windows-latest 9m57s、Build macos-latest 11m33s，整轮 11m51s）——
       产物：`JAI_0.4.0_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、`JAI_0.4.0_x64-setup.exe(+.sig)`、
