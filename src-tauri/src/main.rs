@@ -13,6 +13,7 @@
 use gateway_core::codec::Family;
 use gateway_core::discover::discover_models;
 use gateway_core::netcfg::{self, ProxyConfig};
+use gateway_core::probe::{self, DraftProbeReport, ProbeConfig, ProbeTarget};
 use gateway_core::server::{self, GatewayCtx};
 use gateway_core::skills::SkillDraft;
 use gateway_core::store::{
@@ -121,6 +122,9 @@ pub struct AppCore {
     pub autopush: AutopushHub,
     /// 最近一轮健康检查摘要（UX-T3 横幅数据源）
     pub health_summary: std::sync::Arc<std::sync::Mutex<HealthSummary>>,
+    /// 草稿端点探测的「通过」凭据（D9-T1）。**进程内存储、重启即失效** ——
+    /// 刻意不落库：半年前测过的渠道不该被信任。
+    pub probe_receipts: std::sync::Arc<gateway_core::probe::ProbeReceiptStore>,
 }
 
 /// 最近一轮健康检查摘要（UX-T3 横幅数据源）。
@@ -232,6 +236,10 @@ pub struct NewProvider {
     /// 官网地址（可空）
     #[serde(default)]
     pub website: Option<String>,
+    /// 最近一次端点探测的指纹（`provider_probe_draft` 的返回里带）。
+    /// 只在 `require_probe_pass` 开启时被使用。
+    #[serde(default)]
+    pub probe_fingerprint: Option<String>,
 }
 
 fn default_priority() -> i64 {
@@ -255,11 +263,18 @@ async fn provider_create(
         return Err("名称不能为空".into());
     }
 
+    // base_url 结构性校验（D9-T1）：这是「用户填什么就存什么」的入口之一。
+    // 见 `validate_base_url` 的说明（允许 loopback，但不允许私网 / 云元数据）。
+    let base_url = normalize_base(&input.base_url);
+    validate_base_url(&base_url)?;
+    // 门禁（默认关闭，见 `check_probe_gate`）
+    check_probe_gate(&core, input.probe_fingerprint.as_deref())?;
+
     let id = uuid::Uuid::now_v7().to_string();
     let row = ProviderRow {
         id: id.clone(),
         name: input.name.trim().to_string(),
-        base_url: normalize_base(&input.base_url),
+        base_url,
         family: input.family,
         enabled: true,
         priority: input.priority,
@@ -301,6 +316,10 @@ async fn provider_create(
 #[serde(rename_all = "camelCase")]
 pub struct UpdateProviderInput {
     pub id: String,
+    /// 最近一次端点探测的指纹（`provider_probe_draft` 的返回里带）。
+    /// 只在 `require_probe_pass` 开启时被使用。
+    #[serde(default)]
+    pub probe_fingerprint: Option<String>,
     pub name: Option<String>,
     pub base_url: Option<String>,
     pub priority: Option<i64>,
@@ -331,6 +350,14 @@ async fn provider_update(
         .map(|s| (!s.is_empty()).then(|| s.to_string()));
 
     let normalized = input.base_url.as_deref().map(normalize_base);
+    if let Some(b) = &normalized {
+        validate_base_url(b)?;
+    }
+    // 门禁只在「探测目标真的变了」时生效（base_url / 密钥）——否则改个显示名
+    // 也会被 30 分钟 TTL 挡住，那是纯粹的骚扰。
+    if normalized.is_some() || new_key.is_some() {
+        check_probe_gate(&core, input.probe_fingerprint.as_deref())?;
+    }
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
         db.with(|c| {
@@ -459,6 +486,110 @@ async fn provider_test_draft(
         count: models.len(),
         model_names: models.into_iter().map(|m| m.id).collect(),
     })
+}
+
+/// 「端点探测」入参（新建/编辑供应商弹窗）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeDraftInput {
+    pub base_url: String,
+    pub family: String,
+    #[serde(default)]
+    pub api_key: String,
+    /// 编辑已有渠道时传 id：表单里没重输 key 就用**库里存的** key 探测。
+    /// 不这样做的话，编辑态探测会以「未鉴权」身份打上游 → 用户看到假失败。
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub extra_headers: Option<String>,
+    /// 是否允许访问本机地址（Ollama / LM Studio 等本机部署）。默认 false。
+    #[serde(default)]
+    pub allow_loopback: bool,
+}
+
+/// 端点探测：对**草稿**渠道发一次真实的最小推理请求（`max_tokens = 1`），
+/// 逐端点给出「通过 / 失败 + 失败分类 + 延迟」。不写库、不落凭据。
+///
+/// 复用 `core.http` → 自动继承出站代理与 10s connect timeout（与转发链路同一出口）。
+/// 结论同时存进进程内 receipt，供 `require_probe_pass` 门禁使用（默认关闭）。
+#[tauri::command]
+async fn provider_probe_draft(
+    core: State<'_, AppCore>,
+    input: ProbeDraftInput,
+) -> Result<DraftProbeReport, String> {
+    let typed_key = Some(input.api_key.trim().to_string()).filter(|s| !s.is_empty());
+    let api_key = match typed_key {
+        Some(k) => Some(k),
+        None => match input.provider_id.as_deref() {
+            Some(id) => core
+                .db
+                .with(|c| store::provider_get(c, id))
+                .ok()
+                .flatten()
+                .and_then(|p| p.api_key),
+            None => None,
+        },
+    };
+    let target = ProbeTarget {
+        family: input.family,
+        base_url: normalize_base(&input.base_url),
+        api_key,
+        model: input.model,
+        extra_headers: input.extra_headers.filter(|s| !s.trim().is_empty()),
+    };
+    let cfg = ProbeConfig {
+        allow_loopback: input.allow_loopback,
+        ..ProbeConfig::default()
+    };
+    let report = probe::probe_draft(&core.http, &target, &cfg).await;
+    let now = store::now_ms();
+    core.probe_receipts.prune(now);
+    core.probe_receipts.put(&report);
+    Ok(report)
+}
+
+/// 保存渠道时的 base_url 结构性校验（D9-T1 / 决策 D2）。
+///
+/// 这里**允许 loopback**（`allow_loopback = true`）：Ollama / LM Studio / vLLM 这类
+/// 本机部署是正当用法，而保存动作本身不发起任何请求。真正的「用户填什么就打什么」
+/// 入口是草稿探测，那里对 loopback 要求显式勾选（决策 D3）。
+/// 私网 / link-local（含云元数据 `169.254.169.254`）/ 组播 / 保留段在任何情况下都拒绝。
+///
+/// 刻意**不做**热路径（`try_candidate`）每请求校验：那会让「已存渠道突然被拦」
+/// 变成可用性事故，收益却很小。
+fn validate_base_url(raw: &str) -> Result<(), String> {
+    gateway_core::netguard::validate_outbound_url(raw, true)
+        .map(|_| ())
+        .map_err(|e| format!("Base URL 不合法：{e}"))
+}
+
+/// `require_probe_pass` 门禁（D9-T1，meta KV，**默认关闭** = 只展示不拦截）。
+///
+/// 开启后，保存渠道必须带上一次「刚刚探测通过」的指纹：receipt 存在进程内、
+/// TTL 30 分钟、且要求至少一个非信息性端点真的通过（全是 Skipped 不算）。
+fn check_probe_gate(core: &AppCore, fingerprint: Option<&str>) -> Result<(), String> {
+    let enabled = core
+        .db
+        .with(|c| store::meta_get(c, "require_probe_pass"))
+        .ok()
+        .flatten()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "true" || v == "1"
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(());
+    }
+    let Some(fp) = fingerprint.filter(|s| !s.is_empty()) else {
+        return Err("该渠道尚未完成端点探测：请先在弹窗里点「端点探测」".into());
+    };
+    if !core.probe_receipts.validate(fp, store::now_ms()) {
+        return Err("端点探测未通过或已过期（30 分钟），请重新探测后再保存".into());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- 模型命令
@@ -3377,6 +3508,7 @@ fn main() {
                 health_summary: std::sync::Arc::new(
                     std::sync::Mutex::new(HealthSummary::default()),
                 ),
+                probe_receipts: std::sync::Arc::new(gateway_core::probe::ProbeReceiptStore::new()),
             };
             ensure_gateway_key(&core)?;
 
@@ -3472,6 +3604,7 @@ fn main() {
             provider_set_enabled,
             provider_test,
             provider_test_draft,
+            provider_probe_draft,
             provider_discover_models,
             model_list,
             model_set_limits,

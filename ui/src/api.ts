@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
+  DraftProbeReport,
   GwStatus,
   GatewayKeyInfo,
   HealthSummary,
@@ -12,6 +13,7 @@ import type {
   Modality,
   ModelRow,
   ProxyConfigDto,
+  ProbeDraftInput,
   ProviderDto,
   SettingsDto,
   SkillRow,
@@ -41,6 +43,8 @@ export const api = {
     extraHeaders?: string | null;
     apiKey: string;
     website?: string | null;
+    /** 最近一次端点探测的指纹（`require_probe_pass` 开启时才用） */
+    probeFingerprint?: string | null;
   }) => invoke<ProviderDto>("provider_create", { input }),
   providerUpdate: (input: {
     id: string;
@@ -51,6 +55,8 @@ export const api = {
     extraHeaders?: string | null;
     apiKey?: string;
     website?: string | null;
+    /** 最近一次端点探测的指纹（`require_probe_pass` 开启时才用） */
+    probeFingerprint?: string | null;
   }) => invoke<void>("provider_update", { input }),
   providerDelete: (id: string) =>
     invoke<void>("provider_delete", { id }),
@@ -68,6 +74,10 @@ export const api = {
     ),
   providerDiscoverModels: (id: string) =>
     invoke<[number, number]>("provider_discover_models", { id }),
+  /** 草稿端点探测（D9-T1）：发一次真实的最小推理请求，逐端点给出结论。
+   *  不写库；结论会作为 receipt 存在主进程内，供 `require_probe_pass` 门禁使用。 */
+  providerProbeDraft: (input: ProbeDraftInput) =>
+    invoke<DraftProbeReport>("provider_probe_draft", { input }),
   /** 供应商级推理档位值域（0011）：null/空 = 未声明 ⇒ 原样透传 */
   providerSetReasoningLevels: (id: string, levels: string[] | null) =>
     invoke<void>("provider_set_reasoning_levels", { id, levels }),

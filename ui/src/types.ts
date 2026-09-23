@@ -16,7 +16,11 @@ export interface HealthSummary {
   down: HealthDownProvider[];
 }
 
-export type Family = "openai_compat" | "anthropic" | "gemini";
+export type Family =
+  | "openai_compat"
+  | "openai_responses"
+  | "anthropic"
+  | "gemini";
 
 export interface ProviderDto {
   id: string;
@@ -189,4 +193,58 @@ export interface SkillRow {
   enabled: boolean;
   createdAt: number;
   updatedAt: number;
+}
+
+// ---------------------------------------------------------------- 渠道草稿端点探测（D9-T1）
+
+/** 探测请求入参（与后端 `ProbeDraftInput` 对齐） */
+export interface ProbeDraftInput {
+  baseUrl: string;
+  family: string;
+  apiKey: string;
+  /** 编辑已有渠道时传 id：表单没重输 key 就用库里存的 key 探测 */
+  providerId?: string | null;
+  /** 必填：探测必须有模型名（为空时后端返回一行 skipped/no_model） */
+  model: string;
+  extraHeaders?: string | null;
+  /** 是否允许访问本机地址（Ollama / LM Studio 等本机部署），默认 false */
+  allowLoopback: boolean;
+}
+
+export type ProbeStatus = "passed" | "failed" | "skipped";
+
+/** 失败分类（对用户可解释；UI 需映射成中文短语，不要直接显示枚举） */
+export type ProbeCategory =
+  | "authentication"
+  | "model"
+  | "endpoint_unsupported"
+  | "request"
+  | "rate_limit"
+  | "overloaded"
+  | "timeout"
+  | "network"
+  | "protocol"
+  | "url_blocked"
+  | "no_model";
+
+export interface ProbeOutcome {
+  endpoint: string;
+  status: ProbeStatus;
+  category?: ProbeCategory | null;
+  /** 已脱敏（不含 key）、≤300 字符 */
+  message: string;
+  latencyMs: number;
+  testedModel?: string | null;
+  /** 这次探测是否可能真的产生了计费 */
+  costPossible: boolean;
+  /** true = 附加信息性探测（openai_compat 的 /responses），不进「通过」门禁 */
+  informational: boolean;
+}
+
+export interface DraftProbeReport {
+  runId: string;
+  testedAt: number;
+  /** 不可逆指纹：保存时回传给后端做 `require_probe_pass` 门禁校验 */
+  fingerprint: string;
+  results: ProbeOutcome[];
 }

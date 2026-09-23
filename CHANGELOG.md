@@ -6,6 +6,57 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **渠道草稿端点探测**（D9-T1）：在「新建/编辑供应商」弹窗里，除现有「测试连接」（只打
+  `/models`）之外新增「端点探测」——对每个候选端点发一次**真实的最小推理请求**
+  （`max_tokens = 1` + `stream: false`），逐端点给出「通过 / 失败 + 原因 + 延迟」。
+  为什么需要它：能列模型 ≠ 能推理。中转站常见三种假绿 —— `/models` 有数据但
+  `/chat/completions` 404；网关前置的 HTML 拦截页返回 200；key 只能读模型不能推理。
+  用户此前只有保存完、在客户端里真发一次请求才会发现，那时排查成本已经很高。
+  新增 `crates/gateway-core/src/probe.rs`：
+  - 端点与 payload 按 family 派生（`openai_compat` → `/chat/completions`、
+    `openai_responses` → `/responses`、`anthropic` → `/v1/messages` +
+    `anthropic-version`、`gemini` → `/v1beta/models/{model}:generateContent`），
+    鉴权头照抄转发链路的口径（Gemini 走 `x-goog-api-key`，避免 key 进 URL/日志）。
+  - **2xx 不等于通过**：必须能把响应解析成该协议的预期最小结构（`choices` /
+    `content` / `output|status` / `candidates`），否则判 `protocol` 失败 —— 这条是
+    防「假绿」的关键（拦截页也是 200）。200 + `error` 对象的中转站也会被识别。
+  - 失败分类：`authentication` / `model` / `endpoint_unsupported` / `request` /
+    `rate_limit` / `overloaded` / `timeout` / `network` / `protocol` / `url_blocked` /
+    `no_model`。404 按正文分流（「model not found」→ `model`，nginx 的
+    `<html>404 Not Found</html>` → `endpoint_unsupported`，避免把用户引错方向）。
+  - 结论 message **脱敏**（抹掉明文 key 与 `sk-*` / `AIza*` / `Bearer *` 形态）并
+    按字符截断到 300；`cost_possible` 明示「这次探测真的调用了模型」。
+  - 附加信息性探测：`openai_compat` 渠道额外探一次 `/responses`，回答「这个中转站
+    能不能接 Codex」。该行带 `informational: true`，**不进「通过」门禁**，UI 灰显。
+  - 新增 `crates/gateway-core/src/netguard.rs`（SSRF 校验）：**发请求之前**校验
+    `base_url`。拦截非 http(s)、URL 内嵌用户名/密码、IPv4 私网与保留段
+    （`0/8`、`10/8`、`100.64/10`、`127/8`、`169.254/16`、`172.16/12`、`192.0.2/24`、
+    `192.168/16`、`198.18/15`、`224/4`、`240/4`）、IPv6（`::`、`::1`、`fc00::/7`、
+    `fe80::/10`、`ff00::/8`）、**IPv4-mapped IPv6**（`::ffff:127.0.0.1` —— 最常见的
+    绕过手法），以及 `localhost` / `*.localhost` / `*.local` / `*.internal` 主机名。
+    `allow_loopback = true` 只放行 loopback（Ollama / LM Studio / vLLM），
+    **link-local 与云元数据端点（`169.254.169.254`）任何情况下都不放行**。
+    判定用 `url.host()` 而非 `host_str()`，于是十进制（`http://2130706433/`）、
+    十六进制（`http://0x7f.0.0.1/`）、八进制、省略段（`http://127.1/`）这些
+    **字面量混淆写法**也被归一化后照样拦住。已知局限：不做 DNS 解析后的复查
+    （「域名解析到 127.0.0.1」不在拦截范围内，理由见模块头）。
+  - 接线：`provider_create` / `provider_update` 保存时做一次结构性校验
+    （**允许 loopback** —— 保存动作本身不发请求，且本机部署是正当用法；私网与云元数据
+    一律拒绝）；刻意**不做**热路径每请求校验（否则「已存渠道突然被拦」会变成可用性事故）。
+  - 可选门禁（meta KV `require_probe_pass`，**默认 `false` = 只展示不拦截**）：
+    开启后保存渠道必须带上一次「刚刚探测通过」的指纹。receipt 存在**进程内**、
+    TTL 30 分钟、重启即失效（刻意不落库：半年前测过的渠道不该被信任）；
+    判据是「至少一个非信息性端点真的通过 + 无失败」，全是 Skipped 不算。
+    `provider_update` 只在动了 `base_url` 或密钥时才校验（否则改个显示名也会被挡住）。
+  - 新增 IPC `provider_probe_draft`（复用 `core.http`，自动继承出站代理与
+    10s connect timeout）。编辑态表单里没重输 key 时传 `providerId`，后端用库里存的
+    key 探测 —— 否则会以未鉴权身份打上游，得到假失败。
+  前端：`ProviderDialog` 新增「端点探测」按钮（在「测试连接」右侧）+ 探测区块
+  （探测用模型输入 + `datalist` 候选 + 「允许访问本机地址」开关 + 结果面板）；
+  新增 `components/common/ProbePanel.tsx` 展示逐端点结论行，失败行 hover 显示完整
+  message，信息性行灰显并标注「（信息性）」。探测是弹窗内临时状态，
+  **不改表单、不影响 `useDirtyGuard`**。顺手修掉 `ui/src/types.ts` 的 `Family`
+  类型漏了 `openai_responses`（后端与 providers 表 CHECK 都是四个值）。
 - **迁移前自动备份 DB**（D9-T5）：此前 `Db::open` 用裸 `?`，迁移失败 → `setup` 返回 Err
   → `main.rs` 的 `.expect("error while running jai")` panic 退出。用户只看到一个闪退的
   图标，**既没有提示、也没有回滚点**。
@@ -113,6 +164,22 @@ All notable changes to this project will be documented in this file.
 
 ### Tests
 
+- 新增 `crates/gateway-core/tests/m13_probe.rs`（11 用例）：200 + 合法 body → `Passed`；
+  **200 + HTML 拦截页 → `Failed{Protocol}`**（防「假绿」，这条最重要）；401 →
+  `Failed{Authentication}`；404 + 模型语义 → `Failed{Model}`；慢于 `per_probe_timeout`
+  → `Failed{Timeout}`；连接拒绝 → `Failed{Network}`；云元数据地址 → `Failed{UrlBlocked}`
+  且**一个请求都不发**（断言 mock 命中数为 0、延迟为 0）；`127.0.0.1` 默认拦、显式勾选后
+  放行；未填模型 → `Skipped{NoModel}`；未知协议族 → `Failed{Protocol}`；结论里不含明文 key。
+- `netguard` 内联 14 个单测：全地址族矩阵（含 IPv4-mapped IPv6 与**字面量混淆写法**
+  十进制/十六进制/八进制/省略段）、`allow_loopback` 只放行 loopback、link-local 与
+  云元数据任何开关都不放行、非法 scheme / 缺 host / 内嵌用户名密码 / 本机主机名。
+- `probe` 内联 22 个单测：四族 payload 矩阵（`stream:false` + 1 token + 鉴权拼法）、
+  失败分类矩阵、404 的 model/endpoint 分流、200 + error 对象、预期结构矩阵、
+  脱敏与按字符截断、指纹稳定性与不可逆（改 key/模型/URL/族/开关/超时都变）、
+  receipt 的通过/失败/全跳过/信息性失败/过期/覆盖。
+- UI 门禁新增探针 `tools/visual-regression/probe-endpoint.mjs` + `gate.mjs` 判据：
+  逐端点结论行渲染完整、信息性行**看得出**灰显（opacity 区分）、截断摘要自带 `title`、
+  被拦截地址的文案与零延迟、探测不改表单脏状态。判据已实测「改坏就会红」。
 - 新增 `crates/gateway-core/tests/m13_retry_model.rs`（9 用例，全绿）——每个用例都按
   「mock 被请求了几次」断言，而不是只看状态码：
   401 同族全失败 → 转换族**零请求**；429 与 405 → 跨组并成功；组内预算 3（4 个同族候选

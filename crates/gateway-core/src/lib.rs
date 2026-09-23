@@ -15,6 +15,8 @@ pub mod effort;
 pub mod mcp;
 pub mod modality;
 pub mod netcfg;
+pub mod netguard;
+pub mod probe;
 pub mod router;
 pub mod server;
 pub mod skills;

@@ -60,6 +60,12 @@ function installMock() {
       case "skill_import_zip": return 2;
       case "provider_test": return "连通正常，返回 21 个模型（耗时 812ms）";
       case "provider_test_draft": return { ok: true, count: 21, modelNames: fix.model_list["01a0565e-792a-7aa3-a1cb-a4c8a689568c"].map((m) => m.modelName) };
+      // 端点探测（D9-T1）：按输入的 baseUrl 决定回哪份夹具，便于探针分别验证
+      // 「通过 / 信息性失败」与「地址被拦截」两种形态
+      case "provider_probe_draft":
+        return String(args?.input?.baseUrl || "").includes("169.254")
+          ? fix.probe_report_blocked
+          : fix.probe_report;
       case "provider_discover_models": return [21, 3];
       case "webdav_test": return "连接成功：目录 jai/config 可读写（延迟 236ms）";
       case "proxy_test": return "代理可用：经 127.0.0.1:7890 访问 https://api.anthropic.com 返回 200";

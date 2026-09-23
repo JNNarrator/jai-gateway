@@ -201,6 +201,50 @@ for (const size of SIZES) {
     if (toastBand.length) fail("弹窗 footer 不与 toast 带重叠", `${size}/${theme}`, toastBand.slice(0, 6).join(" ; "));
     if (audit.errors?.length) fail("无页面报错", `${size}/${theme} audit`, audit.errors.slice(0, 3).join(" | "));
   }
+
+  // ── probe-endpoint：渠道草稿端点探测面板（D9-T1） ──
+  // 探测面板的结论行是**点击后**才出现的，audit/fold 都不会点到它，所以单独一条探针。
+  const pe = SKIP_PROBES
+    ? readJson(path.join(VR, `out-probe-endpoint-${size}.json`))
+    : runProbe(`probe-endpoint --size=${size}`, "probe-endpoint.mjs", `out-probe-endpoint-${size}.json`);
+  if (!pe) {
+    fail("端点探测面板 probe-endpoint", size, "未产出结果文件（探针未跑或崩溃）");
+  } else {
+    const where = `${size} 添加供应商`;
+    if (!pe.before?.hasPanel) fail("端点探测面板存在", where, "弹窗里没有「端点探测」区块");
+    if (pe.before?.hasRows) fail("端点探测初始无结论", where, "还没探测就渲染出了结论行（可能是旧结果没清）");
+    const rows = pe.first?.rows || [];
+    if (rows.length < 2) {
+      fail("端点探测逐端点出结论", where, `只渲染出 ${rows.length} 行（chat/completions + 信息性 responses 应各一行）`);
+    }
+    for (const r of rows) {
+      if (!r.endpoint || !r.status || !r.hasIcon) {
+        fail("端点探测行内容完整", where, `行缺端点名/状态/图标：${JSON.stringify(r)}`);
+      }
+    }
+    // 信息性行必须**看得出**是灰的（opacity 区分，不只是文字颜色）
+    if (!(pe.first?.infoOpacity < pe.first?.mainOpacity)) {
+      fail("信息性探测行灰显", where, `main=${pe.first?.mainOpacity} info=${pe.first?.infoOpacity}（信息性行必须比主探测行淡）`);
+    }
+    // 被截断的摘要必须自带 title（UI 门禁「截断有 title 兜底」是逐元素判的）
+    for (const r of rows.concat(pe.blocked?.rows || [])) {
+      if (r.clipped && !r.msgTitle) {
+        fail("探测摘要截断有 title", where, `被截断且无 title：「${r.text}」`);
+      }
+    }
+    if (!pe.first?.billedHint) fail("探测提示可能计费", where, "没有「可能产生计费」提示（探测真的会调用模型）");
+    const blocked = pe.blocked?.rows?.[0];
+    if (!blocked) {
+      fail("被拦截地址有结论行", where, "SSRF 拦截没有渲染出任何行");
+    } else {
+      if (blocked.status !== "地址被拦截") fail("被拦截地址文案", where, `状态显示为「${blocked.status}」`);
+      if (blocked.latency !== "—") fail("被拦截地址零延迟", where, `延迟显示为「${blocked.latency}」（一个请求都没发，不该有耗时）`);
+    }
+    // 探测不改变表单：离开弹窗时不该弹「有未保存的改动」
+    if (pe.navAway?.alertOpen) {
+      fail("探测不改表单脏状态", where, "探测后离开触发了「有未保存的改动」拦截");
+    }
+  }
 }
 
 // ─────────────────────── 汇总 ───────────────────────

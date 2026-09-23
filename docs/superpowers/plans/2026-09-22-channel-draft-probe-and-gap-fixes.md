@@ -131,6 +131,19 @@
 
 **目标**：在「新建/编辑供应商」弹窗里，除现有「测试连接」（打 `/models`）之外，新增「端点探测」——对每个候选端点发一次**真实的最小推理请求**，逐端点给出「通过 / 失败 + 失败分类 + 延迟」。
 
+> ✅ **已实施（2026-09-22）**。落地与本文的差异（正文保留原设计以便回溯）：
+>
+> 1. **`ProbeOutcome` 增加 `informational: bool`**。信息性探测（`openai_compat` 额外探 `/responses`）在 UI 上要灰显，但它是 `Failed`，而本文的 receipt 判据是「全部 Passed 或 Skipped」—— 那样一个 404 的 `/responses` 会让**所有 openai_compat 渠道永远过不了门禁**。现在信息性行不参与门禁，其余行要求「至少一个真的通过 + 无失败」（全是 Skipped 不算 —— 那等于什么都没测）。
+> 2. **`ProbeDraftInput` 增加 `providerId`**。编辑已有渠道时表单里的 key 是空的（语义是「留空 = 不改」），照原设计会以**未鉴权**身份打上游 → 用户看到假失败。传了 id 且没重输 key 时，后端用库里存的 key 探测。
+> 3. **保存时的 `base_url` 校验允许 loopback**（`validate_outbound_url(url, true)`）：Ollama / LM Studio / vLLM 是本机部署的正当用法，而保存动作本身**不发请求**；真正「用户填什么就打什么」的入口是草稿探测，那里对 loopback 要求显式勾选（决策 D3）。私网 / link-local（含云元数据）/ 组播 / 保留段在任何情况下都拒绝。
+> 4. **门禁只在「探测目标真的变了」时生效**：`provider_update` 仅在动了 `base_url` 或密钥时校验 receipt —— 否则改个显示名也会被 30 分钟 TTL 挡住，纯属骚扰。指纹由 UI 回传（`probeFingerprint`），不在保存时重算（重算要求保存端复刻探测端的 `allow_loopback` / 超时，容易错配成「刚测过却说没测」）。
+> 5. **`run_id` 用 uuid v7 而不是 v4**：workspace 只开了 `uuid` 的 `v7` feature（全仓一致），且 v7 时间有序。
+> 6. **`netguard` 用 `url.host()` 而不是 `host_str()`**：前者把主机归一化成 `Ipv4`/`Ipv6`/`Domain` 三态，于是十进制（`http://2130706433/`）、十六进制（`http://0x7f.0.0.1/`）、八进制、省略段（`http://127.1/`）这些**字面量混淆写法**都被 url crate 归一化后照样拦住；而 `host_str()` 会把 IPv6 带上方括号（`"[::1]"`）导致漏判。**已知局限**：不做 DNS 解析后的复查（「域名解析到 127.0.0.1」不在拦截范围内）—— 威胁模型是「用户被误导填了危险地址」，不是「远端攻击者控制主机名」，已在模块头写明。
+> 7. **前端**：探测的模型输入用 `<datalist>`（原生、零依赖）而不是 Select + 「先发现模型」按钮 —— 候选来自编辑态的 `model_list` 与新建态「测试连接」拉到的模型名；探测的状态与调用放在 `ProviderDialog`（与现有 `testMsg` 同处），`ProbePanel` 只做展示。**没有**新增「先发现模型」按钮：新建态本来就没有渠道可发现，提示文案改为「可先点『测试连接』拉取模型列表，或直接填模型名」。
+> 8. **UI 门禁补了一条探针**：`tools/visual-regression/probe-endpoint.mjs` + `gate.mjs` 里的判据（逐端点结论行渲染 / 信息性行**看得出**灰显 / 截断摘要自带 title / 被拦截地址文案与零延迟 / 探测不改表单脏状态）。判据已实测「改坏就会红」（去掉 `opacity-60` 时门禁立刻报 `信息性探测行灰显`）。
+>
+> 验收：`cargo test --workspace` 全绿（34 套件，新增 `m13_probe.rs` 11 用例、`netguard` 14 个单测、`probe` 22 个单测）；`node tools/visual-regression/gate.mjs` 全绿（双尺寸 × 双主题，83 步审计 + 折叠线 + 命中区 + 新增探测面板判据）。
+
 #### T1.1 新增模块 `crates/gateway-core/src/probe.rs`
 
 现有 `discover.rs`（325 行）只负责列模型，**不要塞进去**——它的职责已经很清晰。新建独立模块。

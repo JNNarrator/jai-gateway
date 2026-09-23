@@ -46,6 +46,53 @@ const model = (id, providerId, modelName, upstream, ctx, i) => ({
 });
 
 export const fixtures = {
+  // 渠道草稿端点探测（D9-T1）：四行覆盖四种展示形态 ——
+  // 主探测通过 / 信息性探测失败（灰显）/ 未填模型跳过 / 地址被拦截。
+  probe_report: {
+    runId: "01a0565e-792a-7aa3-a1cb-a4c8a689568c",
+    testedAt: NOW,
+    fingerprint: "9f2c1d4b7a6e5c8f0b3a2d1e4f6a8c9b0d2e4f6a8c1b3d5e7f9a0b2c4d6e8f1a",
+    results: [
+      {
+        endpoint: "chat_completions",
+        status: "passed",
+        category: null,
+        message: "通过",
+        latencyMs: 412,
+        testedModel: "gpt-4o-mini",
+        costPossible: true,
+        informational: false,
+      },
+      {
+        endpoint: "responses",
+        status: "failed",
+        category: "endpoint_unsupported",
+        message:
+          "HTTP 404：<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx/1.24.0</center></body></html>",
+        latencyMs: 380,
+        testedModel: "gpt-4o-mini",
+        costPossible: true,
+        informational: true,
+      },
+    ],
+  },
+  probe_report_blocked: {
+    runId: "01a0565e-792a-7aa3-a1cb-a4c8a689568d",
+    testedAt: NOW,
+    fingerprint: "1111111111111111111111111111111111111111111111111111111111111111",
+    results: [
+      {
+        endpoint: "chat_completions",
+        status: "failed",
+        category: "url_blocked",
+        message: "目标 169.254.169.254 属于链路本地地址（含云元数据端点，任何情况下都不放行），已拦截",
+        latencyMs: 0,
+        testedModel: null,
+        costPossible: false,
+        informational: false,
+      },
+    ],
+  },
   gateway_status: { running: true, port: 1314, restarts: 2 },
   health_summary: {
     checkedAtMs: NOW - 42_000,

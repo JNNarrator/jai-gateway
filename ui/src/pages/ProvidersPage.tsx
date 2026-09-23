@@ -7,12 +7,13 @@ import {
   KeyRound,
   Pencil,
   PlugZap,
+  Radar,
   Plus,
   RefreshCw,
   Trash2,
 } from "lucide-react";
 import { api } from "../api";
-import type { ProviderDto } from "../types";
+import type { DraftProbeReport, ProviderDto } from "../types";
 import { toast } from "../lib/toast";
 import { fmtClock } from "../lib/format";
 import { cn } from "@/lib/utils";
@@ -22,6 +23,7 @@ import { EmptyState } from "@/components/common/EmptyState";
 import { EffortLevelsEditor } from "@/components/common/EffortLevelsEditor";
 import { MaxToolsEditor } from "@/components/common/MaxToolsEditor";
 import { FormField } from "@/components/common/FormField";
+import { ProbePanel } from "@/components/common/ProbePanel";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { useDirtyGuard } from "@/lib/dirty";
 import { Badge } from "@/components/ui/badge";
@@ -481,6 +483,34 @@ function ProviderDialog({
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [envOpen, setEnvOpen] = useState(false);
 
+  // ---- 端点探测（D9-T1）：全是弹窗内临时状态，**不进表单、不影响脏状态判定**
+  const [probeModel, setProbeModel] = useState("");
+  const [allowLoopback, setAllowLoopback] = useState(false);
+  const [probeBusy, setProbeBusy] = useState(false);
+  const [probeReport, setProbeReport] = useState<DraftProbeReport | null>(null);
+  const [probeErr, setProbeErr] = useState("");
+  /** 探测目标候选：编辑态取已入库模型；新建态取「测试连接」拉到的模型名 */
+  const [modelOptions, setModelOptions] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!p) return;
+    let alive = true;
+    api
+      .modelList(p.id)
+      .then((rows) => {
+        if (!alive) return;
+        const names = rows.map((r) => r.modelName);
+        setModelOptions(names);
+        setProbeModel((cur) => cur || names[0] || "");
+      })
+      .catch(() => {
+        /* 列模型失败不影响探测（用户可以手填模型名） */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [p]);
+
   async function testConnection() {
     setFormErr("");
     setTestMsg(null);
@@ -491,6 +521,8 @@ function ProviderDialog({
         family: v.family,
         apiKey: v.apiKey,
       });
+      setModelOptions(r.modelNames);
+      setProbeModel((cur) => cur || r.modelNames[0] || "");
       const preview = r.modelNames.slice(0, 3).join(", ");
       setTestMsg({
         ok: true,
@@ -503,6 +535,38 @@ function ProviderDialog({
         ok: false,
         text: `连接失败：${e}。请检查网络、Base URL、API Key 是否匹配该协议族。`,
       });
+    }
+  }
+
+  /** 端点探测：对每个候选端点发一次真实的最小推理请求（max_tokens=1）。 */
+  async function runProbe() {
+    setProbeErr("");
+    setProbeReport(null);
+    const v = getValues();
+    setProbeBusy(true);
+    try {
+      const headersObj: Record<string, string> = {};
+      for (const row of v.extraHeaders) {
+        const k = row.key.trim();
+        if (k) headersObj[k] = row.value.trim();
+      }
+      const report = await api.providerProbeDraft({
+        baseUrl: v.baseUrl,
+        family: v.family,
+        apiKey: v.apiKey,
+        // 编辑态没重输 key 时，让后端用库里存的 key（否则会以未鉴权身份打上游）
+        providerId: p?.id ?? null,
+        model: probeModel,
+        extraHeaders: Object.keys(headersObj).length
+          ? JSON.stringify(headersObj)
+          : null,
+        allowLoopback,
+      });
+      setProbeReport(report);
+    } catch (e) {
+      setProbeErr(String(e));
+    } finally {
+      setProbeBusy(false);
     }
   }
 
@@ -526,6 +590,8 @@ function ProviderDialog({
           extraHeaders: eh,
           apiKey: v.apiKey,
           website: v.website || null,
+          // 门禁 `require_probe_pass` 开启时后端会校验它（默认关闭）
+          probeFingerprint: probeReport?.fingerprint ?? null,
         });
       } else if (p) {
         await api.providerUpdate({
@@ -538,6 +604,7 @@ function ProviderDialog({
           extraHeaders: eh,
           apiKey: v.apiKey || undefined,
           website: v.website || null,
+          probeFingerprint: probeReport?.fingerprint ?? null,
         });
       }
       toast(mode === "create" ? "供应商已创建" : "已保存");
@@ -728,6 +795,45 @@ function ProviderDialog({
               </div>
             )}
 
+            <div className="space-y-2 rounded-md border p-3">
+              <div className="flex items-center gap-1.5 text-sm font-medium">
+                <Radar className="size-4" aria-hidden />
+                端点探测
+              </div>
+              <p className="text-xs text-muted-foreground">
+                对每个候选端点发一次真实的最小推理请求（max_tokens=1），逐端点给出
+                「通过 / 失败 + 原因 + 延迟」。只判 HTTP 200 不够——网关拦截页也是
+                200，所以这里会校验响应结构。探测会真的调用模型，可能产生计费。
+              </p>
+              <FormField
+                label="探测用模型"
+                htmlFor="pf-probe-model"
+                hint={
+                  modelOptions.length
+                    ? "从该渠道已知模型里选，或直接填一个模型名"
+                    : "还没有已知模型：可先点「测试连接」拉取模型列表，或直接填模型名"
+                }
+              >
+                <Input
+                  id="pf-probe-model"
+                  list="pf-probe-model-options"
+                  placeholder="如 gpt-4o-mini"
+                  value={probeModel}
+                  onChange={(e) => setProbeModel(e.target.value)}
+                />
+                <datalist id="pf-probe-model-options">
+                  {modelOptions.map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+              </FormField>
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Switch checked={allowLoopback} onCheckedChange={setAllowLoopback} />
+                允许访问本机地址（用于 Ollama / LM Studio 等本机部署）
+              </label>
+              <ProbePanel report={probeReport} busy={probeBusy} error={probeErr} />
+            </div>
+
           </DialogBody>
 
           <DialogFooter className="gap-2 border-t pt-4">
@@ -740,6 +846,15 @@ function ProviderDialog({
             >
               <PlugZap aria-hidden />
               测试连接
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={isSubmitting || probeBusy}
+              onClick={() => void runProbe()}
+            >
+              <Radar aria-hidden />
+              {probeBusy ? "探测中…" : "端点探测"}
             </Button>
             <Button type="submit" disabled={isSubmitting}>
               {mode === "create" ? "创建" : "保存"}
