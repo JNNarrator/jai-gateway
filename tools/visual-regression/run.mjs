@@ -33,7 +33,7 @@ const TAB_LABEL = {
 // ───────────────────────── mock ─────────────────────────
 function installMock() {
   const fix = window.__JAI_FIX__;
-  const state = { running: true, providers: null, models: null, mcp: null, skills: null };
+  const state = { running: true, providers: null, models: null, mcp: null, skills: null, keys: (fix.gateway_key_list || []).map((k) => ({ ...k })) };
   const calls = [];
   const opened = [];
   window.__JAI_CALLS__ = calls;
@@ -49,7 +49,41 @@ function installMock() {
       case "model_list": return fix.model_list[args.providerId] || [];
       case "logs_recent": return fix.logs_recent.slice(0, args?.limit ?? 100);
       case "stats_usage": return fix.stats_usage.slice(0, args?.days ?? 7);
-      case "gateway_key_reveal": return fix.gateway_key_info;
+      case "gateway_key_info": return state.keys[0] ?? null;
+      case "gateway_key_list": return state.keys.map((k) => ({ ...k }));
+      case "gateway_key_reveal": {
+        const k = args?.id ? state.keys.find((x) => x.id === args.id) : state.keys[0];
+        return { ...k, key: `sk-jai-REVEALED-${k?.id ?? "none"}-000000000000` };
+      }
+      case "gateway_key_create": {
+        const row = {
+          id: `k-new-${state.keys.length + 1}`,
+          prefix: "sk-jai-New9x",
+          label: args?.label ?? null,
+          createdAt: Date.now(),
+          lastUsedAt: null,
+          revokedAt: null,
+          key: `sk-jai-NEWKEY${state.keys.length + 1}000000000000000000`,
+        };
+        state.keys = [row, ...state.keys];
+        return { ...row };
+      }
+      case "gateway_key_revoke":
+        state.keys = state.keys.filter((k) => k.id !== args?.id);
+        return true;
+      case "gateway_key_regenerate": {
+        const row = {
+          id: "k-rotated",
+          prefix: "sk-jai-Rot8y",
+          label: "手动轮换",
+          createdAt: Date.now(),
+          lastUsedAt: null,
+          revokedAt: null,
+          key: "sk-jai-ROTATED000000000000000000000000",
+        };
+        state.keys = [row];
+        return { ...row };
+      }
       case "export_config_json": return JSON.stringify({ format: "jai-export/v1", providers: fix.provider_list, models: fix.model_list["01a0565e-792a-7aa3-a1cb-a4c8a689568c"] }, null, 2);
       case "export_config_to_file": return "/Users/jiangnan/Documents/JAI/jai-export-1788401052890.json";
       case "skill_export_markdown": return "# rust-review\n\n对 Rust 改动做逐条评审……\n";

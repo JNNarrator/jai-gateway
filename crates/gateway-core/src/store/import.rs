@@ -12,9 +12,9 @@ use serde_json::{Map, Value};
 use crate::modality::Modality;
 
 use super::{
-    gw_key_active, gw_key_rotate, meta_set, model_upsert, provider_get_by_name_base,
-    provider_insert, provider_set_api_key, provider_set_website, provider_update_fields,
-    ProviderRow,
+    gw_key_create, gw_key_rotate, gw_keys_active, meta_set, model_upsert,
+    provider_get_by_name_base, provider_insert, provider_set_api_key, provider_set_website,
+    provider_update_fields, ProviderRow,
 };
 
 /// 导入 meta 的白名单键（同步契约：仅**共享的**连接配置与凭据；端口/CORS 等本机设置不迁移）。
@@ -313,20 +313,26 @@ pub fn apply_import(c: &Connection, text: &str, strict: bool) -> Result<ImportRe
         report.models_imported += 1;
     }
 
-    // 网关密钥：远端非空且与本地 active 不同 → 轮换（吊销旧 key）；相同则跳过
+    // 网关密钥：远端非空时保证「远端那把能用」；已在本地活跃集合里就幂等跳过。
+    //
+    // 多密钥（D9-T6a）之后这里分两种情形 —— 区别在**会不会动到本机已有的其他密钥**：
+    // - 本地只有一把（或没有）：按原轮换语义（吊销旧 key、装上远端 key）。
+    //   这正是「同一个人多台机器共用一把密钥」的同步场景，也是本路径一直以来的行为。
+    // - 本地已有多把：本机是**刻意**配了多把（不同客户端 / 不同人），远端快照没有
+    //   资格把它们清掉 —— 只把远端那把补进来（若不存在），其余原样保留。
     if let Some(remote_key) = v
         .get("gateway_key")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let local_active = gw_key_active(c).map_err(|e| e.to_string())?;
-        let differs = local_active
-            .as_ref()
-            .map(|k| k.key != remote_key)
-            .unwrap_or(true);
-        if differs {
-            gw_key_rotate(c, remote_key, Some("同步导入")).map_err(|e| e.to_string())?;
+        let locals = gw_keys_active(c).map_err(|e| e.to_string())?;
+        if !locals.iter().any(|k| k.key == remote_key) {
+            if locals.len() <= 1 {
+                gw_key_rotate(c, remote_key, Some("同步导入")).map_err(|e| e.to_string())?;
+            } else {
+                gw_key_create(c, remote_key, Some("同步导入")).map_err(|e| e.to_string())?;
+            }
         }
     }
 
@@ -560,6 +566,40 @@ mod tests {
         apply_import(&c, remote_full, false).unwrap();
         let row = crate::store::provider_get(&c, "p1").unwrap().unwrap();
         assert_eq!(row.api_key.as_deref(), Some("sk-remote-new"));
+    }
+
+    /// 多密钥（D9-T6a）：本地已有多把时，远端快照**只补不删**。
+    ///
+    /// 理由：本机配了多把说明是刻意的（不同客户端 / 不同人），远端快照没资格清掉它们；
+    /// 而「同一个人多台机器共用一把」的场景由「本地 ≤1 把时轮换」覆盖（见上一个用例）。
+    #[test]
+    fn import_does_not_wipe_local_keys_when_multiple_exist() {
+        let c = open_and_migrate(":memory:").unwrap();
+        crate::store::gw_key_create(&c, "sk-jai-local-one-000000", Some("笔记本")).unwrap();
+        crate::store::gw_key_create(&c, "sk-jai-local-two-000000", Some("CI")).unwrap();
+
+        let pull = r#"{"format":"jai-export/v1","meta":[],"providers":[],"gateway_key":"sk-jai-remote-key-00000"}"#;
+        apply_import(&c, pull, false).unwrap();
+
+        let keys: Vec<String> = crate::store::gw_keys_active(&c)
+            .unwrap()
+            .into_iter()
+            .map(|k| k.key)
+            .collect();
+        assert_eq!(keys.len(), 3, "本机两把 + 远端一把，一把都不该被吊销");
+        assert!(keys.contains(&"sk-jai-remote-key-00000".to_string()));
+        let revoked = c
+            .query_row(
+                "SELECT COUNT(*) FROM gateway_keys WHERE revoked_at IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(revoked, 0, "多密钥场景不该产生吊销");
+
+        // 幂等：再拉一次同一个远端 key → 仍是 3 把
+        apply_import(&c, pull, false).unwrap();
+        assert_eq!(crate::store::gw_keys_active(&c).unwrap().len(), 3);
     }
 
     /// gateway_key 拉取覆盖语义：不同则轮换（吊销旧 key），相同则幂等跳过。

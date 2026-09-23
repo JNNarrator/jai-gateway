@@ -879,20 +879,26 @@ fn ensure_gateway_key(core: &AppCore) -> Result<(), String> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayKeyInfo {
+    /// 密钥 id（多密钥：吊销 / 指定 reveal 都按它定位）
+    pub id: String,
     pub prefix: String,
     pub label: Option<String>,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
-    /// 仅 reveal/regenerate 携带全文；info 恒为空串
+    /// 非空即已吊销（列表里不再返回已吊销的，保留字段供 DTO 完整性）
+    pub revoked_at: Option<i64>,
+    /// 仅 reveal/create/regenerate 携带全文；list/info 恒为空串
     pub key: String,
 }
 
 fn key_info(k: GatewayKeyRow, with_full: bool) -> GatewayKeyInfo {
     GatewayKeyInfo {
+        id: k.id,
         prefix: k.prefix,
         label: k.label,
         created_at: k.created_at,
         last_used_at: k.last_used_at,
+        revoked_at: k.revoked_at,
         key: if with_full { k.key } else { String::new() },
     }
 }
@@ -910,14 +916,76 @@ async fn gateway_key_info(core: State<'_, AppCore>) -> Result<Option<GatewayKeyI
     .map_err(join_err)?
 }
 
+/// 列出全部未吊销密钥（**不含全文**，常态只给前缀）。
 #[tauri::command]
-async fn gateway_key_reveal(core: State<'_, AppCore>) -> Result<GatewayKeyInfo, String> {
+async fn gateway_key_list(core: State<'_, AppCore>) -> Result<Vec<GatewayKeyInfo>, String> {
     let db = core.db.clone();
     tokio::task::spawn_blocking(move || {
-        db.with_any(|c| match store::gw_key_active(c) {
-            Ok(Some(k)) => Ok(key_info(k, true)),
-            Ok(None) => Err("无活跃网关密钥".to_string()),
+        db.with_any(|c| match store::gw_keys_active(c) {
+            Ok(rows) => Ok(rows.into_iter().map(|k| key_info(k, false)).collect()),
             Err(e) => Err(e.to_string()),
+        })
+    })
+    .await
+    .map_err(join_err)?
+}
+
+/// 新建一把密钥（**不吊销旧的**）。返回值带全文 —— 这是唯一一次能拿到全文的时机
+/// （列表与 info 都不带），UI 必须提示用户当场复制。
+#[tauri::command]
+async fn gateway_key_create(
+    core: State<'_, AppCore>,
+    label: Option<String>,
+) -> Result<GatewayKeyInfo, String> {
+    let new_key = gen_gateway_key();
+    let nk = new_key.clone();
+    // 标签归一在 store 层（`gw_key_create`）统一做，这里不重复
+    let db = core.db.clone();
+    let row = tokio::task::spawn_blocking(move || {
+        db.with(|c| store::gw_key_create(c, &nk, label.as_deref()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    core.autopush.notify_change();
+    Ok(key_info(row, true))
+}
+
+/// 按 id 吊销一把密钥（软删，保留审计痕迹）。其他密钥不受影响。
+#[tauri::command]
+async fn gateway_key_revoke(core: State<'_, AppCore>, id: String) -> Result<bool, String> {
+    let db = core.db.clone();
+    let changed = tokio::task::spawn_blocking(move || {
+        db.with(|c| store::gw_key_revoke(c, &id))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(join_err)??;
+    core.autopush.notify_change();
+    Ok(changed)
+}
+
+/// 显示全文。`id` 省略时取最新一把（单密钥语义的兼容路径）。
+#[tauri::command]
+async fn gateway_key_reveal(
+    core: State<'_, AppCore>,
+    id: Option<String>,
+) -> Result<GatewayKeyInfo, String> {
+    let db = core.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_any(|c| match id.as_deref() {
+            None => match store::gw_key_active(c) {
+                Ok(Some(k)) => Ok(key_info(k, true)),
+                Ok(None) => Err("无活跃网关密钥".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            Some(want) => match store::gw_keys_active(c) {
+                Ok(rows) => match rows.into_iter().find(|k| k.id == want) {
+                    Some(k) => Ok(key_info(k, true)),
+                    None => Err("该密钥不存在或已吊销".to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            },
         })
     })
     .await
@@ -939,10 +1007,12 @@ async fn gateway_key_regenerate(core: State<'_, AppCore>) -> Result<GatewayKeyIn
     // 新密钥随 WebDAV 同步：触发自动推送防抖通知（未配置 WebDAV 时无副作用）
     core.autopush.notify_change();
     Ok(GatewayKeyInfo {
+        id: row.id,
         prefix: row.prefix,
         label: row.label,
         created_at: row.created_at,
         last_used_at: None,
+        revoked_at: None,
         key: new_key,
     })
 }
@@ -3616,6 +3686,9 @@ fn main() {
             model_set_max_tools,
             provider_set_max_tools,
             gateway_key_info,
+            gateway_key_list,
+            gateway_key_create,
+            gateway_key_revoke,
             gateway_key_reveal,
             gateway_key_regenerate,
             logs_recent,

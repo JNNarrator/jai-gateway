@@ -42,6 +42,7 @@ function installMock() {
     switch (cmd) {
       case "gateway_status": return { ...fix.gateway_status, running: true };
       case "gateway_key_info": return { ...fix.gateway_key_info };
+      case "gateway_key_list": return (fix.gateway_key_list || []).map((k) => ({ ...k }));
       case "gateway_key_reveal": return { ...fix.gateway_key_info };
       case "health_summary": return JSON.parse(JSON.stringify(fix.health_summary));
       case "plugin:window|theme": return "dark";

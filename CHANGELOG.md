@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **网关多密钥**（D9-T6a）：此前「密钥」实质只有一把 —— `gw_key_active` 只取最新一条，
+  鉴权也只比那一把。于是「给 A 客户端一把、给 B 客户端一把，A 泄露了只吊销 A」做不到：
+  只能轮换，而那会把所有人一起踢掉。现在每把密钥独立存在、可单独吊销：
+  - store：新增 `gw_keys_active`（全部未吊销）/ `gw_key_create`（**不吊销旧的**）/
+    `gw_key_revoke`（按 id 软删，返回是否真的改动了行；重复吊销不改时间戳）。
+    `gw_key_active` 保留「最新一把」语义（导出 / 导入比对 / 首次自举在用）。
+    排序补 `rowid DESC` —— `created_at` 只到毫秒，同毫秒创建时顺序不确定会让列表「跳」。
+    label 在 store 层归一（去空白，空白串视同未填）。
+  - 鉴权：`security::authenticate` 从「取唯一活跃 key」改为「取全部活跃 key → 逐个
+    `ct_eq`」。**不做短路优化**（不「先比 prefix 再比全文」——prefix 是 14 字符明文，
+    用它筛选会让「哪些 prefix 存在」可被时序区分）；密钥数量是个位数，全量比对成本可忽略。
+  - 新 IPC：`gateway_key_list`（**不含全文**）/ `gateway_key_create`（返回带全文，
+    这是唯一一次能拿到全文的时机）/ `gateway_key_revoke(id)`；
+    `gateway_key_reveal` 增加可选 `id`（省略时取最新一把）。
+    `GatewayKeyInfo` 增加 `id` / `revokedAt`。
+  - WebDAV 导入语义收窄：本地只有 ≤1 把时保持原轮换语义；本地**已有多把**时**只补不删**
+    —— 本机配多把是刻意的，远端快照没资格清掉它们。已知局限：导出仍只带最新一把密钥。
+  - 前端「网关」页：单卡片改为密钥列表（前缀 / 备注 / 创建时间 / 最后使用 +
+    显示全文 / 复制 / 吊销），吊销走二次确认；新增「新建密钥」（可填备注）与
+    「复制最新一把」；原「轮换密钥」改为「轮换全部密钥」并在确认框里写清
+    「这是把所有密钥一起换掉，只想换某个客户端请用新建 + 单独吊销」。
 - **渠道草稿端点探测**（D9-T1）：在「新建/编辑供应商」弹窗里，除现有「测试连接」（只打
   `/models`）之外新增「端点探测」——对每个候选端点发一次**真实的最小推理请求**
   （`max_tokens = 1` + `stream: false`），逐端点给出「通过 / 失败 + 原因 + 延迟」。
@@ -164,6 +185,16 @@ All notable changes to this project will be documented in this file.
 
 ### Tests
 
+- 新增 `crates/gateway-core/tests/m13_multi_key.rs`（7 用例）：创建 3 把后**三把都能鉴权**
+  （新建不踢旧）；吊销其中 1 把后该密钥 401、其余两把 200（**端到端走完整中间件**，
+  只测函数会漏掉接线回归）；轮换后新密钥可用且旧的全失效；全吊销 → 一律失败；
+  吊销幂等且不改时间戳；空白 label 归一为 NULL；`gw_key_active` 仍返回最新一把
+  （吊销最新那把后回退到上一把而不是 None）。
+- `store::import` 新增 1 个单测：本地已有多把密钥时，WebDAV 拉取**只补不删**
+  （不产生任何吊销），且重复拉取幂等。
+- UI 门禁新增探针 `tools/visual-regression/probe-keys.mjs` + `gate.mjs` 判据：
+  列表渲染全部密钥、显示/隐藏全文、吊销**先二次确认且确认前不动数据**、
+  新建插到最前且当场显示全文、全吊销后有空态文案。判据已实测「改坏就会红」。
 - 新增 `crates/gateway-core/tests/m13_probe.rs`（11 用例）：200 + 合法 body → `Passed`；
   **200 + HTML 拦截页 → `Failed{Protocol}`**（防「假绿」，这条最重要）；401 →
   `Failed{Authentication}`；404 + 模型语义 → `Failed{Model}`；慢于 `per_probe_timeout`

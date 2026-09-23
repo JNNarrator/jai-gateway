@@ -202,6 +202,67 @@ for (const size of SIZES) {
     if (audit.errors?.length) fail("无页面报错", `${size}/${theme} audit`, audit.errors.slice(0, 3).join(" | "));
   }
 
+  // ── probe-keys：网关多密钥列表（D9-T6a） ──
+  const pk = SKIP_PROBES
+    ? readJson(path.join(VR, `out-probe-keys-${size}.json`))
+    : runProbe(`probe-keys --size=${size}`, "probe-keys.mjs", `out-probe-keys-${size}.json`);
+  if (!pk) {
+    fail("多密钥列表 probe-keys", size, "未产出结果文件（探针未跑或崩溃）");
+  } else {
+    const where = `${size} 网关页`;
+    const init = pk.initial?.rows || [];
+    if (init.length < 3) {
+      fail("多密钥列表渲染全部密钥", where, `初始只渲染出 ${init.length} 行（夹具 3 把）`);
+    }
+    for (const r of init) {
+      if (!r.prefix || !r.label || !r.created || !r.used) {
+        fail("密钥行内容完整", where, `行缺前缀/备注/创建时间/最后使用：${JSON.stringify(r)}`);
+      }
+      if (r.clipped) {
+        fail("密钥列截断有 title", where, `列被截断且无 title：${r.prefix}`);
+      }
+    }
+    // 显示全文 → 该行变长；再点回到前缀态
+    const shown = pk.revealed?.rows?.[0]?.shown ?? "";
+    if (shown.length <= (init[0]?.prefix?.length ?? 0) + 4 || shown.endsWith("…")) {
+      fail("显示全文真的显示全文", where, `显示全文后仍是「${shown}」`);
+    }
+    if (!(pk.hiddenAgain?.rows?.[0]?.shown ?? "").endsWith("…")) {
+      fail("隐藏全文回到前缀态", where, `隐藏后为「${pk.hiddenAgain?.rows?.[0]?.shown}」`);
+    }
+    // 吊销必须先二次确认，且确认前不动数据
+    if (!pk.confirmOpen) {
+      fail("吊销密钥需二次确认", where, "点「吊销」没有弹确认框（直接删了？）");
+    } else {
+      if (pk.confirmOpen.rowsStillThere !== init.length) {
+        fail("吊销确认前不改数据", where, `确认框打开时列表已变成 ${pk.confirmOpen.rowsStillThere} 行`);
+      }
+      if (!pk.confirmOpen.buttons?.includes("取消")) {
+        fail("吊销确认框可取消", where, `按钮：${(pk.confirmOpen.buttons || []).join("/")}`);
+      }
+    }
+    if ((pk.afterRevoke?.rows?.length ?? 0) !== init.length - 1) {
+      fail("吊销只删该行", where, `吊销一把后为 ${pk.afterRevoke?.rows?.length} 行（期望 ${init.length - 1}）`);
+    }
+    // 新建：插到最前，且当场显示全文
+    const newRow = pk.afterCreate?.rows?.[0];
+    if (!newRow || newRow.prefix === init[0]?.prefix) {
+      fail("新建密钥插到最前", where, `首行为 ${newRow?.prefix}（未变化）`);
+    } else if (newRow.shown.endsWith("…")) {
+      fail("新密钥当场显示全文", where, `新建后首行显示「${newRow.shown}」（唯一一次能拿到全文的时机，必须当场可见）`);
+    }
+    // 全部吊销 → 空态文案，不留空列表
+    if ((pk.afterAllRevoked?.rows?.length ?? -1) !== 0) {
+      fail("全部吊销后列表为空", where, `仍剩 ${pk.afterAllRevoked?.rows?.length} 行`);
+    }
+    if (!pk.afterAllRevoked?.emptyText) {
+      fail("空列表有空态文案", where, "列表为空但没有提示文案");
+    }
+    if (pk.errors?.length) {
+      fail("多密钥页无报错", where, pk.errors.slice(0, 3).join(" | "));
+    }
+  }
+
   // ── probe-endpoint：渠道草稿端点探测面板（D9-T1） ──
   // 探测面板的结论行是**点击后**才出现的，audit/fold 都不会点到它，所以单独一条探针。
   const pe = SKIP_PROBES

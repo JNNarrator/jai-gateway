@@ -754,37 +754,56 @@ pub struct GatewayKeyRow {
     pub last_used_at: Option<i64>,
 }
 
-pub fn gw_key_active(c: &Connection) -> Result<Option<GatewayKeyRow>, StoreError> {
+/// 全部**未吊销**的网关密钥，新建在前。
+///
+/// 多密钥（D9-T6a）：一把密钥对应一个客户端 / 一个人，可独立吊销，互不影响。
+/// 鉴权要遍历全部（见 `server::security::authenticate`），所以这里不设 LIMIT。
+pub fn gw_keys_active(c: &Connection) -> Result<Vec<GatewayKeyRow>, StoreError> {
+    // `created_at` 只到毫秒 —— 同一毫秒内建的多把密钥靠它排序是不确定的（实测：三把
+    // 同毫秒创建时顺序随机，UI 列表会「跳」）。补 `rowid DESC` 作为稳定的次级键：
+    // rowid 随插入单调递增，于是「最新建的排最前」在任何情况下都成立。
     let sql = "SELECT id,key,prefix,label,created_at,revoked_at,last_used_at
-               FROM gateway_keys WHERE revoked_at IS NULL ORDER BY created_at DESC LIMIT 1";
-    Ok(c.query_row(sql, [], |r| {
-        Ok(GatewayKeyRow {
-            id: r.get(0)?,
-            key: r.get(1)?,
-            prefix: r.get(2)?,
-            label: r.get(3)?,
-            created_at: r.get(4)?,
-            revoked_at: r.get(5)?,
-            last_used_at: r.get(6)?,
-        })
-    })
-    .optional()?)
+               FROM gateway_keys WHERE revoked_at IS NULL
+               ORDER BY created_at DESC, rowid DESC";
+    let mut stmt = c.prepare(sql)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(GatewayKeyRow {
+                id: r.get(0)?,
+                key: r.get(1)?,
+                prefix: r.get(2)?,
+                label: r.get(3)?,
+                created_at: r.get(4)?,
+                revoked_at: r.get(5)?,
+                last_used_at: r.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
-/// 创建新网关密钥并吊销旧密钥（storage §6-2 轮换语义：吊销+新建，保留审计痕迹）。
-pub fn gw_key_rotate(
+/// 最新一把未吊销密钥。
+///
+/// 保留给「单密钥」语义的调用点（首次启动自举、导出、WebDAV 导入的活跃密钥比对）——
+/// 它们要的是「当前那把主密钥」，不是「全部密钥」。多密钥场景请用 [`gw_keys_active`]。
+pub fn gw_key_active(c: &Connection) -> Result<Option<GatewayKeyRow>, StoreError> {
+    Ok(gw_keys_active(c)?.into_iter().next())
+}
+
+/// 创建一把新密钥，**不吊销任何旧密钥**（多密钥）。
+pub fn gw_key_create(
     c: &Connection,
     new_key: &str,
     label: Option<&str>,
 ) -> Result<GatewayKeyRow, StoreError> {
     let now = now_ms();
-    c.execute(
-        "UPDATE gateway_keys SET revoked_at=?1 WHERE revoked_at IS NULL",
-        [now],
-    )?;
+    // 标签归一：去首尾空白，空白串视同未填（避免列表里出现看不见的「空标签」）。
+    // 放在 store 而不是 IPC —— 单一来源，`gw_key_rotate` 与导入路径都自动受益。
+    let label = label.map(str::trim).filter(|l| !l.is_empty());
     let row = GatewayKeyRow {
         id: uuid::Uuid::now_v7().to_string(),
         key: new_key.to_string(),
+        // 常态只展示前缀（14 字符 = `sk-jai-` + 7 位，与既有口径一致）
         prefix: new_key.chars().take(14).collect(),
         label: label.map(str::to_string),
         created_at: now,
@@ -797,6 +816,33 @@ pub fn gw_key_rotate(
         params![row.id, row.key, row.prefix, row.label, row.created_at],
     )?;
     Ok(row)
+}
+
+/// 按 id 吊销一把密钥。返回是否真的改动了行（已吊销的再吊销 → false，且不改时间戳）。
+///
+/// 吊销是软删（`revoked_at` 非空），保留审计痕迹：storage §6-2 的轮换语义也靠它。
+pub fn gw_key_revoke(c: &Connection, id: &str) -> Result<bool, StoreError> {
+    let n = c.execute(
+        "UPDATE gateway_keys SET revoked_at=?1 WHERE id=?2 AND revoked_at IS NULL",
+        params![now_ms(), id],
+    )?;
+    Ok(n > 0)
+}
+
+/// 创建新网关密钥并吊销**全部**旧密钥（storage §6-2 轮换语义：吊销+新建，保留审计痕迹）。
+///
+/// 与 [`gw_key_create`] 的区别：这是「一键换掉所有密钥」——旧客户端会立刻失效，
+/// 所以 UI 上必须二次确认；多密钥场景请用 `gw_key_create`。
+pub fn gw_key_rotate(
+    c: &Connection,
+    new_key: &str,
+    label: Option<&str>,
+) -> Result<GatewayKeyRow, StoreError> {
+    c.execute(
+        "UPDATE gateway_keys SET revoked_at=?1 WHERE revoked_at IS NULL",
+        [now_ms()],
+    )?;
+    gw_key_create(c, new_key, label)
 }
 
 /// 认证命中后节流更新 last_used_at（至多每 60s 一次，避免写放大）。

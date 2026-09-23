@@ -117,7 +117,17 @@ export const api = {
 
   // 网关密钥
   gatewayKeyInfo: () => invoke<GatewayKeyInfo | null>("gateway_key_info"),
-  gatewayKeyReveal: () => invoke<GatewayKeyInfo>("gateway_key_reveal"),
+  /** 全部未吊销密钥（**不含全文**，常态只给前缀） */
+  gatewayKeyList: () => invoke<GatewayKeyInfo[]>("gateway_key_list"),
+  /** 新建一把密钥（**不吊销旧的**）。返回带全文 —— 唯一一次能拿到全文的时机。 */
+  gatewayKeyCreate: (label?: string | null) =>
+    invoke<GatewayKeyInfo>("gateway_key_create", { label: label ?? null }),
+  /** 按 id 吊销（软删，其他密钥不受影响）。返回是否真的改动了行。 */
+  gatewayKeyRevoke: (id: string) =>
+    invoke<boolean>("gateway_key_revoke", { id }),
+  /** 显示全文；`id` 省略时取最新一把（单密钥语义的兼容路径） */
+  gatewayKeyReveal: (id?: string) =>
+    invoke<GatewayKeyInfo>("gateway_key_reveal", { id: id ?? null }),
   gatewayKeyRegenerate: () =>
     invoke<GatewayKeyInfo>("gateway_key_regenerate"),
 

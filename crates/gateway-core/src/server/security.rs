@@ -117,8 +117,15 @@ pub struct AuthedKey {
     pub id: String,
 }
 
-/// 依据 Bearer / x-api-key 头对活跃网关密钥做常量时间认证。
+/// 依据 Bearer / x-api-key 头对**全部未吊销**网关密钥做常量时间认证。
 /// 命中后节流回写 last_used_at。
+///
+/// 多密钥（D9-T6a）：一把密钥对应一个客户端 / 一个人，可独立吊销。所以这里是
+/// 「取全部活跃密钥 → 逐个比对」，命中即返回该密钥的 id（后续按 key 归因要用）。
+///
+/// **不做短路优化**：不要「先比 prefix 再比全文」—— prefix 是 14 字符明文，
+/// 拿它做快速筛选会让「哪些 prefix 存在」可被时序区分。密钥数量是个位数，
+/// 全量 `ct_eq` 遍历的成本可忽略。
 // Err 直接携带 axum Response（鉴权失败即返回的错误体），体积超 clippy
 // result_large_err 阈值；属 API 形状选择，仅在认证失败路径构造。
 #[allow(clippy::result_large_err)]
@@ -133,9 +140,10 @@ pub async fn authenticate(db: &Db, headers: &HeaderMap) -> Result<AuthedKey, Res
     let active = tokio::task::spawn_blocking(
         move || -> Result<Vec<(String, String)>, store::StoreError> {
             db2.with(|c| {
-                Ok(store::gw_key_active(c)?
-                    .map(|k| vec![(k.id, k.key)])
-                    .unwrap_or_default())
+                Ok(store::gw_keys_active(c)?
+                    .into_iter()
+                    .map(|k| (k.id, k.key))
+                    .collect())
             })
         },
     )

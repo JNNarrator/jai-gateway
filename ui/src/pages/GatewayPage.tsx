@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Copy, HeartPulse, Play, Square } from "lucide-react";
+import { AlertTriangle, Copy, Eye, EyeOff, HeartPulse, Play, Plus, Square, Trash2 } from "lucide-react";
 import { api } from "../api";
 import type { GatewayKeyInfo, GwStatus, HealthSummary } from "../types";
 import { toast } from "../lib/toast";
+import { fmtClock } from "../lib/format";
 import { goTab } from "../lib/nav";
 import { PageHeader } from "@/components/common/PageHeader";
 import { CopyField } from "@/components/common/CopyField";
 import { StatusBadge } from "@/components/common/StatusBadge";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Card,
   CardContent,
@@ -18,8 +20,15 @@ import {
 } from "@/components/ui/card";
 export function GatewayPage() {
   const [status, setStatus] = useState<GwStatus | null>(null);
-  const [key, setKey] = useState<GatewayKeyInfo | null>(null);
+  // 多密钥（D9-T6a）：一把密钥对应一个客户端 / 一个人，可独立吊销。
+  const [keys, setKeys] = useState<GatewayKeyInfo[]>([]);
+  /** 已「显示全文」的密钥：id → 全文（只在本次会话内存在，不落任何持久化） */
+  const [revealed, setRevealed] = useState<Record<string, string>>({});
+  /** 「接入信息」复制用到的全文：用户点过显示全文 / 新建 / 轮换时记下最新那一把 */
   const [revealKey, setRevealKey] = useState<string>("");
+  const [newLabel, setNewLabel] = useState("");
+  const [keyBusy, setKeyBusy] = useState(false);
+  const [confirmRevoke, setConfirmRevoke] = useState<GatewayKeyInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [confirmRotate, setConfirmRotate] = useState(false);
@@ -55,8 +64,16 @@ export function GatewayPage() {
     return () => clearInterval(t);
   }, []);
 
+  const loadKeys = async () => {
+    try {
+      setKeys(await api.gatewayKeyList());
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
+
   useEffect(() => {
-    api.gatewayKeyInfo().then((k) => setKey(k)).catch(() => {});
+    void loadKeys();
   }, []);
 
   useEffect(() => {
@@ -79,18 +96,93 @@ export function GatewayPage() {
   }
 
   async function doRegen() {
-    const k = await api.gatewayKeyRegenerate();
-    setKey(k);
-    setRevealKey(k.key);
-    toast("密钥已轮换");
+    setKeyBusy(true);
+    try {
+      const k = await api.gatewayKeyRegenerate();
+      setRevealKey(k.key);
+      setRevealed({ [k.id]: k.key });
+      await loadKeys();
+      toast("已轮换：旧密钥全部失效，新密钥已显示");
+    } catch (e) {
+      toast(String(e), "err");
+    } finally {
+      setKeyBusy(false);
+    }
   }
 
-  /** 不经「显示全文」直接复制完整密钥：内部取全量值，不在界面上展示 */
+  /** 新建一把密钥（不动旧密钥）：返回值带全文，这是唯一一次能拿到全文的时机 */
+  async function doCreateKey() {
+    setKeyBusy(true);
+    try {
+      const k = await api.gatewayKeyCreate(newLabel || null);
+      setNewLabel("");
+      setRevealKey(k.key);
+      setRevealed({ [k.id]: k.key });
+      await loadKeys();
+      toast("已新建密钥：请当场复制，之后列表只显示前缀");
+    } catch (e) {
+      toast(String(e), "err");
+    } finally {
+      setKeyBusy(false);
+    }
+  }
+
+  /** 显示 / 隐藏某一把密钥的全文 */
+  async function doToggleReveal(k: GatewayKeyInfo) {
+    if (revealed[k.id]) {
+      setRevealed((prev) => {
+        const next = { ...prev };
+        delete next[k.id];
+        return next;
+      });
+      return;
+    }
+    try {
+      const full = (await api.gatewayKeyReveal(k.id)).key;
+      setRevealed((prev) => ({ ...prev, [k.id]: full }));
+      setRevealKey(full);
+    } catch (e) {
+      toast(String(e), "err");
+    }
+  }
+
+  async function doCopyOne(k: GatewayKeyInfo) {
+    try {
+      const full = revealed[k.id] || (await api.gatewayKeyReveal(k.id)).key;
+      await navigator.clipboard.writeText(full);
+      toast("已复制");
+    } catch {
+      toast("复制失败", "err");
+    }
+  }
+
+  async function doRevoke() {
+    const k = confirmRevoke;
+    setConfirmRevoke(null);
+    if (!k) return;
+    setKeyBusy(true);
+    try {
+      const changed = await api.gatewayKeyRevoke(k.id);
+      setRevealed((prev) => {
+        const next = { ...prev };
+        delete next[k.id];
+        return next;
+      });
+      await loadKeys();
+      toast(changed ? "已吊销：该密钥立即失效" : "该密钥已不存在");
+    } catch (e) {
+      toast(String(e), "err");
+    } finally {
+      setKeyBusy(false);
+    }
+  }
+
+  /** 不经「显示全文」直接复制完整密钥：取最新一把，不在界面上展示 */
   async function doCopyKey() {
     try {
       const full = revealKey || (await api.gatewayKeyReveal()).key;
       await navigator.clipboard.writeText(full);
-      toast("已复制");
+      toast("已复制最新一把密钥");
     } catch {
       toast("复制失败", "err");
     }
@@ -264,37 +356,135 @@ export function GatewayPage() {
             <div className="text-muted-foreground">Base URL</div>
             <CopyField value={baseUrl} display={baseUrl} />
           </div>
-          <div className="space-y-1.5">
-            <div className="text-muted-foreground">API Key</div>
-            <CopyField
-              value={revealKey}
-              display={
-                revealKey
-                  ? revealKey
-                  : key
-                    ? `${key.prefix}…（点击右侧显示全文）`
-                    : "加载中"
-              }
-              onCopy={doCopyKey}
-              onToggleReveal={() =>
-                void (revealKey
-                  ? setRevealKey("")
-                  : api
-                      .gatewayKeyReveal()
-                      .then((r) => setRevealKey(r.key))
-                      .catch(() => {}))
-              }
-              revealed={!!revealKey}
-            >
+          {/* 多密钥（D9-T6a）：每把密钥给一个客户端 / 一个人，可独立吊销 ——
+              泄露一把不必把所有人一起踢掉（那是「轮换」的语义，单独放右边）。 */}
+          <div className="space-y-2" data-testid="gateway-keys">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+              <span className="text-muted-foreground">API Key</span>
+              <span className="text-xs text-muted-foreground">
+                每个客户端 / 人一把，可独立吊销；常态只显示前缀
+              </span>
+            </div>
+
+            {keys.length === 0 ? (
+              <p className="text-xs text-muted-foreground" data-testid="gateway-keys-empty">
+                当前没有可用密钥。新建一把即可接入客户端。
+              </p>
+            ) : (
+              <ul className="space-y-1.5" data-testid="gateway-key-list">
+                {keys.map((k) => {
+                  const full = revealed[k.id];
+                  return (
+                    <li
+                      key={k.id}
+                      className="flex flex-wrap items-center gap-2"
+                      data-testid="gateway-key-row"
+                      data-prefix={k.prefix}
+                    >
+                      <span
+                        className="w-40 shrink-0 truncate font-mono text-xs"
+                        title={full ?? `${k.prefix}…（未显示全文）`}
+                      >
+                        {full ?? `${k.prefix}…`}
+                      </span>
+                      <span
+                        className="w-24 shrink-0 truncate text-xs text-muted-foreground"
+                        title={k.label ?? "未命名"}
+                      >
+                        {k.label ?? "未命名"}
+                      </span>
+                      <span
+                        className="w-32 shrink-0 text-xs text-muted-foreground"
+                        title={`创建于 ${fmtClock(k.createdAt)}`}
+                      >
+                        {fmtClock(k.createdAt)}
+                      </span>
+                      <span
+                        className="w-32 shrink-0 text-xs text-muted-foreground"
+                        title={
+                          k.lastUsedAt
+                            ? `最后使用 ${fmtClock(k.lastUsedAt)}`
+                            : "从未使用"
+                        }
+                      >
+                        {k.lastUsedAt ? `用 ${fmtClock(k.lastUsedAt)}` : "从未使用"}
+                      </span>
+                      <span className="ml-auto flex shrink-0 items-center gap-1">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7"
+                          aria-label={`${full ? "隐藏" : "显示"}全文 ${k.prefix}`}
+                          onClick={() => void doToggleReveal(k)}
+                        >
+                          {full ? <EyeOff aria-hidden /> : <Eye aria-hidden />}
+                          {full ? "隐藏" : "显示全文"}
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7"
+                          aria-label={`复制密钥 ${k.prefix}`}
+                          onClick={() => void doCopyOne(k)}
+                        >
+                          <Copy aria-hidden />
+                          复制
+                        </Button>
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          className="h-7"
+                          aria-label={`吊销密钥 ${k.prefix}`}
+                          disabled={keyBusy}
+                          onClick={() => setConfirmRevoke(k)}
+                        >
+                          <Trash2 aria-hidden />
+                          吊销
+                        </Button>
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                className="h-8 w-48 text-xs"
+                placeholder="备注（发给谁，可空）"
+                value={newLabel}
+                aria-label="新密钥备注"
+                onChange={(e) => setNewLabel(e.target.value)}
+              />
+              <Button
+                size="sm"
+                className="h-8"
+                disabled={keyBusy}
+                onClick={() => void doCreateKey()}
+              >
+                <Plus aria-hidden />
+                新建密钥
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8"
+                disabled={keyBusy}
+                onClick={() => void doCopyKey()}
+              >
+                <Copy aria-hidden />
+                复制最新一把
+              </Button>
               <Button
                 variant="destructive"
                 size="sm"
-                className="h-9 shrink-0"
+                className="h-8"
+                disabled={keyBusy}
                 onClick={() => setConfirmRotate(true)}
               >
-                轮换密钥
+                轮换全部密钥
               </Button>
-            </CopyField>
+            </div>
           </div>
 
           {/* 完整请求地址与 Base URL 并存：Base URL 供「自己拼路径」的客户端，
@@ -372,11 +562,21 @@ export function GatewayPage() {
       <ConfirmDialog
         open={confirmRotate}
         onOpenChange={setConfirmRotate}
-        title="轮换网关密钥？"
-        description="旧密钥将立即失效，已配置的客户端需要更新为新密钥。"
-        confirmText="轮换"
+        title="轮换全部网关密钥？"
+        description="这是「一键换掉所有密钥」：全部旧密钥立即失效，所有已配置的客户端都需要更新。只想给某个客户端换一把，请用「新建密钥」+ 单独吊销旧的那把。"
+        confirmText="全部轮换"
         destructive
         onConfirm={doRegen}
+      />
+
+      <ConfirmDialog
+        open={!!confirmRevoke}
+        onOpenChange={(o) => !o && setConfirmRevoke(null)}
+        title={`吊销「${confirmRevoke?.label ?? confirmRevoke?.prefix ?? ""}」？`}
+        description="该密钥立即失效，使用它的客户端会收到 401；其他密钥不受影响。吊销是软删，会保留记录。"
+        confirmText="吊销"
+        destructive
+        onConfirm={doRevoke}
       />
     </div>
   );

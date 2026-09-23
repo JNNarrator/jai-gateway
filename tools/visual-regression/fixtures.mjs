@@ -106,12 +106,45 @@ export const fixtures = {
     ],
   },
   gateway_key_info: {
+    id: "k-main",
     prefix: "sk-jai-pnxAR",
     label: null,
     createdAt: NOW - 30 * DAY,
     lastUsedAt: NOW - 3 * 60_000,
+    revokedAt: null,
     key: "sk-jai-pnxARZHZCYBK3sCEJxOxZ8UrUCws",
   },
+  // 多密钥（D9-T6a）：三把覆盖三种展示形态 —— 有备注且用过 / 无备注从未用过 /
+  // 很久以前建的（时间列宽度与截断都要能扛住）。
+  gateway_key_list: [
+    {
+      id: "k-main",
+      prefix: "sk-jai-pnxAR",
+      label: null,
+      createdAt: NOW - 30 * DAY,
+      lastUsedAt: NOW - 3 * 60_000,
+      revokedAt: null,
+      key: "",
+    },
+    {
+      id: "k-laptop",
+      prefix: "sk-jai-Lp7Qm",
+      label: "笔记本 Claude Code",
+      createdAt: NOW - 6 * DAY,
+      lastUsedAt: NOW - 42 * 60_000,
+      revokedAt: null,
+      key: "",
+    },
+    {
+      id: "k-ci",
+      prefix: "sk-jai-Ci9Zx",
+      label: "CI 流水线",
+      createdAt: NOW - 2 * 3600_000,
+      lastUsedAt: null,
+      revokedAt: null,
+      key: "",
+    },
+  ],
   provider_list: [
     {
       id: P_MAIN,

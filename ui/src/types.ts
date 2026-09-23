@@ -66,10 +66,15 @@ export interface ModelRow {
 }
 
 export interface GatewayKeyInfo {
+  /** 密钥 id（多密钥：吊销 / 指定显示全文都按它定位） */
+  id: string;
   prefix: string;
   label?: string | null;
   createdAt: number;
   lastUsedAt?: number | null;
+  /** 非空即已吊销（列表接口不返回已吊销的，字段供 DTO 完整性） */
+  revokedAt?: number | null;
+  /** 仅 reveal / create / regenerate 携带全文；list / info 恒为空串 */
   key: string;
 }
 
