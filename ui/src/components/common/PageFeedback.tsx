@@ -3,7 +3,7 @@ import { CircleAlert, CircleCheck, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /**
- * 反馈的落点规则（2026-09-23 全局整改）。
+ * 反馈的落点规则（2026-09-24 全局整改）。
  *
  * 起因（用户反馈「有些反馈都在最顶部……还得滚到上面或者下面去看提示」）：
  * 页级 `msg/err` 横幅此前直接渲染在 `PageHeader` 之后，而触发它的按钮常在列表下方 ——

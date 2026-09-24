@@ -1,4 +1,4 @@
-// 反馈落点探针（2026-09-23 全局整改）。
+// 反馈落点探针（2026-09-24 全局整改）。
 //
 //   node tools/visual-regression/probe-feedback.mjs --size=1180x800
 //
