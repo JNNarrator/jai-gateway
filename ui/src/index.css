@@ -94,3 +94,14 @@
     cursor: pointer;
   }
 }
+
+/*
+ * toast 的关闭按钮必须可点。
+ *
+ * Toaster 整体（容器与单条）被设成 `pointer-events: none` —— 那是刻意的：toast 只做
+ * 视觉反馈、**永不吞点击**（历史 P0-3「toast 遮挡导致点不到」）。但错误 toast 现在
+ * 不自动消失、需要手动关，所以只把那个小按钮恢复成可点：其它区域依旧穿透。
+ */
+[data-sonner-toast] [data-close-button] {
+  pointer-events: auto;
+}

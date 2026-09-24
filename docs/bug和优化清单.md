@@ -1599,3 +1599,104 @@ app.windows = [ { decorations, hiddenTitle, titleBarStyle, transparent, windowEf
 
 > 备注（与 §4 ⑩ 同口径）：本轮**只改配置与门禁**，未触碰 `crates/` 与 `src-tauri/src/` 的任何 Rust 行为；
 > 工作区里 `crates/gateway-core/**` 的改动来自另一个并行工作流，与本轮无关。
+
+
+## 6. 按钮反馈的落点：从「都堆在页面顶部」到「就近 / 吸顶」（2026-09-23）
+
+> 触发来源：用户提出「按钮的 tips，现在有些反馈都在最顶部，窗口上下有滚动条。还得滚到上面或者下面去看提示。很恶心」。
+> 结论：**toast 本身没问题**（实测视口固定，见 6.1）；真问题是页内 `msg/err` 的锚点写死在
+> `PageHeader` 之后，而触发它的按钮常在列表下方。本轮把落点规则收敛成两条，并按**触发按钮的层级**
+> 自动选边，同时把「错误不自动消失」变成一条可断言的规矩。
+
+### 6.1 先排除误诊：toast 是视口固定，不是它的错
+
+`[data-sonner-toaster]` 实测（1180×800）：
+
+```
+position = fixed                 li rect = 723→776（视口高 800，完全在内）
+transform 祖先 = []（逐个祖先的 transform / filter / perspective / contain:paint / willChange 全查过）
+```
+
+⇒ 用户看到的「要滚上去看」**不是 toast**，而是**页内那条横幅**：它锚在页面顶部，触发它的按钮
+在列表下方，所以点完必须滚回顶部。
+
+### 6.2 真问题：5 个页面把反馈锚在 `PageHeader` 之后（实测距离）
+
+同类问题在 5 个页面同时存在（网关 / 同步 / MCP / 技能 / 供应商）。把页面源码回退到整改前
+（`git stash` 前后各测一次）、1180×800、**MCP 夹具扩到 10 个 server 让列表真的滚动**：
+
+| 场景 | 点击时滚动位置 | 反馈出现位置 | 结论 |
+|---|---|---|---|
+| MCP 页点**最后一行**的「列出工具」 | 404px（可滚 404） | 页面顶部（非吸顶）`top=-236` | **需滚回 272px** |
+| 同步页点「推送」（WebDAV 操作条） | 458px（可滚 969） | 页面顶部（非吸顶）`top=-330` | **需滚回 366px** |
+
+同一场景整改后：
+
+| 场景 | 点击时滚动位置 | 反馈出现位置 | 结论 |
+|---|---|---|---|
+| MCP 页点最后一行「列出工具」 | 310px | **该行内** | 不用滚 |
+| 同步页点「推送」 | 356px | **吸顶条里**（`top=125`，视口 36~800） | 不用滚 |
+
+> 说明：`ProvidersPage` 一直把反馈放在**产生它的那张卡片**里，落点本来就是对的 —— 这次只是把它
+> 推广到其余 4 个页面，并把「行级按钮」单独拆出来。
+
+### 6.3 规则：按触发按钮的层级选边 + 「每页只留一个 sticky」
+
+1. **行级按钮**（列表某一行的「列出工具」等）→ 反馈落在**该行内**（`FeedbackLine` 渲在该行卡片里），
+   key 用行 id。**不许**再汇总到页面顶部 —— 那正是被投诉的行为。
+2. **页级 / 卡片级按钮** → 反馈**吸顶**（`sticky top-0`）或并入页面已有的吸顶操作条，跟着滚动条走。
+3. **错误 `role="alert"` 一律不自动消失**（可手动关），成功 / 确认类 2.4s 自动收。
+4. **每个页面只保留一个 `sticky top-0` 区域**：两个 `top-0` 的 sticky 会叠在一起，DOM 靠后的那个
+   把前面那个盖住。同步页的 WebDAV 操作条因此从卡片内**上移**到页面顶部，与反馈条合成同一个容器；
+   同时**把 WebDAV 卡移到最前** —— 操作条作用的就是这张卡的字段，它上移后必须紧邻被作用的对象，
+   否则首屏看到的是「保存配置」孤零零挂在一张无关的卡上面（这条也是实测出来的：第一版上移后
+   首屏顺序是「操作条 → 导入导出 JSON 卡 → WebDAV 卡」，按钮与字段被整整一张卡隔开）。
+
+### 6.4 处置
+
+- 新增 `ui/src/components/common/PageFeedback.tsx`：`FeedbackLine`（行内 / 吸顶条共用，带
+  `aria-label="关闭提示"`、`data-testid`、`data-kind`、关闭钮真实盒子 24×24）、`StickyFeedback`
+  （**只给页面上没有别的吸顶条的页面**：MCP / 技能 / 供应商）、`useFeedback()`（一个 map：页级 key
+  `__page__`、行级 key = 行 id；`OK_TTL_MS = 2400` 只作用于成功类；卸载清定时器）。
+- `ui/src/lib/toast.ts`：错误改 `sonnerToast.error(msg, { duration: Infinity, closeButton: true })`。
+  `duration: Infinity` 是 sonner 明确支持的写法（它内部专门判 `toast.duration === Infinity` 并跳过
+  `setTimeout` —— 因为 `setTimeout(fn, Infinity)` 会因延迟溢出被当成 0，即立刻触发）。
+- `ui/src/index.css`：`[data-sonner-toast] [data-close-button] { pointer-events: auto; }` ——
+  `Toaster` 整体是 `pointer-events: none`（防「toast 吞掉底下控件的点击」，见 §1 的 P0-3 修复），
+  只恢复这个小圆钮。
+- 5 个页面的 `msg/err` 状态全部换成 `fb`（`pageOk` / `pageErr` / `rowOk` / `rowErr` / `dismiss`）。
+- 新增探针 `tools/visual-regression/probe-feedback.mjs`，判据集中写在 `gate.mjs`。
+
+### 6.5 判据与变异验证（负控制）
+
+判据 5 条（都读 computed style 或实测滚动 / 时长，不靠类名猜）：
+
+| # | 判据 | 怎么量 |
+|---|---|---|
+| ① | 页级反馈**吸顶** | 反馈元素往上找最近的 sticky 祖先，读它的 `position` |
+| ② | **滚到页面最底仍在视口内** | `main.scrollTop = scrollHeight` 后重读 rect，比 `clientHeight` |
+| ③ | 错误**不自动消失**且可手动关 | 等 3s 仍在 → 点「关闭提示」→ 消失 |
+| ④ | 错误 **toast 不自动消失** + 关闭钮可点 | 等 4.6s 仍在、有 `[data-close-button]`、`pointer-events === "auto"`、点它后消失 |
+| ⑤ | 行级反馈落在**该行内**、页级条为空 | 按 `[data-testid=mcp-row]` 的下标核对反馈所在行 = 被点的那一行 |
+
+**5 处分别改坏，门禁全部变红**（单尺寸单主题跑 `gate.mjs`）：
+
+| 改坏什么 | 红的判据 |
+|---|---|
+| 页级吸顶容器去掉 `sticky top-0` | ① `页级反馈吸顶`、② `页级反馈滚到底仍可见` |
+| 把 `OK_TTL_MS` 也套到错误上（`kind === "ok" \|\| kind === "err"`） | ③ `错误反馈不自动消失`、`错误反馈可手动关闭` |
+| 错误 toast 去掉 `duration: Infinity` | ④ `错误 toast 不自动消失`、`错误 toast 有关闭按钮` |
+| MCP「列出工具」结果改回 `fb.pageOk` | ⑤ `行级反馈落在该行内`、`行级反馈不再汇总到页面顶部` |
+| `index.css` 删掉 `[data-close-button]{pointer-events:auto}` | ④ `错误 toast 的关闭按钮可点`（`pointer-events=none`） |
+
+> 顺带发现并修掉一个**判据自身的不严谨**：错误 toast 那条原先只等 3s，而 `duration: Infinity`
+> 一旦被去掉，兜底链是 `Toaster` 的 2400ms → sonner 自家的 **4000ms**。只等 3s 时，**同时**去掉
+> 这两处就会假绿（4000 > 3600）。改成等 4.6s（长于兜底默认值），判据才真正成立。
+
+### 6.6 本轮顺带修掉的三处
+
+| # | 问题 | 根因 | 验证 |
+|---|---|---|---|
+| 1 | `mcp-switches.mjs` / `sync-intervals.mjs` 自 D9-T6a 起**一直崩**（切页时「等侧边栏按钮超时」） | 探针自带极简 mock 的 `default: return null` → 新增的 `gateway_key_list` 返回 `null` → `setKeys(null)` 渲染抛错 → 整棵 React 树卸载 | 补上 `gateway_key_list` / `gateway_key_rules_get` 两个 case 后，两个探针恢复通过 |
+| 2 | 密钥规则弹窗「拒绝」选中态在浅色主题**对比度 3.87 < 4.5** | `text-destructive` on `bg-destructive/10` | 改实心底 + 白字，audit 通过 |
+| 3 | 密钥前缀按钮（94×16）与规则 chip（56×22）**真实盒子 < 24px** | 只有文字撑高 | 加 `inline-flex min-h-6 items-center`，`probe-hits` 通过 |

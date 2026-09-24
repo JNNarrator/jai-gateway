@@ -410,6 +410,79 @@ for (const size of SIZES) {
     }
   }
 
+  // ── probe-feedback：按钮反馈的落点（2026-09-23 全局整改） ──
+  // 用户反馈「有些反馈都在最顶部……还得滚到上面或者下面去看提示」。判据是**位置与时长**，
+  // 都是可量的：吸顶条滚到底仍在视口、行级反馈落在该行内、错误不自动消失。
+  const pf = SKIP_PROBES
+    ? readJson(path.join(VR, `out-probe-feedback-${size}.json`))
+    : runProbe(`probe-feedback --size=${size}`, "probe-feedback.mjs", `out-probe-feedback-${size}.json`);
+  if (!pf) {
+    fail("反馈落点 probe-feedback", size, "未产出结果文件（探针未跑或崩溃）");
+  } else {
+    const where = `${size} 反馈落点`;
+    const top = pf.pageFeedbackAtTop;
+    // ① 页级反馈必须**吸顶**：不是看类名，是读 computed style
+    if (!top?.present) {
+      fail("页级反馈出现在吸顶条里", where, "页级错误没有渲染出反馈条");
+    } else if (top.stickyPosition !== "sticky") {
+      fail("页级反馈吸顶", where, `反馈所在容器 position=${top.stickyPosition}（期望 sticky）`);
+    }
+    // ② 滚到页面最底后仍在视口内 —— 这才是「不用滚回去看提示」的直接证明
+    if (!pf.pageFeedbackAtBottom?.inView) {
+      fail(
+        "页级反馈滚到底仍可见",
+        where,
+        `滚到 ${pf.scrolled?.scrollH}/${pf.scrolled?.clientH} 后反馈条 top=${pf.pageFeedbackAtBottom?.top} bottom=${pf.pageFeedbackAtBottom?.bottom}（视口高 ${pf.pageFeedbackAtBottom?.viewportH}）`,
+      );
+    }
+    // ③ 错误**不自动消失**（成功类是 2.4s），且能手动关
+    if (!pf.pageFeedbackAfter3s?.present) {
+      fail("错误反馈不自动消失", where, "等 3s 后页级错误自己没了（上游报错原文往往看不完）");
+    }
+    if (!pf.dismissWorks?.clicked || pf.pageFeedbackDismissed?.present) {
+      fail("错误反馈可手动关闭", where, `点「关闭提示」后仍存在=${pf.pageFeedbackDismissed?.present}`);
+    }
+    // ④ 错误 toast 同理：不自动消失 + 关闭钮**可点**
+    if (!pf.toastNow?.present) {
+      fail("错误 toast 能出现", where, "复制失败没有弹错误 toast");
+    } else {
+      if (!pf.toastAfterWait?.present) {
+        fail("错误 toast 不自动消失", where, "等 4.6s 后错误 toast 自己没了（兜底链：Toaster 2400ms → sonner 4000ms）");
+      }
+      if (!pf.toastNow.hasClose) {
+        fail("错误 toast 有关闭按钮", where, "错误 toast 没有关闭按钮");
+      } else if (pf.toastNow.closePointerEvents !== "auto") {
+        fail(
+          "错误 toast 的关闭按钮可点",
+          where,
+          `关闭按钮 pointer-events=${pf.toastNow.closePointerEvents}（Toaster 整体是 none，只有这个小钮该被恢复成 auto）`,
+        );
+      }
+      if (pf.toastCloseClicked && pf.toastAfterClose?.present) {
+        fail("错误 toast 点关后消失", where, "点了关闭按钮 toast 还在");
+      }
+    }
+    // ⑤ 行级反馈落在**触发它的那一行**里，且不许再汇总到页级吸顶条
+    const rf = pf.rowFeedback;
+    if (rf?.feedbackRowIdx !== pf.targetIdx) {
+      fail(
+        "行级反馈落在该行内",
+        where,
+        `点了第 ${pf.targetIdx} 行（共 ${rf?.rowCount} 行），反馈却出现在第 ${rf?.feedbackRowIdx} 行`,
+      );
+    }
+    if ((rf?.pageLevelCount ?? -1) !== 0) {
+      fail(
+        "行级反馈不再汇总到页面顶部",
+        where,
+        `页级吸顶条同时有 ${rf?.pageLevelCount} 条（行级反馈应只在该行内）`,
+      );
+    }
+    if (pf.errors?.length) {
+      fail("反馈落点页无报错", where, pf.errors.slice(0, 3).join(" | "));
+    }
+  }
+
   // ── probe-endpoint：渠道草稿端点探测面板（D9-T1） ──
   // 探测面板的结论行是**点击后**才出现的，audit/fold 都不会点到它，所以单独一条探针。
   const pe = SKIP_PROBES

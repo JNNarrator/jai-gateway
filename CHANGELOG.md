@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **按钮反馈的落点全局整改**（用户反馈「按钮的 tips……有些反馈都在最顶部，窗口上下有滚动条。
+  还得滚到上面或者下面去看提示」）。先量后改，结论是**不是 toast 的错**：`[data-sonner-toaster]`
+  实测 `position: fixed`、单条 rect `723→776`（视口 800）、无 `transform` 祖先 —— toast 永远在视口里。
+  真问题是 5 个页面把页级 `msg/err` 直接渲染在 `PageHeader` 之后，而触发它的按钮常在列表下方；
+  右下角的 toast 又在另一个对角，视线来回跳。（`ProvidersPage` 早就把反馈放在产生它的卡片里，
+  是对的，只是没推广开。）
+
+  规则收敛成两条，按**触发按钮的层级**决定落点：
+
+  - **行级按钮**（列表某一行的「列出工具」等）→ 反馈落在**该行内**；
+  - **页级 / 卡片级按钮** → 反馈**吸顶**（`sticky top-0`），跟着滚动条走；
+  - 错误（`role="alert"`）一律**不自动消失**、可手动关；成功 / 确认类 2.4s 自动收。
+
+  实测（1180×800，整改前后各测一次；MCP 夹具扩到 10 个 server 让列表真的滚动）：
+
+  | 场景 | 整改前 | 整改后 |
+  |---|---|---|
+  | MCP 页点**最后一行**的「列出工具」 | 点击时已滚 404px，反馈在**页面顶部（非吸顶）**→ **需滚回 272px** | 落在**该行内**，不用滚 |
+  | 同步页点「推送」（WebDAV 操作条） | 点击时已滚 458px，反馈在**页面顶部** → **需滚回 366px** | 反馈与操作条合并**吸顶**，不用滚 |
+
+  改动：
+  - 新增 `ui/src/components/common/PageFeedback.tsx`：`FeedbackLine`（行内与吸顶条共用，带关闭按钮）、
+    `StickyFeedback`（只给页面上没有别的吸顶条的页面）、`useFeedback()`（页级 key `__page__`，
+    行级 key = 行 id；错误无 TTL，成功 2.4s）。**每个页面只保留一个 `sticky top-0` 区域** ——
+    两个 `top-0` 的 sticky 会叠、DOM 靠后的压掉前面那个。为此同步页的 WebDAV 操作条从卡片内
+    **上移**到页面顶部与反馈条合并（实测：滚到最底 915px 时操作条仍在视口内，且页面上
+    `position: sticky` 的元素**恰好 1 个**），并把 **WebDAV 卡移到最前** —— 操作条作用的就是
+    这张卡的字段，操作条上移后它必须紧邻被作用的对象，否则首屏看到的是「保存配置」孤零零挂在
+    一张无关的卡上面。
+  - `ui/src/lib/toast.ts`：错误 toast 改 `duration: Infinity` + `closeButton: true` ——
+    上游报错原文往往是一大段 JSON/HTML，2.4s 看不完，等用户去查问题时它已经没了。
+    `ui/src/index.css` 单独把 `[data-close-button]` 恢复成 `pointer-events: auto`
+    （`Toaster` 整体是 `none`，用来防「toast 吞掉底下的点击」）。
+  - 5 个页面（网关 / 同步 / MCP / 技能 / 供应商）的 `msg/err` 全部改为就近或吸顶。
+  - 新增探针 `tools/visual-regression/probe-feedback.mjs` + `gate.mjs` 判据 5 条，且 5 处
+    **分别改坏实测必红**（见 `docs/bug和优化清单.md` §6.5）。
+
 ## [0.4.1] - 2026-09-23
 
 ### Changed

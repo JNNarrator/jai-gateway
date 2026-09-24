@@ -5,6 +5,7 @@ import type { SkillRow } from "../types";
 import { toast } from "../lib/toast";
 import { copyText } from "../lib/clipboard";
 import { PageHeader } from "@/components/common/PageHeader";
+import { StickyFeedback, useFeedback } from "@/components/common/PageFeedback";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
@@ -24,8 +25,8 @@ import { Textarea } from "@/components/ui/textarea";
 
 export function SkillsPage() {
   const [list, setList] = useState<SkillRow[]>([]);
-  const [err, setErr] = useState("");
-  const [msg, setMsg] = useState("");
+  // 反馈落点：页级吸顶（本页没有别的吸顶条，用 StickyFeedback）——见 PageFeedback 文件头。
+  const fb = useFeedback();
   const [dialog, setDialog] = useState<
     { mode: "create" } | { mode: "edit"; row: SkillRow } | null
   >(null);
@@ -41,13 +42,15 @@ export function SkillsPage() {
   }
   useEffect(() => {
     refresh()
-      .catch((e) => setErr(String(e)))
+      .catch((e) => fb.pageErr(String(e)))
       .finally(() => setLoading(false));
+    // 只在挂载时跑一次：fb 的方法每次渲染都是新引用，进依赖会无限拉取
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** 成功类短提示（自动收）走这里；错误请用 `fb.pageErr`（不自动消失）。 */
   function flash(text: string) {
-    setMsg(text);
-    setTimeout(() => setMsg(""), 2000);
+    fb.pageOk(text);
   }
 
   function toggleSelect(id: string) {
@@ -83,31 +86,31 @@ export function SkillsPage() {
   }
 
   async function act(fn: () => Promise<unknown>) {
-    setErr("");
+    fb.clearPage();
     try {
       await fn();
       await refresh();
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     }
   }
 
   async function importFile(file: File) {
     if (!file.name.toLowerCase().endsWith(".zip")) {
-      setErr("请选择 ZIP 文件");
+      fb.pageErr("请选择 ZIP 文件");
       return;
     }
     setImporting(true);
-    setErr("");
-    setMsg("");
+    fb.clearPage();
+    fb.clearPage();
     try {
       const buf = await file.arrayBuffer();
       const data = Array.from(new Uint8Array(buf));
       const n = await api.skillImportZip(data);
-      setMsg(`已从 ${file.name}（${(file.size / 1024).toFixed(1)} KB）导入 ${n} 个技能`);
+      fb.pageOk(`已从 ${file.name}（${(file.size / 1024).toFixed(1)} KB）导入 ${n} 个技能`);
       await refresh();
     } catch (e2) {
-      setErr(String(e2));
+      fb.pageErr(String(e2));
     } finally {
       setImporting(false);
     }
@@ -190,19 +193,7 @@ export function SkillsPage() {
         }
       />
 
-      {err && (
-        <div
-          role="alert"
-          className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-        >
-          {err}
-        </div>
-      )}
-      {msg && (
-        <div className="rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-primary">
-          {msg}
-        </div>
-      )}
+      <StickyFeedback feedback={fb.page} onDismiss={fb.clearPage} />
 
       {selected.size > 0 && (
         <div className="flex flex-wrap items-center gap-2 rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-primary">

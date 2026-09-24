@@ -6,6 +6,7 @@ import { toast } from "../lib/toast";
 import { copyText } from "../lib/clipboard";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/common/PageHeader";
+import { FeedbackLine, StickyFeedback, useFeedback } from "@/components/common/PageFeedback";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
@@ -69,8 +70,9 @@ function envKeySummary(env: string): string {
 
 export function McpPage() {
   const [list, setList] = useState<McpServerRow[]>([]);
-  const [msg, setMsg] = useState("");
-  const [err, setErr] = useState("");
+  // 反馈落点：页级吸顶（本页没有别的吸顶条，用 StickyFeedback）；
+  // 行级（「列出工具」/ 开关）落**该行内** —— 见 PageFeedback 的文件头。
+  const fb = useFeedback();
   const [dialog, setDialog] = useState<
     { mode: "create" } | { mode: "edit"; row: McpServerRow } | { mode: "import" } | null
   >(null);
@@ -82,17 +84,22 @@ export function McpPage() {
   }
   useEffect(() => {
     refresh()
-      .catch((e) => setErr(String(e)))
+      .catch((e) => fb.pageErr(String(e)))
       .finally(() => setLoading(false));
+    // 只在挂载时跑一次：fb 的方法每次渲染都是新引用，进依赖会无限拉取
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function act(fn: () => Promise<unknown>) {
-    setErr("");
+  /** `rowId` 给了就把错误落到**那一行**，否则落到页级吸顶条。 */
+  async function act(fn: () => Promise<unknown>, rowId?: string) {
+    if (rowId) fb.dismiss(rowId);
+    else fb.clearPage();
     try {
       await fn();
       await refresh();
     } catch (e) {
-      setErr(String(e));
+      if (rowId) fb.rowErr(rowId, String(e));
+      else fb.pageErr(String(e));
     }
   }
 
@@ -133,19 +140,7 @@ export function McpPage() {
         }
       />
 
-      {err && (
-        <div
-          role="alert"
-          className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-        >
-          {err}
-        </div>
-      )}
-      {msg && (
-        <div className="rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm break-all text-primary">
-          {msg}
-        </div>
-      )}
+      <StickyFeedback feedback={fb.page} onDismiss={fb.clearPage} />
 
       {loading ? (
         <SkeletonList rows={3} />
@@ -181,6 +176,8 @@ export function McpPage() {
         {list.map((m) => (
           <div
             key={m.id}
+            data-testid="mcp-row"
+            data-id={m.id}
             className="rounded-lg border bg-card p-4 text-card-foreground shadow-sm"
           >
             <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -190,7 +187,7 @@ export function McpPage() {
                     <label className="flex cursor-pointer items-center gap-1.5">
                       <Switch
                         checked={m.enabled}
-                        onCheckedChange={(v) => act(() => api.mcpSetEnabled(m.id, v))}
+                        onCheckedChange={(v) => act(() => api.mcpSetEnabled(m.id, v), m.id)}
                         aria-label={`启用/停用 ${m.name}`}
                       />
                       <span className="text-xs text-muted-foreground">
@@ -207,7 +204,7 @@ export function McpPage() {
                     <label className="flex cursor-pointer items-center gap-1.5">
                       <Switch
                         checked={m.proxyAllowed}
-                        onCheckedChange={(v) => act(() => api.mcpSetProxyAllowed(m.id, v))}
+                        onCheckedChange={(v) => act(() => api.mcpSetProxyAllowed(m.id, v), m.id)}
                         aria-label={`允许代理执行 ${m.name}`}
                       />
                       <span
@@ -292,12 +289,15 @@ export function McpPage() {
                   onClick={() =>
                     act(async () => {
                       const tools = await api.mcpToolsList(m.id);
-                      setMsg(
+                      // 结果落在**这一行**里：此前汇总到页面顶部，点列表下方的行
+                      // 必须滚回顶部才看得到
+                      fb.rowOk(
+                        m.id,
                         tools.length
-                          ? `${m.name} 工具：${tools.map((t) => t.name).join("、")}`
-                          : `${m.name} 未暴露工具`,
+                          ? `工具：${tools.map((t) => t.name).join("、")}`
+                          : "未暴露工具",
                       );
-                    })
+                    }, m.id)
                   }
                 >
                   <ListTree aria-hidden />
@@ -326,6 +326,14 @@ export function McpPage() {
                 </Button>
               </div>
             </div>
+            {/* 行级反馈：落在**产生它的这一行**里（此前汇总到页面顶部，
+                点列表下方的「列出工具」必须滚回顶部才看得到） */}
+            <FeedbackLine
+              feedback={fb.row(m.id)}
+              onDismiss={() => fb.dismiss(m.id)}
+              testId="mcp-row-feedback"
+              className="mt-2"
+            />
           </div>
         ))}
         </TooltipProvider>
@@ -336,7 +344,7 @@ export function McpPage() {
           onClose={() => setDialog(null)}
           onDone={(report) => {
             setDialog(null);
-            setMsg(
+            fb.pageOk(
               `导入完成：新增 ${report.imported}，更新 ${report.updated}${
                 report.skipped.length ? `，跳过 ${report.skipped.length}` : ""
               }`,
@@ -351,8 +359,7 @@ export function McpPage() {
           onClose={() => setDialog(null)}
           onDone={() => {
             setDialog(null);
-            setMsg("MCP Server 已保存");
-            setTimeout(() => setMsg(""), 2000);
+            fb.pageOk("MCP Server 已保存");
             refresh();
           }}
         />

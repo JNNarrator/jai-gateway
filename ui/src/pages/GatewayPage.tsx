@@ -24,6 +24,7 @@ import { CopyField } from "@/components/common/CopyField";
 import { StatusBadge } from "@/components/common/StatusBadge";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { KeyRulesDialog } from "@/components/common/KeyRulesDialog";
+import { FeedbackLine, useFeedback } from "@/components/common/PageFeedback";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -73,7 +74,8 @@ export function GatewayPage() {
   /** 已配过规则的密钥 id 集合 —— 列表上给个状态提示，避免用户忘了配过 */
   const [limitedKeys, setLimitedKeys] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
+  // 页级反馈吸顶（见 PageFeedback 的文件头）：本页已有吸顶操作条，反馈并进同一个容器。
+  const fb = useFeedback();
   const [confirmRotate, setConfirmRotate] = useState(false);
   const [health, setHealth] = useState<HealthSummary | null>(null);
 
@@ -102,7 +104,7 @@ export function GatewayPage() {
     try {
       setStatus(await api.status());
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     }
   }
 
@@ -135,7 +137,7 @@ export function GatewayPage() {
       );
       setLimitedKeys(flags);
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     }
   };
 
@@ -152,11 +154,11 @@ export function GatewayPage() {
 
   async function toggle(run: boolean) {
     setBusy(true);
-    setErr("");
+    fb.clearPage();
     try {
       setStatus(run ? await api.start() : await api.stop());
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     } finally {
       setBusy(false);
     }
@@ -305,51 +307,46 @@ export function GatewayPage() {
           （页级主操作 + 吸顶条内按钮都算；不靠类名/文本猜）。 */}
       <div
         data-slot="page-actions"
-        className="sticky top-0 z-10 -mx-2 flex flex-wrap items-center gap-2 border-b border-border/60 bg-card px-2 py-3"
+        className="sticky top-0 z-10 -mx-2 space-y-2 border-b border-border/60 bg-card px-2 py-3"
       >
-        {status?.running ? (
-          // 「停止」是可恢复动作，不该和「吊销 / 轮换」抢同一个实心红（见 DANGER_OUTLINE）
+        <div className="flex flex-wrap items-center gap-2">
+          {status?.running ? (
+            // 「停止」是可恢复动作，不该和「吊销 / 轮换」抢同一个实心红（见 DANGER_OUTLINE）
+            <Button
+              variant="outline"
+              className={DANGER_OUTLINE}
+              disabled={busy}
+              onClick={() => toggle(false)}
+            >
+              <Square aria-hidden />
+              停止
+            </Button>
+          ) : (
+            <Button disabled={busy} onClick={() => toggle(true)}>
+              <Play aria-hidden />
+              启动
+            </Button>
+          )}
           <Button
             variant="outline"
-            className={DANGER_OUTLINE}
             disabled={busy}
-            onClick={() => toggle(false)}
+            onClick={() => void doCopyEndpoints()}
+            data-testid="gateway-copy-endpoints"
           >
-            <Square aria-hidden />
-            停止
+            <Copy aria-hidden />
+            复制接入信息
           </Button>
-        ) : (
-          <Button disabled={busy} onClick={() => toggle(true)}>
-            <Play aria-hidden />
-            启动
+          <Button variant="outline" disabled={busy} onClick={() => void doCopyMcpConfig()}>
+            <Copy aria-hidden />
+            复制 MCP 配置
           </Button>
-        )}
-        <Button
-          variant="outline"
-          disabled={busy}
-          onClick={() => void doCopyEndpoints()}
-          data-testid="gateway-copy-endpoints"
-        >
-          <Copy aria-hidden />
-          复制接入信息
-        </Button>
-        <Button variant="outline" disabled={busy} onClick={() => void doCopyMcpConfig()}>
-          <Copy aria-hidden />
-          复制 MCP 配置
-        </Button>
-        <span className="ml-auto font-mono text-xs text-muted-foreground">
-          127.0.0.1:{port}
-        </span>
-      </div>
-
-      {err && (
-        <div
-          role="alert"
-          className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-        >
-          {err}
+            <span className="ml-auto font-mono text-xs text-muted-foreground">
+              127.0.0.1:{port}
+            </span>
         </div>
-      )}
+        {/* 页级反馈吸顶：跟着滚动条走 —— 点页面下方的按钮时提示仍钉在顶部 */}
+        <FeedbackLine feedback={fb.page} onDismiss={fb.clearPage} />
+      </div>
 
       {health?.checkedAtMs != null &&
         (health.down.length > 0 ? (

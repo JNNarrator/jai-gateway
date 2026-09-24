@@ -22,9 +22,10 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
           而下方的 toastOptions 把文字色写死为 var(--foreground)——暗色主题下就是
           「近白字 + 浅绿底」= 对比度 1.01，成功提示完全不可读（视觉回归审计实测）。
           位置用 bottom-right：bottom-center 会盖住视口底部中央的表格行/表单按钮。
-          pointer-events:none 让 toast 只做视觉反馈、永不吞点击（容器 ol 与单条 li 都设）；
-          若将来要加可点击的 toast action，需单独把该条设为 pointerEvents:auto，
-          并确保它不覆盖页面主操作区。 */}
+          pointer-events:none 让 toast 只做视觉反馈、永不吞点击（容器 ol 与单条 li 都设）。
+          **例外**：错误 toast 不自动消失、需要一个关闭按钮，故在 index.css 里单独把
+          `[data-close-button]` 恢复成 pointer-events:auto（只有那个 20×20 的小圆钮可点，
+          其余区域依旧穿透，不会挡住页面主操作区）。 */}
       <Toaster
         position="bottom-right"
         richColors

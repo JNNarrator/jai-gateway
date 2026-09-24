@@ -18,6 +18,7 @@ import { toast } from "../lib/toast";
 import { fmtClock } from "../lib/format";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/common/PageHeader";
+import { StickyFeedback, useFeedback } from "@/components/common/PageFeedback";
 import { SkeletonList } from "@/components/common/SkeletonList";
 import { EmptyState } from "@/components/common/EmptyState";
 import { EffortLevelsEditor } from "@/components/common/EffortLevelsEditor";
@@ -129,7 +130,10 @@ type FormValues = z.infer<typeof createSchema>;
 export function ProvidersPage() {
   const [list, setList] = useState<ProviderDto[]>([]);
   const [busy, setBusy] = useState("");
+  // 卡片内的反馈（`ProvidersPage` 一直是这么做的 —— 反馈落在产生它的那张卡里，
+  // 是本轮全局整改的样板）；页级反馈（列表加载失败等）走吸顶条。
   const [msg, setMsg] = useState<{ id: string; ok: boolean; text: string } | null>(null);
+  const fb = useFeedback();
   const [dialog, setDialog] = useState<
     { mode: "create" } | { mode: "edit"; p: ProviderDto } | null
   >(null);
@@ -141,7 +145,7 @@ export function ProvidersPage() {
   }
   useEffect(() => {
     refresh()
-      .catch((e) => setMsg({ id: "", ok: false, text: String(e) }))
+      .catch((e) => fb.pageErr(String(e)))
       .finally(() => setLoading(false));
   }, []);
 
@@ -171,14 +175,7 @@ export function ProvidersPage() {
         }
       />
 
-      {msg && !msg.id && (
-        <div
-          role="alert"
-          className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-        >
-          {msg.text}
-        </div>
-      )}
+      <StickyFeedback feedback={fb.page} onDismiss={fb.clearPage} />
 
       {loading ? (
         <SkeletonList rows={3} />

@@ -16,6 +16,7 @@ import type {
 import { CopyField } from "@/components/common/CopyField";
 import { toast } from "../lib/toast";
 import { PageHeader } from "@/components/common/PageHeader";
+import { FeedbackLine, useFeedback } from "@/components/common/PageFeedback";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import {
   Dialog,
@@ -111,8 +112,8 @@ export function SyncPage() {
     useState<WebDavBackupItem | null>(null);
   const [pushBlockInfo, setPushBlockInfo] = useState("");
   const [pushDiff, setPushDiff] = useState<PushDiffDetailDto | null>(null);
-  const [msg, setMsg] = useState("");
-  const [err, setErr] = useState("");
+  // 页级反馈吸顶（见 PageFeedback 文件头）：本页已有吸顶操作条，反馈并进同一个容器。
+  const fb = useFeedback();
   const [busy, setBusy] = useState("");
   const [confirmImport, setConfirmImport] = useState(false);
   const [overwriteInfo, setOverwriteInfo] = useState("");
@@ -158,7 +159,7 @@ export function SyncPage() {
     try {
       setBackups(await api.webdavBackupsList());
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
       setBackups([]);
     } finally {
       setLoadingBackups(false);
@@ -167,16 +168,16 @@ export function SyncPage() {
 
   async function doBackupRestore(b: WebDavBackupItem) {
     setBusy("backup-restore");
-    setErr("");
+    fb.clearPage();
     setConfirmRestoreBackup(null);
     try {
       const r = await api.webdavBackupRestore(b.name);
-      setMsg(
+      fb.pageOk(
         `已从远端备份 ${b.name} 恢复：供应商 ${r.providersImported}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
       );
       void loadBackups();
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     } finally {
       setBusy("");
     }
@@ -184,29 +185,29 @@ export function SyncPage() {
 
   async function doBackupDelete(b: WebDavBackupItem) {
     setBusy("backup-delete");
-    setErr("");
+    fb.clearPage();
     setConfirmDeleteBackup(null);
     try {
       await api.webdavBackupDelete(b.name);
-      setMsg(`已删除远端备份 ${b.name}`);
+      fb.pageOk(`已删除远端备份 ${b.name}`);
       void loadBackups();
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     } finally {
       setBusy("");
     }
   }
 
   async function doImport() {
-    setErr("");
+    fb.clearPage();
     setConfirmImport(false);
     try {
       const r = await api.configImport(importText, false);
-      setMsg(
+      fb.pageOk(
         `导入完成：新增供应商 ${r.providersImported}，重复跳过 ${r.providersSkippedDuplicate}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
       );
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     }
   }
 
@@ -220,14 +221,14 @@ export function SyncPage() {
         // 平台不支持打开目录时忽略
       }
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     }
   }
 
   async function saveAutoPush(next: { enabled: boolean; intervalMin: number }) {
-    setErr("");
+    fb.clearPage();
     if (!cfg.url.trim()) {
-      setErr("请先填写并保存 WebDAV 连接配置");
+      fb.pageErr("请先填写并保存 WebDAV 连接配置");
       return;
     }
     try {
@@ -240,16 +241,16 @@ export function SyncPage() {
         autoPushIntervalMin: next.intervalMin,
       });
       setAutoPush(next);
-      setMsg(next.enabled ? "自动推送已开启" : "自动推送已关闭");
+      fb.pageOk(next.enabled ? "自动推送已开启" : "自动推送已关闭");
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     }
   }
 
   async function saveAutoPull(next: { enabled: boolean; intervalMin: number }) {
-    setErr("");
+    fb.clearPage();
     if (!cfg.url.trim()) {
-      setErr("请先填写并保存 WebDAV 连接配置");
+      fb.pageErr("请先填写并保存 WebDAV 连接配置");
       return;
     }
     try {
@@ -262,17 +263,17 @@ export function SyncPage() {
         autoPullIntervalMin: next.intervalMin,
       });
       setAutoPull(next);
-      setMsg(next.enabled ? "自动拉取已开启" : "自动拉取已关闭");
+      fb.pageOk(next.enabled ? "自动拉取已开启" : "自动拉取已关闭");
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     }
   }
 
   async function saveCfg() {
-    setErr("");
+    fb.clearPage();
     const url = cfg.url.trim();
     if (!url) {
-      setErr("WebDAV 根地址不能为空");
+      fb.pageErr("WebDAV 根地址不能为空");
       return;
     }
     const normalized = url.endsWith("/") ? url : `${url}/`;
@@ -281,18 +282,17 @@ export function SyncPage() {
       setCfg({ ...cfg, url: normalized });
       const saved = await api.webdavConfigGet().catch(() => null);
       if (saved) setPw(saved.password ?? "");
-      setMsg("WebDAV 连接配置已保存");
+      fb.pageOk("WebDAV 连接配置已保存");
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     }
   }
 
   async function testWebdav() {
-    setErr("");
-    setMsg("");
+    fb.clearPage();
     const url = cfg.url.trim();
     if (!url) {
-      setErr("WebDAV 根地址不能为空");
+      fb.pageErr("WebDAV 根地址不能为空");
       return;
     }
     try {
@@ -301,36 +301,35 @@ export function SyncPage() {
         username: cfg.username,
         password: pw || null,
       });
-      setMsg(result);
+      fb.pageOk(result);
       toast("WebDAV 连接成功");
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
       toast("WebDAV 连接失败", "err");
     }
   }
 
   async function previewWebdav() {
-    setErr("");
-    setMsg("");
+    fb.clearPage();
     try {
       const r = await api.webdavPreview();
       if (r.willOverwrite) {
         setOverwriteInfo(`${r.message}。拉取将用远端配置覆盖本机。`);
         return; // 由 ConfirmDialog 决定是否拉取
       }
-      setMsg(r.message);
+      fb.pageOk(r.message);
       toast("远端与本地一致");
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     }
   }
 
   async function doPush() {
     setBusy("push");
-    setErr("");
+    fb.clearPage();
     try {
       await api.webdavPush(false);
-      setMsg("已推送到 WebDAV，推送前本地快照与远端旧版备份均已留存");
+      fb.pageOk("已推送到 WebDAV，推送前本地快照与远端旧版备份均已留存");
       void loadBackups();
       void api.webdavSnapshotInfo().then(setSnapInfo).catch(() => {});
     } catch (e) {
@@ -341,7 +340,7 @@ export function SyncPage() {
         const d = await api.webdavPushDiff().catch(() => null);
         setPushDiff(d);
       } else {
-        setErr(text);
+        fb.pageErr(text);
       }
     } finally {
       setBusy("");
@@ -352,14 +351,14 @@ export function SyncPage() {
     setPushBlockInfo("");
     setPushDiff(null);
     setBusy("push");
-    setErr("");
+    fb.clearPage();
     try {
       await api.webdavPush(true);
-      setMsg("已推送到 WebDAV（以本机为准覆盖），推送前远端旧版已留存为备份");
+      fb.pageOk("已推送到 WebDAV（以本机为准覆盖），推送前远端旧版已留存为备份");
       void loadBackups();
       void api.webdavSnapshotInfo().then(setSnapInfo).catch(() => {});
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     } finally {
       setBusy("");
     }
@@ -367,16 +366,16 @@ export function SyncPage() {
 
   async function doPull() {
     setBusy("pull");
-    setErr("");
+    fb.clearPage();
     setOverwriteInfo("");
     try {
       const r = await api.webdavPull();
-      setMsg(
+      fb.pageOk(
         `拉取并导入完成：新增供应商 ${r.providersImported}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
       );
       void loadBackups();
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     } finally {
       setBusy("");
     }
@@ -384,17 +383,17 @@ export function SyncPage() {
 
   async function doRestore() {
     setBusy("restore");
-    setErr("");
+    fb.clearPage();
     setConfirmRestore(false);
     try {
       const r = await api.webdavSnapshotRestore();
-      setMsg(
+      fb.pageOk(
         `已从快照恢复：新增供应商 ${r.providersImported}，重复跳过 ${r.providersSkippedDuplicate}，模型 ${r.modelsImported}；待补密钥：${r.missingKeys.join("、") || "无"}`,
       );
       api.webdavSnapshotInfo().then(setSnapInfo).catch(() => {});
       void loadBackups();
     } catch (e) {
-      setErr(String(e));
+      fb.pageErr(String(e));
     } finally {
       setBusy("");
     }
@@ -407,61 +406,40 @@ export function SyncPage() {
         description="在设备间迁移或备份供应商与模型配置。"
       />
 
-      {err && (
-        <div
-          role="alert"
-          className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-        >
-          {err}
+      {/* 主操作条：吸顶常驻。
+          位置从「WebDAV 卡片内部」上移到页面顶部（2026-09-23 反馈整改）：本页反馈来源
+          横跨三张卡（导出/导入在第一张、WebDAV 操作条在第二张、备份在最后一张），反馈
+          必须和它待在**同一个吸顶区**才不会互相盖住 —— 两个 `top-0` 的 sticky 会叠，
+          DOM 靠后的那个把前面那个压掉。上移也更符合它原本的目的
+          （「避免默认窗口下需要滚动上千像素才点到」）。 */}
+      <div
+        data-slot="page-actions"
+        className="sticky top-0 z-10 -mx-2 space-y-2 border-b border-border/60 bg-card px-2 py-3"
+      >
+        <div className="flex flex-wrap gap-2">
+          <Button onClick={saveCfg}>保存配置</Button>
+          <Button variant="outline" onClick={testWebdav}>
+            测试连接
+          </Button>
+          <Button variant="outline" onClick={previewWebdav}>
+            预览变更
+          </Button>
+          <Button variant="outline" disabled={busy === "push"} onClick={doPush}>
+            <CloudUpload aria-hidden />
+            {busy === "push" ? "推送中…" : "推送"}
+          </Button>
+          <Button variant="outline" disabled={busy === "pull"} onClick={doPull}>
+            <Download aria-hidden />
+            {busy === "pull" ? "拉取中…" : "拉取"}
+          </Button>
         </div>
-      )}
-      {msg && (
-        <div className="rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-foreground">
-          {msg}
-        </div>
-      )}
+        {/* 页级反馈吸顶：跟着滚动条走，不用滚回顶部看提示 */}
+        <FeedbackLine feedback={fb.page} onDismiss={fb.clearPage} />
+      </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>导入导出 JSON</CardTitle>
-          <CardDescription>
-            导出产物只含供应商与模型定义，不含任何 API Key。导入后请在「供应商」页逐项补录凭据。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <Textarea
-            rows={3}
-            className="min-h-0 font-mono text-xs"
-            value={importText}
-            onChange={(e) => setImportText(e.target.value)}
-            placeholder="粘贴从另一台设备导出的 jai-export JSON…"
-          />
-          <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={() => setConfirmImport(true)} disabled={!importText.trim()}>
-              导入
-            </Button>
-            <Button
-              variant="outline"
-              onClick={async () => {
-                try {
-                  const text = await navigator.clipboard.readText();
-                  setImportText(text);
-                  toast("已粘贴");
-                } catch {
-                  toast("无法读取剪贴板", "err");
-                }
-              }}
-            >
-              <ClipboardPaste aria-hidden />
-              粘贴
-            </Button>
-            <Button variant="outline" onClick={doExport}>
-              导出到文件
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
-
+      {/* WebDAV 卡放在最前：吸顶操作条（保存配置 / 测试连接 / 推送 / 拉取）作用的就是
+          这张卡的字段 —— 操作条上移到页面顶部后（见上），它必须紧邻被作用的对象，
+          否则首屏看到的是「保存配置」孤零零挂在一张无关的卡上面。 */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -475,28 +453,6 @@ export function SyncPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* 主操作条：置于 WebDAV 卡片顶部并吸顶，避免默认窗口下需要滚动上千像素才点到。
-              data-slot=page-actions 是探针契约（fold.mjs 据此认定本页主操作并断言首屏可达）。 */}
-          <div
-            data-slot="page-actions"
-            className="sticky top-0 z-10 -mx-6 flex flex-wrap gap-2 border-b border-border/60 bg-card px-6 py-3"
-          >
-            <Button onClick={saveCfg}>保存配置</Button>
-            <Button variant="outline" onClick={testWebdav}>
-              测试连接
-            </Button>
-            <Button variant="outline" onClick={previewWebdav}>
-              预览变更
-            </Button>
-            <Button variant="outline" disabled={busy === "push"} onClick={doPush}>
-              <CloudUpload aria-hidden />
-              {busy === "push" ? "推送中…" : "推送"}
-            </Button>
-            <Button variant="outline" disabled={busy === "pull"} onClick={doPull}>
-              <Download aria-hidden />
-              {busy === "pull" ? "拉取中…" : "拉取"}
-            </Button>
-          </div>
           {busy && (
             <div className="h-1 w-full overflow-hidden rounded bg-muted">
               <div className="h-full w-1/3 animate-pulse rounded bg-primary" />
@@ -734,6 +690,47 @@ export function SyncPage() {
                 ))}
               </ul>
             )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>导入导出 JSON</CardTitle>
+          <CardDescription>
+            导出产物只含供应商与模型定义，不含任何 API Key。导入后请在「供应商」页逐项补录凭据。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Textarea
+            rows={3}
+            className="min-h-0 font-mono text-xs"
+            value={importText}
+            onChange={(e) => setImportText(e.target.value)}
+            placeholder="粘贴从另一台设备导出的 jai-export JSON…"
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <Button onClick={() => setConfirmImport(true)} disabled={!importText.trim()}>
+              导入
+            </Button>
+            <Button
+              variant="outline"
+              onClick={async () => {
+                try {
+                  const text = await navigator.clipboard.readText();
+                  setImportText(text);
+                  toast("已粘贴");
+                } catch {
+                  toast("无法读取剪贴板", "err");
+                }
+              }}
+            >
+              <ClipboardPaste aria-hidden />
+              粘贴
+            </Button>
+            <Button variant="outline" onClick={doExport}>
+              导出到文件
+            </Button>
           </div>
         </CardContent>
       </Card>
