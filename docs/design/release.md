@@ -44,6 +44,22 @@
 - [x] Updater 签名密钥已生成并写入本地（见 §1）；CI secrets 需配置：
   - `TAURI_SIGNING_PRIVATE_KEY`：私钥文件内容（`~/.tauri/jai.key`）
   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码（`~/.tauri/jai.key.password`）
+- [x] tag 触发验证：**v0.4.2 实测**（run 35949712668，3/3 job success：Create release draft 5s、
+      Build macos-latest 7m30s、Build windows-latest 12m10s，整轮 12m21s）——
+      产物：`JAI_0.4.2_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、`JAI_0.4.2_x64-setup.exe(+.sig)`、
+      `JAI_0.4.2_x64_en-US.msi(+.sig)`、`latest.json`；`prerelease=false`。
+      同轮 `CI`（main push，run 35949708975）三个 job 全绿（Frontend build 23s /
+      Rust macos-latest 1m50s / Rust windows-latest 3m45s）。
+      **发布**：`gh release edit v0.4.2 --draft=false --latest`（`published=2026-09-24T03:15:14Z`），
+      随后 feed 校验通过：`version=0.4.2`，5 个平台键齐全（darwin-aarch64 / darwin-aarch64-app /
+      windows-x86_64 / windows-x86_64-msi / windows-x86_64-nsis），三个 URL 的资产名都带 `_0.4.2_`。
+      ⚠️ **「已触发构建的 tag 要重打」的正确姿势**（本次实测踩到，起因是本批注释/文档的日期
+      一开始写成了 09-23，与发布日不符，决定重打）：tag 一推上去 workflow 会立刻建**草稿**，
+      所以顺序必须是
+      ① `gh run cancel <run-id>`（确认 `conclusion=cancelled`）→
+      ② `gh release delete v0.4.2 --yes --cleanup-tag`（连远端 tag 一起删，否则 workflow 再次运行到
+      「建草稿」会撞重名）→ ③ `git tag -d` 清本地 → ④ 改完重新 `git tag -a` + `git push origin v0.4.2`。
+      本次重打后 Release run 与 CI run 全绿，产物与 feed 均正常。
 - [x] tag 触发验证：**v0.4.1 实测**（run 35852602856，3/3 job success：Create release draft 6s、
       Build macos-latest 10m17s、Build windows-latest 12m43s，整轮 13m）——
       产物：`JAI_0.4.1_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、`JAI_0.4.1_x64-setup.exe(+.sig)`、
