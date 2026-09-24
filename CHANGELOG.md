@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-23
+
 ### Changed
 
 - **按钮反馈的落点全局整改**（用户反馈「按钮的 tips……有些反馈都在最顶部，窗口上下有滚动条。

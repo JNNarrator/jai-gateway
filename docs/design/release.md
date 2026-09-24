@@ -4,7 +4,7 @@
 
 ## 1. 版本与产物
 
-- 版本：`src-tauri/tauri.conf.json` `"version"`（当前 `0.4.1`）
+- 版本：`src-tauri/tauri.conf.json` `"version"`（当前 `0.4.2`）
 - 产物：
   - macOS：`.dmg` / `.app`（Tauri bundle `targets: all`）
     - ⚠️ **只有 `aarch64`（Apple Silicon）**：`macos-latest` runner 已是 arm64，
