@@ -70,6 +70,35 @@ data: {\"id\":\"c4\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\
 data: {\"id\":\"c4\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12}}\n\n\
 data: [DONE]\n\n";
 
+/// 退化复读（真机形状的缩小版）：同一句话连续重复 8 遍，**跨 4 帧**下发。
+///
+/// 真机形状（见 bug 清单第 11 条）：基元律动/deepseek-flash 在 460k 上下文下把同一句话
+/// 重复 **810 遍** ≈ 8900 tokens ≈ 8192 上限。这里缩到 8 遍便于阅读，但**跨帧**这点保留 ——
+/// 探针必须能在增量流上累积才成立，单帧一次给全测不出跨帧状态。
+///
+/// 末尾用 `finish_reason:"length"` + 顶满的 `completion_tokens`：复读的典型去向就是撞上
+/// 输出预算（重复内容把预算耗尽）。
+const REPEATED_SENTENCE_LOOP: &str = "\
+data: {\"id\":\"c9\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c9\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c9\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c9\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c9\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":460817,\"completion_tokens\":8192}}\n\n\
+data: [DONE]\n\n";
+
+/// **反向控制**：内容各异的长正文 —— 绝不能被打上「退化复读」。
+///
+/// 与 `REPEATED_SENTENCE_LOOP` 配对：只证明「复读会被标」不够，还必须证明「正常长正文
+/// 不会被标」，否则判据可能只是「有正文就标」这种空洞实现。
+const VARIED_LONG_TEXT: &str = "\
+data: {\"id\":\"c10\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"第一个问题在于缓冲区没有及时刷新。\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c10\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"第二个问题在于重试预算被跨组规则吃掉了。\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c10\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"第三个问题是日志列的采集口径分了两条路径。\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c10\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"第四个问题是推送与拉取的间隔互相绑定。\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c10\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"第五个问题是健康检查的状态跃迁没有发通知。\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"c10\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":210000,\"completion_tokens\":8192}}\n\n\
+data: [DONE]\n\n";
+
 /// 把给定的 SSE 片段**逐块**吐出（每块之间 120ms），逼真流式。
 ///
 /// 逐块是刻意的：整包一次到达时，网关的 `bytes_stream()` 只会 yield 一个 chunk，
@@ -369,4 +398,59 @@ async fn passthrough_counts_tool_calls_after_text() {
         "正文在前时若见到正文就提前收工，这里会数成 0"
     );
     assert_eq!(row.error_kind, None);
+}
+
+/// 退化复读（直通路径）：同一句话被重复吐出来 → 必须**直接点名**上游在复读。
+///
+/// 此前这件事只能靠「`usage_output` 顶满上限」反推（见 bug 清单第 11 条）；本用例钉住
+/// 探针接入后 `error_kind` 给出明确结论，且直通契约（逐字节一致）不受影响。
+#[tokio::test(flavor = "multi_thread")]
+async fn passthrough_degenerate_repetition_is_flagged() {
+    let fx = fixture(&[REPEATED_SENTENCE_LOOP]).await;
+    let (status, body) = fx.post_chat_stream(chat_body(true, Some(8192))).await;
+    assert_eq!(status, 200);
+    // 直通契约：探针只读不写，客户端收到的字节与上游发出的完全一致
+    assert_eq!(body, REPEATED_SENTENCE_LOOP, "字节直通必须保持逐字节一致");
+
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200 && r.is_stream)
+        .expect("应有流式成功日志");
+    assert_eq!(row.route_mode, "passthrough");
+    assert_eq!(row.stop_reason.as_deref(), Some("max_tokens"));
+    assert_eq!(
+        row.error_kind.as_deref(),
+        Some("UpstreamDegenerateRepetition"),
+        "退化复读必须被直接点名，而不是只能靠 usage 反推"
+    );
+    let summary = row.error_summary.as_deref().unwrap_or_default();
+    assert!(summary.contains("重复"), "摘要要说明重复这件事: {summary}");
+    // 复读优先，但「同时被截断」这个事实不能丢
+    assert!(
+        summary.contains("max_output_tokens"),
+        "复读占用了主结论位，「同时被截断」也要在摘要里留一句: {summary}"
+    );
+}
+
+/// **反向控制**：内容各异的长正文不得被打上「退化复读」（判据不能是「有正文就标」）。
+#[tokio::test(flavor = "multi_thread")]
+async fn passthrough_varied_long_text_is_not_flagged_as_repetition() {
+    let fx = fixture(&[VARIED_LONG_TEXT]).await;
+    let (status, body) = fx.post_chat_stream(chat_body(true, Some(8192))).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, VARIED_LONG_TEXT);
+
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200 && r.is_stream)
+        .expect("应有流式成功日志");
+    assert_ne!(
+        row.error_kind.as_deref(),
+        Some("UpstreamDegenerateRepetition"),
+        "内容各异的长正文不是复读"
+    );
+    // 这一轮确实撞满预算：应落回原有的截断口径（证明优先级没有把旧判定吃掉）
+    assert_eq!(row.error_kind.as_deref(), Some("OutputBudgetClipped"));
 }

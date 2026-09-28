@@ -570,6 +570,224 @@ fn keep_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
     }
 }
 
+// ---------------------------------------------------------------- 退化复读探针
+
+/// 参与比较的段**最小字节数**：低于此值的段（标点、空行、`---` 分隔线、列表符号）不参与判定。
+///
+/// 理由：短段重复是**正常排版**，拿它判复读会把正常轮次全标成异常（与
+/// `truncation_diagnostic` 拒绝「只要 length + 有正文就标」同一取舍）。
+const REPETITION_MIN_UNIT_BYTES: usize = 8;
+
+/// 单个段参与比较的**字节上限**：超出只比较前缀，避免病态超长段吃内存。
+const REPETITION_MAX_UNIT_BYTES: usize = 512;
+
+/// 判定「同一段文本重复」时，允许的**段周期**上限（连续多少段构成一个重复单元）。
+///
+/// 取 4 是为了覆盖「重复单元内部本身含句末符」的情形：例如英文 `File a.rs is broken.`
+/// 会被切成 `File a` / `rs is broken` 两段，周期 = 2；中文引号内含 `。` 同理。
+/// 只做周期 1 会把这类真复读漏掉（相邻段永远交替、计数恒为 1）。
+const REPETITION_MAX_PERIOD: usize = 4;
+
+/// 一个重复单元连续出现该次数，即判为**退化复读**。
+///
+/// 取值权衡：真机故障是「同一句话重复 810 遍」（token 数与之精确吻合，见 bug 清单第 11 条），
+/// 5 次已能稳定命中；再调低会把「同一句副歌」「表格里的重复行」误判成故障。
+const REPETITION_FLAG_RUN: u32 = 5;
+
+/// **退化复读探针**：在**可见正文**上检测「同一段文本连续重复」。
+///
+/// 上游在长上下文 agentic 场景下会陷入循环、把同一句话吐几百遍，直到撞上
+/// `max_output_tokens`（2026-09-22 真机：基元律动/deepseek-flash，同一句话重复 810 遍
+/// ≈ 8900 tokens ≈ 8192 上限）。此前这件事只能靠「`usage_output` 顶满上限」**反推**，
+/// 日志里没有任何一处直接写明「上游在复读」。本探针补上这句结论。
+///
+/// 判定口径（刻意保守：**宁可漏判，绝不误判**）：
+/// - 以**段**为单位切分。全角句末符（`。！？；`）与换行**无条件**成界；ASCII 的 `.!?;`
+///   **仅当后接空白**才成界（否则 `a.rs` / `3.14` 会被切碎）。中英输出因此都可覆盖。
+/// - 段先**归一化**（去首尾空白 + 内部连续空白折叠为单空格）再比较：模型复读常只差空白。
+/// - 用**段周期 1..=[`REPETITION_MAX_PERIOD`]** 的环形窗口比较「最近 p 段 == 再往前 p 段」，
+///   取各周期中最大的连续重复次数 ⇒ 重复单元内部含句末符也能识别，不必要求周期恒为 1。
+/// - 长度 < [`REPETITION_MIN_UNIT_BYTES`] 的段**不入环**（见该常量注释）。
+///
+/// 只读：与 [`StopReasonProbe`] / [`PassthroughStreamProbe`] 同一约束 —— 一个字节都不改写，
+/// 不参与转发，绝不因为观测而拖慢或改变客户端收到的内容。
+///
+/// 已知缺口（宁可漏判）：
+/// - **无句末符的长块**复读（如反复吐一段不含标点的 JSON）扫不到：本探针靠切段成立，
+///   整块没有界就切不出段。刻意不为此发明「等长切分」—— 块偏移对不齐时会误判成相同。
+/// - **渐进漂移**复读（每次改一个词）扫不到：要求归一化后**逐字相同**。
+/// - 推理块里的复读不算（`ThinkingDelta` 不喂）：客户端看不到推理，不构成用户可见故障。
+#[derive(Default)]
+struct RepetitionProbe {
+    /// 当前尚未遇到句末符的残留文本
+    cur: String,
+    /// 最近若干段（归一化后）的环形窗口，容量 `2 * REPETITION_MAX_PERIOD`
+    segs: std::collections::VecDeque<Vec<u8>>,
+    /// 每个段周期的**连续重复次数**（下标 = 段周期；0 号不用）
+    run: [u32; REPETITION_MAX_PERIOD + 1],
+    /// 观测到的最大连续重复次数
+    max_run: u32,
+    /// 取得 `max_run` 的那个重复单元长度（写进摘要用）
+    max_run_len: usize,
+    /// 已放弃观测（单段长到不合理，疑似病态输入）
+    given_up: bool,
+}
+
+impl RepetitionProbe {
+    fn new() -> Self {
+        Self {
+            run: [0; REPETITION_MAX_PERIOD + 1],
+            ..Self::default()
+        }
+    }
+
+    /// 喂入一段**可见正文**增量。**不要**喂推理/思考内容（见结构体注释）。
+    fn feed(&mut self, text: &str) {
+        if self.given_up {
+            return;
+        }
+        self.cur.push_str(text);
+        // 单段长到不合理（无句末符的长块）：放弃观测，绝不让观测吃内存或拖累转发
+        if self.cur.len() > REPETITION_MAX_UNIT_BYTES * 8 {
+            self.given_up = true;
+            self.cur = String::new();
+            return;
+        }
+        while let Some(end) = next_unit_end(&self.cur, false) {
+            let rest = self.cur.split_off(end);
+            let unit = std::mem::replace(&mut self.cur, rest);
+            self.observe(&unit);
+        }
+    }
+
+    /// 结束观测，返回 `(最大连续重复次数, 重复单元字节数)`；未达阈值返回 `None`。
+    fn finish(&mut self) -> Option<(u32, usize)> {
+        // 末尾不完整的段也参与：上游被截断时，最后一段往往还没等到句末符
+        let tail = std::mem::take(&mut self.cur);
+        if !tail.is_empty() {
+            self.observe(&tail);
+        }
+        (self.max_run >= REPETITION_FLAG_RUN).then_some((self.max_run, self.max_run_len))
+    }
+
+    fn observe(&mut self, unit: &str) {
+        let norm = normalize_unit(unit);
+        if norm.len() < REPETITION_MIN_UNIT_BYTES {
+            return; // 短段不入环（见常量注释）
+        }
+        self.segs
+            .push_back(norm.as_bytes()[..norm.len().min(REPETITION_MAX_UNIT_BYTES)].to_vec());
+        while self.segs.len() > 2 * REPETITION_MAX_PERIOD {
+            self.segs.pop_front();
+        }
+        // 环形窗口排成单段切片后再比较（`VecDeque::range` 只给迭代器，不能直接 `==`）
+        let segs: &[Vec<u8>] = self.segs.make_contiguous();
+        let n = segs.len();
+        for p in 1..=REPETITION_MAX_PERIOD {
+            if n < 2 * p {
+                self.run[p] = 1;
+                continue;
+            }
+            let same = segs[n - p..n] == segs[n - 2 * p..n - p];
+            self.run[p] = if same {
+                self.run[p].saturating_add(1)
+            } else {
+                1
+            };
+            if self.run[p] > self.max_run {
+                self.max_run = self.run[p];
+                self.max_run_len = segs[n - p..n].iter().map(Vec::len).sum();
+            }
+        }
+    }
+}
+
+/// 取 `s` 中**第一个**段的结束位置（返回终止符之后的字节下标）；没有则 `None`。
+///
+/// `at_eof` 为真时，末尾的 ASCII `.!?;` 也算成界（否则最后一段永远切不出来）。
+fn next_unit_end(s: &str, at_eof: bool) -> Option<usize> {
+    let mut it = s.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        // 全角句末符与换行：无条件成界
+        if matches!(c, '。' | '！' | '？' | '；' | '\n' | '\r') {
+            return Some(i + c.len_utf8());
+        }
+        // ASCII 句末符：仅后接空白（或已到末尾）才成界，避免切碎 `a.rs` / `3.14`
+        if matches!(c, '.' | '!' | '?' | ';') {
+            match it.peek() {
+                Some((_, n)) if n.is_whitespace() => return Some(i + c.len_utf8()),
+                None if at_eof => return Some(i + c.len_utf8()),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// 段归一化：去首尾空白 + 内部连续空白折叠为单空格（模型复读常只差空白）。
+fn normalize_unit(unit: &str) -> String {
+    let mut out = String::with_capacity(unit.len());
+    let mut pending_space = false;
+    for c in unit.chars() {
+        if c.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// **退化复读诊断**：命中即落 `error_kind = "UpstreamDegenerateRepetition"`。
+///
+/// 与 [`truncation_diagnostic`] 的关系：**复读优先**。复读是「为什么会被截断」的上游侧
+/// 根因（重复内容把预算耗尽），比「被截断」本身更接近可行动的结论；「被截断」这件事仍由
+/// `stop_reason` 一列承载，且本摘要会显式提一句。
+///
+/// 不改 HTTP 状态码（上游确实返回了 200），与 `OutputBudgetClipped` / `SseParseWarn` 同档。
+fn repetition_diagnostic(
+    repetition: Option<(u32, usize)>,
+    stop_reason: Option<&str>,
+) -> Option<(&'static str, String)> {
+    let (run, unit_len) = repetition?;
+    let also = match stop_reason {
+        Some("max_tokens") => "本轮同时被 max_output_tokens 截断（重复内容把预算耗尽了）。",
+        Some("safety") => "本轮同时命中内容安全拦截。",
+        _ => "",
+    };
+    Some((
+        "UpstreamDegenerateRepetition",
+        format!(
+            "上游在可见正文里出现**同一段文本连续重复 {run} 次**（每个重复单元约 {unit_len} 字节）\
+             —— 退化复读，模型在长上下文下陷入循环。{also}\
+             这是**上游模型行为**，网关不做内容改写；\
+             处理：压缩/缩短上下文后重试，或换用其他渠道。"
+        ),
+    ))
+}
+
+/// 本轮出站质量诊断的统一入口：**复读优先，其次截断**（理由见 [`repetition_diagnostic`]）。
+fn output_diagnostic(
+    repetition: Option<(u32, usize)>,
+    stop_reason: Option<&str>,
+    saw_visible_output: bool,
+    output_budget: Option<u32>,
+    output_tokens: u64,
+) -> Option<(&'static str, String)> {
+    repetition_diagnostic(repetition, stop_reason).or_else(|| {
+        truncation_diagnostic(
+            stop_reason,
+            saw_visible_output,
+            output_budget,
+            output_tokens,
+        )
+    })
+}
+
 /// **截断诊断**：`stop_reason` 属截断类时，判断这一轮的截断有没有真的伤到用户。
 ///
 /// 两档，同一份判定、同一条日志行（不新增行类型、不动响应头、不改 HTTP 状态码）：
@@ -686,6 +904,8 @@ struct PassthroughStreamProbe {
     tool_call_ids: std::collections::HashSet<String>,
     /// 已放弃观测（病态输入）
     given_up: bool,
+    /// 退化复读探针（只喂可见正文；复用本探针已解析出的 `TextDelta`，不额外解析一次）
+    repetition: RepetitionProbe,
 }
 
 impl PassthroughStreamProbe {
@@ -696,6 +916,7 @@ impl PassthroughStreamProbe {
             seen_visible: false,
             tool_call_ids: std::collections::HashSet::new(),
             given_up: false,
+            repetition: RepetitionProbe::new(),
         }
     }
 
@@ -745,6 +966,9 @@ impl PassthroughStreamProbe {
                     if !text.trim().is_empty() {
                         self.seen_visible = true;
                     }
+                    // 退化复读检测**只喂可见正文**（不喂 ThinkingDelta）：见 RepetitionProbe。
+                    // 复用本探针已经做过的逐帧解析，不额外付一次 JSON 解析成本。
+                    self.repetition.feed(text);
                 }
                 Ev::ToolCallStart { id, .. } => {
                     self.seen_visible = true;
@@ -3016,7 +3240,15 @@ fn deliver_synthesized_stream(
         Block::ToolUse { .. } => true,
         _ => false,
     });
-    let (diag_kind, diag_summary) = truncation_diagnostic(
+    // 退化复读：非流式没有增量，整包正文一次喂完（探针按段切分，同理成立）。
+    let mut repetition = RepetitionProbe::new();
+    for b in &resp.output {
+        if let Block::Text { text } = b {
+            repetition.feed(text);
+        }
+    }
+    let (diag_kind, diag_summary) = output_diagnostic(
+        repetition.finish(),
         Some(resp.stop_reason.as_log_str()),
         saw_visible_output,
         output_budget,
@@ -3143,6 +3375,9 @@ async fn convert_streaming_response(
             // `last_stop_reason` 一起判定「零可见输出的截断轮」（见
             // `empty_truncation_diagnostic`）。
             let mut saw_visible_output = false;
+            // 退化复读探针：只喂**可见正文**（`TextDelta`），不喂 `ThinkingDelta`。
+            // 见 [`RepetitionProbe`]。
+            let mut repetition = RepetitionProbe::new();
             // 挂起的 Finish：上游常把 stop_reason 与 usage 拆成两帧（先 finish_reason 帧、
             // 后 usage 末帧），且 usage 帧可能带非空 choices。若逐帧渲染，客户端会先收到一个
             // usage 全 0 的收尾帧，第二帧再渲染就是重复的 completed/message_stop。故挂起
@@ -3311,6 +3546,11 @@ async fn convert_streaming_response(
                                     tool_call_ids.insert(id.clone());
                                 }
                             }
+                            // 退化复读探针：**每次**正文增量都要喂（不受上面
+                            // 「只记一次 true」的门影响，否则复读量会被少算）。
+                            if let crate::codec::ir::StreamEvent::TextDelta { text } = &ev {
+                                repetition.feed(text);
+                            }
                             // Finish 不立刻下发：挂起合并（见 pending_finish 注释）。
                             // 一旦下发，客户端就会先看到一个 usage 全 0 的收尾帧，
                             // 后续真实 usage 只能变成重复的 completed/message_stop。
@@ -3360,7 +3600,12 @@ async fn convert_streaming_response(
                                         0,
                                         Some("InvalidRequest".into()),
                                         Some("client disconnected mid-stream".into()),
-                                        None,
+                                        // 断开时也要带上**已见到**的结束原因：客户端恰恰常是
+                                        // 因为截断才断开重试，这里丢掉 `last_stop_reason` 会让
+                                        // 重试风暴在日志里退化成 `stop_reason=NULL`，与正常长
+                                        // 回答无法区分（它已经算好了，见上面的 Finish 分支；
+                                        // 同文件其余 4 处收尾日志同口径）。
+                                        last_stop_reason.as_ref().map(|r| r.as_log_str()),
                                     );
                                     drop(tx);
                                     return;
@@ -3491,9 +3736,10 @@ async fn convert_streaming_response(
                         } else {
                             let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
                         }
-                        // 截断诊断（零可见输出 / 被预算掐短）：必须在 `last_usage` 被
+                        // 出站质量诊断（**复读优先**，其次截断）：必须在 `last_usage` 被
                         // `usage_json` 的 map 取走之前算。
-                        let (diag_kind, diag_summary) = truncation_diagnostic(
+                        let (diag_kind, diag_summary) = output_diagnostic(
+                            repetition.finish(),
                             last_stop_reason.as_ref().map(|r| r.as_log_str()),
                             saw_visible_output,
                             output_budget,
@@ -3805,7 +4051,9 @@ async fn streaming_response(
             passthrough.tool_call_ids.len() as i64,
             Some("InvalidRequest".into()),
             Some("client disconnected early".into()),
-            None,
+            // 同「中途断开」分支：探针已扫过的结束原因照记，别退化成 NULL
+            // （上游把整包响应当首块返回时，此处已能扫到 finish_reason/status）。
+            probe.finish(),
         );
         return Attempt::Delivered(empty_resp(StatusCode::OK));
     }
@@ -3865,7 +4113,9 @@ async fn streaming_response(
                                 passthrough.tool_call_ids.len() as i64,
                                 Some("InvalidRequest".into()),
                                 Some("client disconnected mid-stream".into()),
-                                None,
+                                // 同其余收尾分支：探针已扫过的结束原因照记。
+                                // 客户端因截断而断开重试时，这一格正是判据所在。
+                                probe.finish(),
                             );
                             break;
                         }
@@ -3904,7 +4154,10 @@ async fn streaming_response(
                             .and_then(Value::as_u64)
                             .unwrap_or(0);
                         let stop = probe.finish();
-                        let (diag_kind, diag_summary) = truncation_diagnostic(
+                        // 统一入口：**复读优先**，其次截断（见 `repetition_diagnostic`）。
+                        // 直通路径靠 `PassthroughStreamProbe` 顺带喂正文，不额外解析一次。
+                        let (diag_kind, diag_summary) = output_diagnostic(
+                            passthrough.repetition.finish(),
                             stop,
                             passthrough.seen_visible,
                             peeked2.max_output_tokens,
@@ -4363,6 +4616,164 @@ mod tests {
 
         // 有正文的安全拦截不标（拦截没生效到正文上，用户读到了内容）
         assert!(truncation_diagnostic(Some("safety"), true, Some(8192), 8192).is_none());
+    }
+
+    // ------------------------------------------------------------ 退化复读探针
+
+    /// 真机形状：同一句话重复 10 遍（真机是 810 遍，这里缩小到 10 便于阅读）。
+    ///
+    /// 刻意**分多次 feed** 喂入：流式是逐帧到达的，不能假设一次性给全。
+    #[test]
+    fn repetition_probe_flags_repeated_sentence_across_chunks() {
+        let sentence = "这个函数没有明显的阴影问题。";
+        let full = sentence.repeat(10);
+        let mut probe = RepetitionProbe::new();
+        // 按字符切块喂入，模拟上游逐帧下发（不会撕裂 UTF-8）
+        for c in full.chars() {
+            probe.feed(&c.to_string());
+        }
+        let hit = probe.finish().expect("同一句重复 10 遍必须判为退化复读");
+        assert_eq!(hit.0, 10, "应报出重复 10 次");
+        assert!(
+            hit.1 >= sentence.len() - 1,
+            "单元长度应接近句子长度: {hit:?}"
+        );
+    }
+
+    /// 正常文本（句子各不相同）绝不误判 —— 本探针最重要的反向控制。
+    #[test]
+    fn repetition_probe_does_not_flag_varied_text() {
+        let mut probe = RepetitionProbe::new();
+        for i in 0..50 {
+            probe.feed(&format!("这是第 {i} 个完全不同的句子，内容各异。"));
+        }
+        assert!(
+            probe.finish().is_none(),
+            "内容各异的正常文本不该被判为退化复读"
+        );
+    }
+
+    /// 短段重复是**正常排版**（分隔线 / 列表符号 / 空行），不得触发。
+    #[test]
+    fn repetition_probe_ignores_short_unit_repeats() {
+        let mut probe = RepetitionProbe::new();
+        probe.feed(&"---\n".repeat(50));
+        assert!(
+            probe.finish().is_none(),
+            "`---` 这类短段重复是排版，不是复读"
+        );
+
+        let mut probe2 = RepetitionProbe::new();
+        probe2.feed(&"ok\n".repeat(50));
+        assert!(probe2.finish().is_none(), "两字符短行重复同样不该触发");
+    }
+
+    /// 重复单元**内部含句末符**（英文 `File a.rs is broken.`）也必须能识别。
+    ///
+    /// 这种句子的 `.` 会把内容切成两段 ⇒ 段周期为 2。只做周期 1 的实现在此必然漏判，
+    /// 本用例专门钉住「周期 > 1 也要覆盖」。
+    #[test]
+    fn repetition_probe_handles_unit_with_internal_period() {
+        let mut probe = RepetitionProbe::new();
+        probe.feed(&"File a.rs is broken. ".repeat(8));
+        let hit = probe
+            .finish()
+            .expect("内部含句点的重复单元（段周期 2）必须能被识别");
+        assert!(hit.0 >= 4, "应报出至少 4 次重复，实得 {hit:?}");
+    }
+
+    /// 只差空白的复读要命中（归一化生效）。
+    #[test]
+    fn repetition_probe_normalizes_whitespace() {
+        let mut probe = RepetitionProbe::new();
+        for i in 0..6 {
+            let pad = if i % 2 == 0 { " " } else { "   " };
+            probe.feed(&format!("同一句话，只是空白不同。{pad}\n  "));
+        }
+        assert!(
+            probe.finish().is_some(),
+            "归一化后逐字相同即应命中（模型复读常只差空白）"
+        );
+    }
+
+    /// 已知缺口（写进文档，不假装支持）：**无句末符的长块**复读扫不到，且不得因此炸内存。
+    #[test]
+    fn repetition_probe_gives_up_on_unpunctuated_blob() {
+        let mut probe = RepetitionProbe::new();
+        let blob = "x".repeat(4096); // 无任何句末符
+        for _ in 0..50 {
+            probe.feed(&blob);
+        }
+        assert!(
+            probe.finish().is_none(),
+            "无句末符的长块是已记录的漏判缺口（本探针靠切段成立），不得误报"
+        );
+        assert!(probe.given_up, "超长无界段应触发放弃观测，避免吃内存");
+        assert!(probe.cur.is_empty(), "放弃观测后不得继续累积");
+    }
+
+    /// 内存有界性：无论喂多少内容，环形窗口与残留缓冲都不无界增长。
+    #[test]
+    fn repetition_probe_memory_is_bounded() {
+        let mut probe = RepetitionProbe::new();
+        for i in 0..20_000 {
+            probe.feed(&format!("第 {i} 句。"));
+        }
+        assert!(
+            probe.segs.len() <= 2 * REPETITION_MAX_PERIOD,
+            "段环形窗口必须有界，实得 {}",
+            probe.segs.len()
+        );
+        assert!(
+            probe.cur.len() <= REPETITION_MAX_UNIT_BYTES * 8 + 8,
+            "残留段缓冲必须有界，实得 {}",
+            probe.cur.len()
+        );
+    }
+
+    /// 复读优先于截断：同一轮同时命中两者时，落更接近根因的那个。
+    #[test]
+    fn output_diagnostic_prefers_repetition_over_truncation() {
+        let (kind, summary) =
+            output_diagnostic(Some((810, 40)), Some("max_tokens"), true, Some(8192), 8192)
+                .expect("复读命中必须产出诊断");
+        assert_eq!(kind, "UpstreamDegenerateRepetition");
+        assert!(summary.contains("810"), "摘要要带上重复次数: {summary}");
+        // 「被截断」这件事不能丢：摘要里显式提一句（`stop_reason` 列也仍有记录）
+        assert!(summary.contains("max_output_tokens"), "{summary}");
+
+        // 没有复读时退回原有截断口径（回归保护：不能把第 11/12 条的判定吃掉）
+        assert_eq!(
+            output_diagnostic(None, Some("max_tokens"), true, Some(8192), 8192).map(|(k, _)| k),
+            Some("OutputBudgetClipped")
+        );
+        assert_eq!(
+            output_diagnostic(None, Some("max_tokens"), false, Some(16), 16).map(|(k, _)| k),
+            Some("OutputTruncatedEmpty")
+        );
+        // 两者都不命中 → 不标（正常轮次不得被打标）
+        assert!(output_diagnostic(None, Some("end_turn"), true, Some(8192), 100).is_none());
+    }
+
+    /// 阈值边界：4 次不触发、5 次触发。
+    #[test]
+    fn repetition_probe_threshold_boundary() {
+        let sentence = "边界测试用的同一句话。";
+        let mut under = RepetitionProbe::new();
+        under.feed(&sentence.repeat(REPETITION_FLAG_RUN as usize - 1));
+        assert!(
+            under.finish().is_none(),
+            "低于阈值（{} 次）不该触发",
+            REPETITION_FLAG_RUN - 1
+        );
+
+        let mut at = RepetitionProbe::new();
+        at.feed(&sentence.repeat(REPETITION_FLAG_RUN as usize));
+        assert!(
+            at.finish().is_some(),
+            "正好达到阈值（{} 次）必须触发",
+            REPETITION_FLAG_RUN
+        );
     }
 
     #[tokio::test]

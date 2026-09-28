@@ -75,6 +75,48 @@ async fn spawn_openai_mock(mode: &'static str) -> u16 {
                         .body(Body::from(sse))
                         .unwrap()
                 }
+                "stream_length_stall" => {
+                    // 截断帧之后再**继续吐字节**：复刻「客户端读到截断就断开重试」的形状。
+                    // 网关随后那次下发必然失败 → 走「client disconnected mid-stream」收尾分支。
+                    // 该分支必须带上已见到的 `last_stop_reason`（原先传 None，退化成 NULL）。
+                    let head = "data: {\"id\":\"chatcmpl_d\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"cut here\"},\"finish_reason\":null}]}\n\n\
+                                data: {\"id\":\"chatcmpl_d\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":234784,\"completion_tokens\":8192}}\n\n";
+                    let tail = "data: {\"id\":\"chatcmpl_d\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"more\"},\"finish_reason\":null}]}\n\n";
+                    let stream = futures_util::stream::unfold(0usize, move |i| async move {
+                        match i {
+                            0 => Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(head)), 1)),
+                            1 => {
+                                // 留足窗口让客户端读到首块并断开（用例侧等 300ms）
+                                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                                Some((Ok(axum::body::Bytes::from(tail)), 2))
+                            }
+                            _ => None,
+                        }
+                    });
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+                "stream_repeat" => {
+                    // 退化复读（转换路径）：上游把同一句话反复吐出来，最后撞上输出预算。
+                    // 真机是 810 遍（bug 清单第 11 条），这里缩到 6 遍便于阅读。
+                    // 跨帧下发是刻意的：探针必须在增量流上累积才成立。
+                    let sse = "data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"这个函数没有明显的阴影问题。\"},\"finish_reason\":null}]}\n\n\
+                               data: {\"id\":\"chatcmpl_r\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":460817,\"completion_tokens\":8192}}\n\n\
+                               data: [DONE]\n\n";
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
                 "text" => Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
@@ -198,6 +240,30 @@ impl Fixture {
     /// 等待后台日志管道落库后取最近 N 条（route_mode / usage 落库断言用）
     async fn recent_logs(&self, n: i64) -> Vec<gateway_core::store::logs::LogRowView> {
         common::logs_settled(&self.db, n, std::time::Duration::from_secs(5)).await
+    }
+
+    /// 发起流式请求，读到首块后**中途丢弃响应体**（模拟客户端断开重试）。
+    ///
+    /// 时序刻意留出窗口：上游把「正文 + 截断帧」一次性送来，客户端拿到首块后等 300ms
+    /// 再断开 —— 保证网关**先**处理完截断帧（算出 `last_stop_reason`），**再**因下发
+    /// 后续 chunk 失败而走断开分支。否则若在截断帧之前断开，落库本就该是 NULL。
+    async fn post_responses_drop_after_first_chunk(&self, body: Value) -> u16 {
+        use futures_util::StreamExt;
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/v1/responses", self.port);
+        let resp = client
+            .post(&url)
+            .bearer_auth(&self.key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let mut stream = resp.bytes_stream();
+        let _first = stream.next().await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        drop(stream);
+        status
     }
 
     async fn post_responses_raw(&self, body: Value) -> (u16, String) {
@@ -638,4 +704,56 @@ async fn responses_stream_stop_is_completed_end_turn() {
         .find(|r| r.http_status == 200 && r.is_stream)
         .expect("应有流式成功日志");
     assert_eq!(row.stop_reason.as_deref(), Some("end_turn"));
+}
+
+/// 回归（bug 16）：客户端在**已见到截断帧之后**中途断开，落库仍必须记下 `max_tokens`。
+///
+/// 原先该收尾分支把 `stop_reason` 传成 `None`，于是「客户端因截断而断开重试」这一
+/// —— 恰恰最需要看清结束原因的场景 —— 在日志里退化成 NULL，与「上游从没给过终局帧」
+/// 形态完全相同、事后无法区分。同文件其余 4 处收尾日志都带上了该值，只此一处漏了。
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_client_disconnect_keeps_stop_reason() {
+    let fx = fixture("stream_length_stall").await;
+    let status = fx
+        .post_responses_drop_after_first_chunk(responses_body("gpt-4o", true))
+        .await;
+    assert_eq!(status, 200, "首字节已下发，故状态码仍是 200");
+
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.is_stream && r.http_status == 200)
+        .expect("应有流式日志（中途断开也要落库）");
+    assert_eq!(row.route_mode, "converted");
+    assert_eq!(
+        row.stop_reason.as_deref(),
+        Some("max_tokens"),
+        "客户端中途断开也必须带上已见到的结束原因（原先这里是 NULL）"
+    );
+}
+
+/// 退化复读（转换路径）：Responses 入站 → OpenAI 上游，上游复读 → 日志直接点名。
+///
+/// 真机场景是 Responses 入站（Codex/PI-Desktop 形状），所以这条路径才是现场路径。
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_stream_degenerate_repetition_is_flagged() {
+    let fx = fixture("stream_repeat").await;
+    let (status, text) = fx.post_responses_raw(responses_body("gpt-4o", true)).await;
+    assert_eq!(status, 200);
+    // 客户端拿到的仍是完整正常的 Responses 流（网关不改写正文）
+    assert!(text.contains("response.completed"), "收尾事件应照常下发");
+
+    let rows = fx.recent_logs(10).await;
+    let row = rows
+        .iter()
+        .find(|r| r.http_status == 200 && r.is_stream)
+        .expect("应有流式成功日志");
+    assert_eq!(row.route_mode, "converted");
+    assert_eq!(
+        row.error_kind.as_deref(),
+        Some("UpstreamDegenerateRepetition"),
+        "转换路径同样必须点名退化复读（此前只有截断类结论）"
+    );
+    let summary = row.error_summary.as_deref().unwrap_or_default();
+    assert!(summary.contains("重复"), "摘要要说明重复这件事: {summary}");
 }
