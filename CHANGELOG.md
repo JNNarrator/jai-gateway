@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`Channel health` 工作流 + `scripts/channel_health.mjs`**：把「更新通道是否真的可用」
+  变成一条可自动执行的判据（v0.4.3 发版事故的防复发，见
+  [`docs/design/release.md` §3 陷阱 C / §4](docs/design/release.md)）。
+
+  事故形态：GitHub 上同时存在两个 v0.4.3 release —— CI 建的草稿（作者
+  `github-actions[bot]`、8 个资产、含 `latest.json`）与**人工从同一 tag 手建的已发布
+  release**（作者 `JNNarrator`、0 资产、name/body 全空）。空壳虽是空的，但「已发布」身份
+  让它成为 `/releases/latest` 的解析目标 ⇒ `…/latest/download/latest.json` 变 **404** ⇒
+  客户端「检查更新」报 `Could not fetch a valid release JSON from the remote`。
+  **该故障对所有人生效，且全程零报错**（Release 工作流 3/3 job success、`release_check.sh`
+  全绿）—— 属于本仓库最该被探针覆盖的那类「静默失效」。
+
+  脚本逐条校验（零依赖，本地与 CI 同一份；只读，不改任何远端状态）：
+  - `latest.json` 可取到且是合法 JSON（带 cache-bust，避开 CDN 缓存）；
+  - 它的 `version` 与「最新已发布 release」的 tag 一致 ⇒ 抓「latest 指向一个没有 feed 的
+    release」；
+  - 那个 release **确实带资产** ⇒ 直接抓 0 资产空壳（本次的直接原因）；
+  - 平台键齐全、每个平台 `signature` 非空；
+  - 每个平台资产 URL **真能取到**（Range 取首字节，不下几十 MB 的 dmg）。
+
+  工作流 `.github/workflows/channel-health.yml` 三个触发点：`release: published`
+  （**最关键** —— 任何发布动作几秒内被校验，不必等人去点「检查更新」）、每 6 小时定时兜底、
+  手动 `workflow_dispatch`。发版后自查：`node scripts/channel_health.mjs --expect-version <版本>`。
+
+  可注入验证：`JAI_CHANNEL_API` / `JAI_CHANNEL_FEED_URL` 指向 mock 即可复刻「0 资产 +
+  feed 404」。**已实测**该形态下判据变红且**退出码为 1** —— 顺带修掉一个自伤 bug：早期
+  `return` 路径曾漏设退出码，会产出「提示红了但退出码 0」的假绿 CI，现统一走 `finish()` 收尾。
+
+
 ## [0.4.3] - 2026-09-28
 
 ### Added

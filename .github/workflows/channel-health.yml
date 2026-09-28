@@ -1,0 +1,47 @@
+name: Channel health
+
+# 更新通道健康检查（v0.4.3 发版事故后新增，见 docs/design/release.md §4）。
+#
+# 事故回顾（2026-09-28）：GitHub 上同时存在两个 v0.4.3 release —— CI 建的草稿（作家
+# `github-actions[bot]`、8 个资产、含 `latest.json`）与**人工从同一 tag 手建的已发布
+# release**（作者 `JNNarrator`、0 资产、name/body 全空）。后者虽是空壳，但已发布身份让它
+# 抢占了 `/releases/latest` ⇒ `…/latest/download/latest.json` 变 404 ⇒ 客户端「检查更新」
+# 报 `Could not fetch a valid release JSON from the remote`。
+#
+# 这个故障**全程零报错**：Release 工作流 3/3 job success、`release_check.sh` 全绿，
+# 但**所有用户**的更新通道都坏了。本 workflow 就是为这一类「静默失效」设的探针。
+#
+# 三个触发点各有分工：
+#   - `release: published`：**最关键** —— 任何 release 被发布的瞬间就跑。今天这种
+#     「手工建了空壳并发布」会在几秒内被判据抓住，而不是等人去点「检查更新」才发现。
+#   - `schedule`：兜底。发布之外的通道故障（资产被删、tag 被移动、CDN 异常）也能发现。
+#   - `workflow_dispatch`：手动跑（发版后自查、排查期随手跑）。
+#
+# 注意：GitHub 的 `schedule` 在仓库**连续 60 天无活动**后会自动停用（平台行为），
+# 届时 Actions 页会提示。`release: published` 与手动触发不受此限。
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: "0 */6 * * *" # 每 6 小时
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  feed:
+    name: Updater feed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 退出码即结论（判据不过 → 1），失败会按仓库的 Actions 通知设置提醒。
+      # 想让它「必然通知」，可在此 job 之下加一步 issue 创建；当前刻意只做红/绿，
+      # 不引入额外权限与噪音。
+      - name: 更新通道健康检查
+        run: node scripts/channel_health.mjs

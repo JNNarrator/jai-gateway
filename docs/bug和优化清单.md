@@ -1158,7 +1158,41 @@
     结构限制：截断发生时首字节早已下发 ⇒ **不能中途 failover**（`streaming_response` 的「首字节持票」）。
   - 仍缺的一环：**直连对照**（同一 prompt 不经 JAI 直发基元律动）尚未做，见第 16 条。
 
-（默认窗口 1180×800，最小 900×600）
+
+- [x] 18. **手工从 tag 建 release ⇒ 更新通道对所有人静默失效**（2026-09-28 v0.4.3 发版实测踩到，已修 + 已加探针）
+  - 现象（**用户报的**）：应用里「检查更新」报
+    `Could not fetch a valid release JSON from the remote`。
+  - 根因：GitHub 上同时存在**两个** v0.4.3 release ——
+    CI 建的草稿（`id=397916782`，作者 `github-actions[bot]`，name `JAI v0.4.3`、
+    body `见 CHANGELOG.md`、**8 个资产**含 `latest.json`）与**人工从同一 tag 手建的已发布
+    release**（`id=397922775`，作者 `JNNarrator`，name/body **全空**、**0 资产**）。
+    空壳虽是空的，但**「已发布」身份**让它成为 `/releases/latest` 的解析目标 ⇒ 它没有
+    `latest.json` ⇒ `…/latest/download/latest.json` **404**。
+  - **为什么这是最坏的一类故障**：`/releases/latest` 是**全局**解析 —— 指向空壳时
+    **所有用户**的更新检查都坏（不只是新版本用户）；而 **CI 侧全绿**
+    （Release run `36371219008` 3/3 job success、`release_check.sh` 全绿），
+    **没有任何报错**。从发布（`published_at=03:06:37`）到被发现，只能靠人主动去点。
+  - 已修（产物**无需重建**，它们一直在草稿里）：
+    ① 删掉空壳 release（`HTTP 204`，**保留 tag** —— tag 本身是对的）；
+    ② 发布 CI 那个草稿（`draft=false` + `make_latest=true`）；
+    ③ feed 校验（两轮，带 cache-bust）：`version=0.4.3`，5 个平台键齐全，资产名带 `_0.4.3_`。
+  - 防复发（本次新增）：
+    - `scripts/channel_health.mjs`：逐条校验「`latest.json` 可取到 / version 与最新已发布
+      release 一致 / **该 release 确实带资产** / 平台键齐全 / `signature` 非空 /
+      资产 URL 真能取到」。零依赖、只读。
+    - `.github/workflows/channel-health.yml`：`release: published`（**任何发布动作几秒内被校验**）
+      + 每 6 小时定时 + 手动。
+    - `docs/design/release.md`：§3 新增实测记录与 **陷阱 C**（含识别方法：CI 草稿作者是
+      `github-actions[bot]`、name 为 `JAI v<tag>`、body 为 `见 CHANGELOG.md`）；§4 门禁清单
+      加入该检查；§5 发布流程第 6 步加警示。
+  - 自伤 bug（写探针时踩到，已修）：脚本早期 `return` 路径漏设退出码 ⇒ 判据全红但
+    **退出码 0**，CI 会假绿。改为统一走 `finish()` 收尾。**验证方式**：用
+    `JAI_CHANNEL_API` / `JAI_CHANNEL_FEED_URL` 指向 mock 复刻「0 资产 + feed 404」，
+    实测判据变红且退出码为 1；对真实通道则退出码为 0。
+  - 仍是人工项的（本探针覆盖不到）：macOS 签名 + 公证、Windows 代码签名、干净 VM 安装验证、
+    真机验收、48h 常驻 —— 见 `release.md` §4 未勾选项。
+
+## 3. 视觉回归（默认窗口 1180×800，最小 900×600）
 
 > v0.2.0 起默认窗口 980×640 → 1180×800（最小 760×520 → 900×600），见 §2 第 12 条。
 

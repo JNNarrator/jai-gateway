@@ -107,9 +107,59 @@
       该步是 v0.2.6 的翻车点（草稿建成 prerelease 会让 feed 停在上一版且无报错），
       每次发布都必须跑。
 
+- [x] tag 触发验证：**v0.4.3 实测**（run 36371219008，3/3 job success：Create release draft 7s、
+      Build macos-latest 9m23s、Build windows-latest 12m36s，整轮约 13m）——
+      产物 8 个：`JAI_0.4.3_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、
+      `JAI_0.4.3_x64-setup.exe(+.sig)`、`JAI_0.4.3_x64_en-US.msi(+.sig)`、`latest.json`。
+      ✅ 构建与上传**全部正常**（草稿里 8 个资产齐全）。
+      ❌ **但发布环节翻车了** —— 见下方 **陷阱 C**。本次暴露的是流程问题，不是构建问题。
+
+### ⚠️ 陷阱 C：手工从已有 tag 建 release ⇒ 更新通道对所有人**静默**失效（v0.4.3 实测踩到）
+
+**现象**：客户端「检查更新」报
+`Could not fetch a valid release JSON from the remote`；
+`https://github.com/<owner>/<repo>/releases/latest/download/latest.json` 返回 **404**。
+而 **CI 侧全绿**（Release 3/3 job success、`release_check.sh` 全绿）——**没有任何报错**。
+
+**根因**：GitHub 上同时存在**两个** v0.4.3 release：
+
+| id | 状态 | 作者 | name / body | 资产 |
+|---|---|---|---|---|
+| 397916782 | 草稿 | `github-actions[bot]` | `JAI v0.4.3` / `见 CHANGELOG.md` | **8**（真产物，含 `latest.json`） |
+| 397922775 | **已发布** | `JNNarrator`（人工） | 空 / 空 | **0** |
+
+空壳虽然是空的，但**「已发布」这个身份**让它成为 `/releases/latest` 的解析目标 ⇒ 它没有
+`latest.json` ⇒ 该 URL 404 ⇒ **所有用户**的更新检查都失败（不只是新版本用户）。
+注意 `latest` 的语义是「最新的**已发布** release」，**不含草稿、也不含 prerelease**。
+
+**修复**（产物无需重建）：
+① 删掉空壳 release（**保留 tag** —— tag 本身是对的）；
+② 把 CI 的那个草稿发布出去（`draft=false` + `make_latest=true`）；
+③ 校验 feed 已切到新版本（带 cache-bust）。
+
+**规矩**：**只 Publish CI 建的那个草稿，永远不要手工从已有 tag 建 release。**
+识别方法 —— CI 草稿的 `name` 是 `JAI v<tag>`、`body` 是 `见 CHANGELOG.md`、
+**作者是 `github-actions[bot]`**；手工建的通常是空 name / 空 body / 作者是人。
+
+**防复发**：`Channel health` 工作流（`.github/workflows/channel-health.yml`）在
+`release: published` 时**立即**校验通道，见 §4。今天这种空壳一发布就会变红，
+不必等人去点「检查更新」。
+
 ## 4. 发布前门禁
 
 - [x] 自动化门禁脚本：`bash scripts/release_check.sh`（工作区干净、版本号、CHANGELOG、tag、全量回归）
+- [x] **更新通道健康检查**：`node scripts/channel_health.mjs`（零依赖；本地与 CI 同一份脚本）。
+      逐条校验：`latest.json` 可取到且是合法 JSON ｜ `version` 与「最新已发布 release」的 tag
+      一致 ｜ 那个 release **确实带资产**（0 资产空壳是 v0.4.3 事故的直接原因）｜ 平台键齐全 ｜
+      每个平台 `signature` 非空 ｜ 每个资产 URL **真能取到**（Range 取首字节，不下整包）。
+      工作流三个触发点：`release: published`（**最关键** —— 任何发布动作几秒内被校验）、
+      每 6 小时定时、手动 `workflow_dispatch`。
+      - 发版后自查：`node scripts/channel_health.mjs --expect-version <新版本>`
+      - 自测（注入故障形态）：把 `JAI_CHANNEL_API` / `JAI_CHANNEL_FEED_URL` 指向 mock，
+        即可复刻「0 资产 + feed 404」。**已实测**：判据变红且**退出码为 1**
+        （注意：脚本早期 `return` 曾漏设退出码，导致「提示红了但退出码 0」—— CI 会假绿；
+        已改为统一走 `finish()` 收尾，两种形态都回归验证过）。
+      - 已知边界：GitHub 的 `schedule` 在仓库连续 60 天无活动后会被平台自动停用。
 - [x] `bash scripts/regression.sh` 全绿（已被 release_check.sh 覆盖）
 - [ ] **D9 批次（v0.4.0）的真机验收** —— 自动化门禁覆盖不到、必须手点的三项：
       - 单实例保护（D9-T4）：连点两次图标只出一个窗口、第二次把已有窗口前置
@@ -141,7 +191,10 @@
 3. 推送 tag `v0.1.0-beta`
 4. 触发 `.github/workflows/release.yml`
 5. 人工验收 CI 产物（macOS + Windows，签名 + updater 元数据）
-6. 在 GitHub Releases 将草稿转正式发布并指向 updater feed
+6. 在 GitHub Releases 将** CI 建的那个草稿**转正式发布并指向 updater feed
+   ⚠️ **不要手工从已有 tag 新建 release**（会造出空壳并抢占 `/releases/latest`，见 §3 陷阱 C）。
+   确认自己点的是 `name = JAI v<tag>`、作者为 `github-actions[bot]` 的那个草稿。
+   发布后 `Channel health` 工作流会自动跑一次；也可手动 `node scripts/channel_health.mjs --expect-version <版本>`
 7. **发布后必须校验 updater 通道**（v0.2.6 踩过：草稿转正式后 feed 仍返回上一版）
 
    ```bash
