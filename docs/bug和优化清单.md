@@ -775,12 +775,21 @@
   - 回归测试 `crates/gateway-core/tests/tool_pairing_adjacency.rs`（4 用例，修复前 3 红）：
     并行工具 + 首个结果带图（**实机形状**）、`tool_result` 与文本同消息、call 与 output 之间
     夹 user 文本、已合法序列不被改动（并断言图片未在重排中丢失）。
+    另在 `dsh_tool_roundtrip.rs` 补一条**走完整代理链路**（真实网关 + mock 上游）的同形状用例
+    `dsh_parallel_tools_with_image_first_result_keeps_tool_block_together` —— 不只测 codec 纯函数。
+  - **反证实测**：临时停用 `enforce_tool_adjacency`（其余不动）后，
+    `cargo test -p gateway-core --test dsh_tool_roundtrip` 精确变红，报错与实机同形：
+    `assistant[1] tool_calls ["call_00_read", "call_01_bash"] 之后**紧邻**的 tool 消息 = ["call_00_read"]`
+    ⇒ `bash` 悬空。恢复后 6/6 + 4/4 全绿。
   - **同时修掉「断言太松」这个更根本的问题**：`dsh_tool_roundtrip.rs::assert_tool_pairing`
     与 `diag_responses_conversion.rs` 检查 4 此前只判「后续**存在**配对」
     （`for after in &msgs[i + 1..]`），中间夹消息照样绿 —— 这正是本 bug 能穿过 bug 5
     全部回归的原因。两处均改为**严格紧邻**判据（紧邻 tool 块的数量与 id 集合都要相等）。
   - 验证：`cargo test --workspace` **553 通过 / 0 失败**（含强化后的既有断言）；
-    `cargo fmt --check` / `clippy -D warnings` 全绿。
+    `cargo fmt --check` / `clippy -D warnings` 全绿；`release_check.sh` **7/7 全绿**。
+  - 已随 **v0.4.4** 发布（Release run 36545573186 成功；`channel_health.mjs --expect-version 0.4.4`
+    12 项判据全过）。⚠️ 本机 `127.0.0.1:1314` 仍是 `/Applications/JAI.app` 的旧进程，
+    需更新到 0.4.4 并**重启**后才在该机生效。
 
 ## 2. 优化清单
 

@@ -363,3 +363,58 @@ async fn dsh_tool_result_image_hoisted_for_chat_upstream() {
     // ③ 不得破坏既有的「tool_calls 必须有配对 tool 消息」上游约束
     assert_tool_pairing(msgs);
 }
+
+/// 端到端（**实机形状**，2026-09-29 16:08 的 400 现场）：一步内并行两个工具，
+/// 带图的结果**在前**——`read_image` + `bash`。
+///
+/// 修复前出站序列是 `assistant(tool_calls=[read, bash]) → tool(read)
+/// → user(提升的图) → tool(bash)`，上游只看到 `read` 被回应、`bash` 悬空 ⇒
+/// `insufficient tool messages following tool_calls message` 400。
+/// 本用例走**完整代理链路**（真实网关 + mock 上游），不是只测 codec 纯函数。
+#[tokio::test]
+async fn dsh_parallel_tools_with_image_first_result_keeps_tool_block_together() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let fx = fixture(captured.clone()).await;
+    let b64 = "aGVsbG8tdmlzaW9u";
+    let body = json!({
+        "model":"dsh-model",
+        "input":[
+            {"role":"user","content":[{"type":"input_text","text":"看下截图，再跑个命令"}]},
+            {"type":"function_call","call_id":"call_00_read","name":"read_image",
+             "arguments":"{\"path\":\"/tmp/a.png\"}"},
+            {"type":"function_call","call_id":"call_01_bash","name":"bash",
+             "arguments":"{\"command\":\"ls\"}"},
+            {"type":"function_call_output","call_id":"call_00_read","output":[
+                {"type":"input_text","text":"截图如下"},
+                {"type":"input_image","image_url": format!("data:image/jpeg;base64,{b64}")}
+            ]},
+            {"type":"function_call_output","call_id":"call_01_bash","output":"a.png\n"}
+        ]
+    });
+    let (status, resp) = fx.post_responses_raw(body).await;
+    assert_eq!(status, 200, "网关应转换成功: {resp}");
+
+    let guard = captured.lock().unwrap();
+    let up = guard.last().expect("mock 上游应收到请求");
+    let msgs = up["messages"].as_array().expect("Chat 上游应有 messages");
+
+    // ① 严格紧邻：两条 tool 消息必须**连在一起**紧跟 assistant，中间不许插提升的图
+    assert_tool_pairing(msgs);
+
+    let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(
+        roles,
+        vec!["user", "assistant", "tool", "tool", "user"],
+        "提升的图片必须排到本轮工具块之后，messages={msgs:?}"
+    );
+
+    // ② 提升的图片仍在（重排不得把它丢掉）
+    let hoisted = msgs.last().unwrap();
+    assert!(
+        hoisted["content"]
+            .as_array()
+            .map(|a| a.iter().any(|c| c["type"] == "image_url"))
+            .unwrap_or(false),
+        "末尾 user 消息应承载提升的图片，messages={msgs:?}"
+    );
+}

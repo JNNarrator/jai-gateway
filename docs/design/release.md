@@ -141,6 +141,26 @@
 识别方法 —— CI 草稿的 `name` 是 `JAI v<tag>`、`body` 是 `见 CHANGELOG.md`、
 **作者是 `github-actions[bot]`**；手工建的通常是空 name / 空 body / 作者是人。
 
+### ✅ v0.4.4 发版实测（2026-09-29，全程零返工）
+
+首个**按规矩走完整流程**的版本（v0.4.3 的教训生效）：
+
+- `bash scripts/release_check.sh` → **7/7 全绿，退出码 0**（工作区干净 / 版本号 / CHANGELOG
+  `[Unreleased]` / tag 尚未创建 / fmt + clippy + `cargo test --workspace` **553 通过 0 失败** /
+  frontend build / UI 门禁 1180×800 与 900×600 × light+dark）。
+- `git push origin main` → CI run **36545543792** 成功（3m41s）。
+- `git tag -a v0.4.4` + `git push origin v0.4.4` → Release run **36545573186** 成功（12m57s），
+  产物形状与 v0.4.1–v0.4.3 完全一致：`JAI_0.4.4_aarch64.dmg`、`JAI_aarch64.app.tar.gz(+.sig)`、
+  `JAI_0.4.4_x64-setup.exe(+.sig)`、`JAI_0.4.4_x64_en-US.msi(+.sig)`、`latest.json`（共 8 资产）。
+- 发布：`gh release edit v0.4.4 --draft=false --latest`（`published=2026-09-29T09:07:10Z`），
+  **没有**手工建第二个 release ⇒ 不存在 v0.4.3 那种空壳。
+- 发布事件自动触发 Channel health run **36547082547** 成功（13s，`release: published` 触发器生效）。
+- 手动复核 `node scripts/channel_health.mjs --expect-version 0.4.4` → **12 项判据全过，退出码 0**
+  （feed version 一致、5 个平台键齐全且 signature 非空、5 个资产 URL 均 HTTP 206）。
+- ⚠️ **仍未做**：真机验收（含本次修复的 dsh 实机复跑）、干净 VM 装包验证、48h 常驻。
+  尤其注意：本机 `127.0.0.1:1314` 上跑的是 `/Applications/JAI.app` 里**周一启动的旧进程**，
+  修复要等应用更新到 0.4.4 并**重启**后才在该机器上生效。
+
 **防复发**：`Channel health` 工作流（`.github/workflows/channel-health.yml`）在
 `release: published` 时**立即**校验通道，见 §4。今天这种空壳一发布就会变红，
 不必等人去点「检查更新」。

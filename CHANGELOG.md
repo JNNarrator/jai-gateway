@@ -31,7 +31,10 @@ All notable changes to this project will be documented in this file.
   Responses 回合中插话等「用户侧内容」与工具结果同消息或交错）。
 
   回归：新增 `tests/tool_pairing_adjacency.rs`（4 用例，修复前 3 红，含**实机形状**的
-  并行工具 + 首个结果带图）。**同时修掉「断言太松」这个根本问题**：
+  并行工具 + 首个结果带图）；并在 `tests/dsh_tool_roundtrip.rs` 补一条**走完整代理链路**
+  （真实网关 + mock 上游）的同形状用例。**反证实测**：临时停用 `enforce_tool_adjacency` 后，
+  该链路用例精确变红、报错与实机同形（`tool_calls ["call_00_read","call_01_bash"]` 之后紧邻的
+  tool 消息只剩 `["call_00_read"]` ⇒ `bash` 悬空）。**同时修掉「断言太松」这个根本问题**：
   `dsh_tool_roundtrip.rs::assert_tool_pairing` 与 `diag_responses_conversion.rs` 检查 4 此前
   只判「后续**存在**配对」，中间夹消息照样绿（这正是本 bug 能穿过 bug 5 全部回归的原因），
   现均改为**严格紧邻**判据。全量回归 553 通过 / 0 失败。
