@@ -738,6 +738,50 @@
   - 教训：探针的 mock 必须与「真实注入的全局对象集合」对齐；
     缺一个全局对象就会让**断言整体失效**，而失效方式是「一直红」，最容易被当成噪音。
 
+- [x] 29. **并行工具调用 + 工具结果带图 → 下一步请求必 400（bug 5 的漏网分支）**（2026-09-29 修复）
+  - 现象（两次实机上报，`Request id: 0217906621` / `0217906692`）：
+    ```
+    OpenAI API error (400): {"code":null,"message":"{\"code\":\"LITELLM_ERROR\",\"message\":
+    \"status_code=400, An assistant message with 'tool_calls' must be followed by tool messages
+    responding to each 'tool_call_id'. (insufficient tool messages following tool_calls message)\"...}"}
+    ```
+    特征：报错**总是紧跟**在一条带 `CapabilityWarn`
+    （「工具结果内嵌图片…已降级提升为紧随其后的一条 user 消息」）的 200 之后。
+  - 根因（`codec/openai.rs` 编码顺序，**不是 MCP 历史残留、也不是客户端历史缺结果**）：
+    Chat 的 `role=tool` 只允许 text part，所以工具结果内嵌图片时，图片被**降级提升**
+    成紧随其后的一条 user 消息（`openai.rs` `Role::User` 分支 `hoisted_parts`）。
+    该提升消息是在**每条 IR 消息内**就地落地的，于是当
+    **assistant 一次并行调用多个工具、且带图的结果不是最后一个**时，序列变成
+    ```
+    assistant(tool_calls=[read_image, bash]) → tool(read_image) → user(提升的图) → tool(bash)
+    ```
+    上游只看到 `read_image` 被回应，`bash` 悬空 ⇒
+    `insufficient tool messages following tool_calls message` 400。
+    实机命中形状正是 dsh 的常态：一步内 `read_image` + `bash` 并行（2026-09-29 16:07:53
+    step 5 调用 → step 6 请求 16:08:08 报 400，`request_logs` 16177→16178）。
+    同族还有第二个（未实机命中但同样非法）：IR 允许「用户侧内容」与工具结果同消息或交错
+    （Anthropic 的 `user: [tool_result, text]`、Responses 回合中插话），编码后文本消息会落到
+    tool 消息**之前**，同样破坏紧邻性。
+  - 排查过程（可复用）：① `request_logs` 里 400 的 `tool_calls` 恒 0，且紧邻一条
+    `CapabilityWarn` —— 指向「图片提升」而非「历史缺结果」；② 解开 dsh 会话
+    （`~/.dsh/sessions/<proj>/<id>/session.v4.jsonl.zstd`，`zstdcat`）做
+    `tool/call` 与 `tool/result` 的 id 差集：**22 调用 21 结果**，缺的那条正是当时在跑的那步
+    ⇒ 客户端历史是干净的，破坏发生在网关转换里；③ 用 codec 纯函数复现出上面的序列。
+  - 修复：新增 `enforce_tool_adjacency`（`codec/openai.rs` 编码收尾归一）—— 对每个带
+    `tool_calls` 的 assistant，在不跨越下一条 assistant 的窗口内，把回应本轮 id 的 tool 消息
+    按原相对顺序**上提为紧随其后**，其余消息（user 文本 / 提升的图片）顺次排到该轮工具块之后。
+    已合法的序列结构不变（幂等）。选「收尾归一」而非「就地延后提升」：两种成因
+    （提升 / 用户侧内容交错）在同一处一次解决，且给上游约束一个**结构保证**。
+  - 回归测试 `crates/gateway-core/tests/tool_pairing_adjacency.rs`（4 用例，修复前 3 红）：
+    并行工具 + 首个结果带图（**实机形状**）、`tool_result` 与文本同消息、call 与 output 之间
+    夹 user 文本、已合法序列不被改动（并断言图片未在重排中丢失）。
+  - **同时修掉「断言太松」这个更根本的问题**：`dsh_tool_roundtrip.rs::assert_tool_pairing`
+    与 `diag_responses_conversion.rs` 检查 4 此前只判「后续**存在**配对」
+    （`for after in &msgs[i + 1..]`），中间夹消息照样绿 —— 这正是本 bug 能穿过 bug 5
+    全部回归的原因。两处均改为**严格紧邻**判据（紧邻 tool 块的数量与 id 集合都要相等）。
+  - 验证：`cargo test --workspace` **553 通过 / 0 失败**（含强化后的既有断言）；
+    `cargo fmt --check` / `clippy -D warnings` 全绿。
+
 ## 2. 优化清单
 
 - [x] 1. 创建供应商弹框应该有按钮可以测试能不能获取到模型。

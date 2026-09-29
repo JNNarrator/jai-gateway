@@ -220,6 +220,43 @@ fn dump_responses_to_chat_conversion() {
             "❌ 不配对（上游可能 400，或模型看到悬空的工具结果）"
         }
     );
+    // 配对还不够：上游要求 tool 消息**紧邻** assistant.tool_calls，中间夹任何消息都 400
+    // （原文："must be followed by tool messages responding to each 'tool_call_id'"）。
+    // 2026-09-29 的「提升图片插进两条 tool 消息之间」正是栽在这里。
+    let mut adjacency_ok = true;
+    for (i, m) in msgs.iter().enumerate() {
+        let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        let want: Vec<&str> = tcs.iter().filter_map(|t| t["id"].as_str()).collect();
+        let mut got: Vec<&str> = Vec::new();
+        let mut j = i + 1;
+        while j < msgs.len() && msgs[j]["role"] == "tool" {
+            if let Some(id) = msgs[j]["tool_call_id"].as_str() {
+                got.push(id);
+            }
+            j += 1;
+        }
+        if got.len() != want.len() || !want.iter().all(|w| got.contains(w)) {
+            adjacency_ok = false;
+            eprintln!(
+                "   ❌ assistant[{i}] tool_calls {want:?} 之后紧邻的 tool 消息只有 {got:?}\
+                 （第 {} 条消息 role={}）",
+                i + 1,
+                msgs.get(i + 1)
+                    .map(|m| m["role"].clone())
+                    .unwrap_or(Value::Null)
+            );
+        }
+    }
+    eprintln!(
+        "   {}",
+        if adjacency_ok {
+            "✅ tool 消息紧邻其 assistant.tool_calls"
+        } else {
+            "❌ 紧邻性违约（上游必然 400：insufficient tool messages following tool_calls message）"
+        }
+    );
 
     eprintln!();
     eprintln!("检查 5 · 消息条数（有无多出来的插入消息）");

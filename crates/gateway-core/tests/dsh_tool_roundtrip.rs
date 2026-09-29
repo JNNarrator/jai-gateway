@@ -146,26 +146,35 @@ async fn fixture(captured: Arc<Mutex<Vec<Value>>>) -> Fixture {
     }
 }
 
-/// 校验 Chat messages：每个 assistant tool_calls 必须有后续 role=tool 配对。
+/// 校验 Chat messages：每个 assistant tool_calls 必须有**紧随其后**的 role=tool 配对。
+///
+/// 判据必须严格到「紧邻」：上游原文是
+/// `An assistant message with 'tool_calls' must be followed by tool messages responding
+///  to each 'tool_call_id'` —— 只要中间夹了一条 user/assistant 消息就算违约，
+/// 上游报 `insufficient tool messages following tool_calls message`。
+///
+/// 旧版这里只查「后续存在」（`for after in &msgs[i + 1..]`），因此
+/// 2026-09-29 那次「提升的图片插在两条 tool 消息之间」的 400 完全没被拦住
+/// （回归见 `tests/tool_pairing_adjacency.rs`）。
 fn assert_tool_pairing(msgs: &[Value]) {
     for (i, m) in msgs.iter().enumerate() {
         if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
             let ids: Vec<&str> = tcs.iter().filter_map(|tc| tc["id"].as_str()).collect();
-            let mut found = vec![false; ids.len()];
-            for after in &msgs[i + 1..] {
-                if after["role"] == "tool" {
-                    if let Some(tci) = after["tool_call_id"].as_str() {
-                        for (j, id) in ids.iter().enumerate() {
-                            if *id == tci {
-                                found[j] = true;
-                            }
-                        }
-                    }
+            // 只取**紧邻**的那一段 tool 消息
+            let mut got: Vec<&str> = Vec::new();
+            let mut j = i + 1;
+            while j < msgs.len() && msgs[j]["role"] == "tool" {
+                if let Some(tci) = msgs[j]["tool_call_id"].as_str() {
+                    got.push(tci);
                 }
+                j += 1;
             }
+            let covered = got.len() == ids.len() && ids.iter().all(|id| got.contains(id));
             assert!(
-                found.iter().all(|&f| f),
-                "❌ assistant[{i}] tool_calls {ids:?} 未全部被后续 tool 消息回应\nmessages={msgs:?}"
+                covered,
+                "❌ assistant[{i}] tool_calls {ids:?} 之后**紧邻**的 tool 消息 = {got:?}\n\
+                 夹在中间的首条消息 role = {:?}\nmessages={msgs:?}",
+                msgs.get(i + 1).map(|m| m["role"].clone())
             );
         }
     }

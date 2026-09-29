@@ -732,6 +732,75 @@ fn render_image_part(
     }))
 }
 
+/// 收尾归一：把回应某个 assistant 的 `role=tool` 消息**上提为紧随其后**，保住上游硬约束。
+///
+/// 上游原文（LiteLLM / OpenAI）：
+/// `An assistant message with 'tool_calls' must be followed by tool messages responding
+///  to each 'tool_call_id'. (insufficient tool messages following tool_calls message)`
+///
+/// 为什么 IR 会产出「不紧邻」的 Chat 序列（两条独立成因，都不该在编码器里各修一遍）：
+/// 1. **工具结果内嵌图片的降级提升**（见上文 `Role::User` 分支）：Chat 的 `role=tool`
+///    只允许 text part，图片被提升成**紧随其后的一条 user 消息**。若同一轮 assistant
+///    有多个工具调用、而带图的那个**不是最后一个**，提升消息就插进了两条 tool 消息之间
+///    （`tool(A) → user(提升图) → tool(B)`）→ 上游只看到 A 被回应 → 400。
+/// 2. **IR 允许「用户侧内容」与工具结果同消息或交错**：Anthropic 的
+///    `user: [tool_result, text]`、Responses 回合中插话（`function_call` 与
+///    `function_call_output` 之间夹一条 user 文本）都合法，但编码后文本消息会落到
+///    tool 消息之前。
+///
+/// 2026-09-29 实机命中的是第 1 条：dsh 一步并行调用 `read_image` + `bash`，
+/// 图片结果在前 → 下一步请求必 400（`Request id: 0217906692`）。
+///
+/// 归一规则：对每个带 `tool_calls` 的 assistant 消息，在**不跨越下一条 assistant 消息**
+/// 的窗口内，把回应本轮 id 的 tool 消息按原相对顺序上提；其余消息（user 文本、提升的
+/// 图片）顺次排到该轮工具块之后。已合法的序列结构不变（幂等）。
+fn enforce_tool_adjacency(messages: &mut Vec<Value>) {
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i]["role"] != "assistant" {
+            i += 1;
+            continue;
+        }
+        let ids: Vec<String> = messages[i]
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(|tcs| {
+                tcs.iter()
+                    .filter_map(|t| t["id"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // 窗口 = (本条 assistant, 下一条 assistant) —— 越界说明接线本身有问题，不硬修
+        let mut end = i + 1;
+        while end < messages.len() && messages[end]["role"] != "assistant" {
+            end += 1;
+        }
+        let window: Vec<Value> = messages.drain(i + 1..end).collect();
+        let mut taken: Vec<Value> = Vec::new();
+        let mut rest: Vec<Value> = Vec::new();
+        for m in window {
+            let answers_this_round = m["role"] == "tool"
+                && m["tool_call_id"]
+                    .as_str()
+                    .is_some_and(|id| ids.iter().any(|w| w == id));
+            if answers_this_round {
+                taken.push(m);
+            } else {
+                rest.push(m);
+            }
+        }
+        let n = taken.len() + rest.len();
+        taken.extend(rest);
+        messages.splice(i + 1..i + 1, taken);
+        i += 1 + n; // 跳过整个窗口（窗口内无 assistant 消息）
+    }
+}
+
 /// 编码请求：IR → OpenAI chat completions body。
 pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value, String> {
     let mut body = json!({
@@ -918,6 +987,10 @@ pub fn encode_request(req: &crate::codec::ir::CanonicalRequest) -> Result<Value,
             }
         }
     }
+    // 收尾归一：保证 assistant.tool_calls 之后**紧邻**覆盖其全部 id 的 tool 消息。
+    // 见函数文档（上游 400「insufficient tool messages」根因）。
+    enforce_tool_adjacency(&mut messages);
+
     body["messages"] = Value::Array(messages);
 
     // tools

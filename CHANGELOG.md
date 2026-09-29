@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-09-29
+
+### Fixed
+
+- **并行工具调用 + 工具结果带图 → 下一步请求必 400**（`insufficient tool messages following
+  tool_calls message`，bug 清单第 29 条）。
+
+  上游原文：`An assistant message with 'tool_calls' must be followed by tool messages responding
+  to each 'tool_call_id'.` Chat 的 `role=tool` 只允许 text part，因此工具结果内嵌图片时，网关会
+  把图片**降级提升**成紧随其后的一条 user 消息。该消息此前是在**每条 IR 消息内就地落地**的，
+  于是当 assistant **一次并行调用多个工具、且带图的结果不是最后一个**时，出站序列变成
+
+  ```
+  assistant(tool_calls=[read_image, bash]) → tool(read_image) → user(提升的图) → tool(bash)
+  ```
+
+  上游只看得到 `read_image` 被回应，`bash` 悬空 ⇒ 400。触发条件是 dsh 的常态（一步内
+  `read_image` + `bash` 并行）：2026-09-29 step 5 调用（16:07:53）→ step 6 请求（16:08:08）报错，
+  且报错**总是紧跟**一条 `CapabilityWarn` 之后 —— 这是本次定位的关键线索。
+
+  修复：`openai` 编码器新增收尾归一 `enforce_tool_adjacency` —— 对每个带 `tool_calls` 的
+  assistant，在不跨越下一条 assistant 的窗口内，把回应本轮 id 的 tool 消息按原相对顺序
+  **上提为紧随其后**，其余消息（用户文本 / 提升的图片）顺次排到该轮工具块之后；已合法的序列
+  结构不变（幂等）。一并覆盖同族的第二种成因（Anthropic `user: [tool_result, text]`、
+  Responses 回合中插话等「用户侧内容」与工具结果同消息或交错）。
+
+  回归：新增 `tests/tool_pairing_adjacency.rs`（4 用例，修复前 3 红，含**实机形状**的
+  并行工具 + 首个结果带图）。**同时修掉「断言太松」这个根本问题**：
+  `dsh_tool_roundtrip.rs::assert_tool_pairing` 与 `diag_responses_conversion.rs` 检查 4 此前
+  只判「后续**存在**配对」，中间夹消息照样绿（这正是本 bug 能穿过 bug 5 全部回归的原因），
+  现均改为**严格紧邻**判据。全量回归 553 通过 / 0 失败。
+
 ### Added
 
 - **`Channel health` 工作流 + `scripts/channel_health.mjs`**：把「更新通道是否真的可用」
